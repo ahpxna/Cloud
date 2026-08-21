@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.6"
           cache: true
       - run: cp .env.example .env
       - run: docker compose --profile gateway --profile edge config --quiet
@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.6"
           cache: true
       - run: make integration-test
 

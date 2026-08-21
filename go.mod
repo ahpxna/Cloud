@@ -1,6 +1,6 @@
 module family-photo-cloud
 
-go 1.26.1
+go 1.26.6
 
 require (
 	github.com/fergusstrange/embedded-postgres v1.34.0
