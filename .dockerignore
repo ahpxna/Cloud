@@ -1,0 +1,10 @@
+.git
+.cache
+.data
+.env
+.DS_Store
+artifacts
+work
+docs
+ios
+**/*_test.go

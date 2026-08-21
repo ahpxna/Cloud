@@ -1,0 +1,18 @@
+.DS_Store
+.env
+.data/
+artifacts/
+work/
+.cache/
+coverage.out
+*.log
+*.pem
+*.key
+*.p12
+*.mobileprovision
+
+# Xcode user state and build output.
+DerivedData/
+xcuserdata/
+*.xcuserstate
+/ios/FamilyPhotoCloud.xcodeproj/

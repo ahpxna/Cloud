@@ -1,0 +1,203 @@
+import CryptoKit
+import Foundation
+import UIKit
+
+@MainActor
+final class UploadCoordinator: ObservableObject {
+    @Published private(set) var uploads: [QueuedUpload] = []
+    @Published private(set) var lastError: String?
+
+    private let api: PhotoCloudAPI
+    private let auth: AuthenticationStore
+    private let transport: TUSUploadTransport
+
+    init(apiBaseURL: URL) throws {
+        api = PhotoCloudAPI(baseURL: apiBaseURL)
+        auth = AuthenticationStore()
+        transport = try TUSUploadTransport(api: api) { [api, auth] sessionID in
+            let accessToken = try await auth.accessToken(api: api)
+            let session = try await api.uploadSession(id: sessionID, accessToken: accessToken)
+            return try Self.requireUploadToken(session)
+        }
+        transport.uploadFinished = { [weak self] _, context in
+            Task { @MainActor in await self?.tusFinished(context: context) }
+        }
+        transport.uploadFailed = { [weak self] _, context, error in
+            Task { @MainActor in await self?.tusFailed(context: context, error: error) }
+        }
+    }
+
+    func reload() {
+        do { uploads = try AppGroupQueue.all() }
+        catch { lastError = error.localizedDescription }
+    }
+
+    func login(email: String, password: String) async {
+        do {
+            try await auth.login(email: email, password: password, deviceName: UIDevice.current.name, api: api)
+            await startQueuedUploads()
+        } catch { lastError = error.localizedDescription }
+    }
+
+    func startQueuedUploads() async {
+        reload()
+        transport.resumeStoredUploads()
+        for item in uploads where item.state != .available && item.state != .quarantined {
+            if item.serverSessionID == nil {
+                await begin(item)
+            } else {
+                await reconcile(item)
+            }
+        }
+    }
+
+    func registerBackgroundHandler(_ completion: @escaping () -> Void, identifier: String) {
+        transport.registerBackgroundHandler(completion, identifier: identifier)
+    }
+
+    func libraryAssets() async throws -> [LibraryAsset] {
+        let accessToken = try await auth.accessToken(api: api)
+        return try await api.library(accessToken: accessToken)
+    }
+
+    func downloadOriginal(_ asset: LibraryAsset) async throws -> URL {
+        let accessToken = try await auth.accessToken(api: api)
+        return try await api.downloadOriginal(asset, accessToken: accessToken)
+    }
+
+    private func begin(_ original: QueuedUpload) async {
+        do {
+            let payload = try AppGroupQueue.payloadURL(for: original)
+            let digest = try sha256(of: payload)
+            let attributes = try FileManager.default.attributesOfItem(atPath: payload.path())
+            guard let size = attributes[.size] as? NSNumber else { throw URLError(.cannotOpenFile) }
+            let accessToken = try await auth.accessToken(api: api)
+            let session = try await api.createUploadSession(
+                CreateUploadRequest(
+                    clientAssetID: original.id.uuidString,
+                    originalFilename: original.originalFilename,
+                    mediaType: mediaType(for: original),
+                    expectedSize: size.int64Value,
+                    clientSHA256: digest
+                ),
+                accessToken: accessToken
+            )
+            var item = original
+            item.byteCount = size.int64Value
+            item.sha256 = digest
+            item.serverSessionID = session.id
+            item.state = .transferring
+            item.lastError = nil
+            try AppGroupQueue.save(item)
+            let uploadToken: String
+            if let token = session.uploadToken, !token.isEmpty {
+                uploadToken = token
+            } else {
+                let refreshed = try await api.uploadSession(id: session.id, accessToken: accessToken)
+                uploadToken = try Self.requireUploadToken(refreshed)
+            }
+            item.tusUploadID = try transport.enqueue(
+                item: item,
+                endpoint: try api.absoluteURL(for: session.uploadEndpoint),
+                uploadToken: uploadToken
+            )
+            try AppGroupQueue.save(item)
+            reload()
+        } catch {
+            var item = original
+            item.state = .failed
+            item.lastError = error.localizedDescription
+            try? AppGroupQueue.save(item)
+            lastError = error.localizedDescription
+            reload()
+        }
+    }
+
+    private func tusFinished(context: [String: String]?) async {
+        guard let queueID = context?["queue_id"], let id = UUID(uuidString: queueID), var item = try? AppGroupQueue.all().first(where: { $0.id == id }) else { return }
+        item.state = .verifying
+        try? AppGroupQueue.save(item)
+        reload()
+        await reconcile(item)
+    }
+
+    private func reconcile(_ original: QueuedUpload) async {
+        guard let sessionID = original.serverSessionID else { return }
+        var item = original
+        do {
+            for attempt in 0..<10 {
+                let accessToken = try await auth.accessToken(api: api)
+                let status = try await api.uploadSession(id: sessionID, accessToken: accessToken)
+                switch status.state {
+                case "available":
+                    item.state = .available
+                    item.lastError = nil
+                    try AppGroupQueue.save(item)
+                    reload()
+                    return
+                case "quarantined":
+                    item.state = .quarantined
+                    item.lastError = "The server rejected this file because its final SHA-256 or byte count did not match. Keep the source copy."
+                    try AppGroupQueue.save(item)
+                    reload()
+                    return
+                case "created", "uploading":
+                    item.state = .transferring
+                    item.lastError = nil
+                    try AppGroupQueue.save(item)
+                    reload()
+                    return
+                case "failed":
+                    item.state = .failed
+                    item.lastError = "The server marked this upload as failed. Create a new upload from the original file."
+                    try AppGroupQueue.save(item)
+                    reload()
+                    return
+                default:
+                    item.state = .verifying
+                    try AppGroupQueue.save(item)
+                    if attempt < 9 {
+                        try await Task.sleep(for: .seconds(2))
+                    }
+                }
+            }
+        } catch {
+            item.state = .failed
+            item.lastError = error.localizedDescription
+            try? AppGroupQueue.save(item)
+        }
+        reload()
+    }
+
+    private func tusFailed(context: [String: String]?, error: Error) async {
+        guard let queueID = context?["queue_id"], let id = UUID(uuidString: queueID), var item = try? AppGroupQueue.all().first(where: { $0.id == id }) else { return }
+        item.state = .failed
+        item.lastError = error.localizedDescription
+        try? AppGroupQueue.save(item)
+        reload()
+    }
+
+    private func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func mediaType(for item: QueuedUpload) -> String {
+        if let mimeType = item.contentType.preferredMIMEType {
+            return mimeType
+        }
+        return item.contentType.conforms(to: .image) ? "image/*" : "video/*"
+    }
+
+    private nonisolated static func requireUploadToken(_ session: UploadSession) throws -> String {
+        guard let token = session.uploadToken, !token.isEmpty else {
+            throw APIProblem(status: 410, code: "upload_session_expired", detail: "The upload session expired. Create a new upload from the original file.")
+        }
+        return token
+    }
+}

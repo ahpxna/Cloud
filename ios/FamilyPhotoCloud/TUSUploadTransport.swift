@@ -1,0 +1,113 @@
+import Foundation
+import TUSKit
+
+/// TUSKit retains custom headers in its own persistence. Its header is therefore
+/// a narrowly scoped upload capability, never the general access token.
+final class TUSUploadTransport: NSObject, TUSClientDelegate {
+    private let headerProvider: ScopedHeaderProvider
+    private let client: TUSClient
+    var uploadFinished: ((UUID, [String: String]?) -> Void)?
+    var uploadFailed: ((UUID, [String: String]?, Error) -> Void)?
+
+    init(api: PhotoCloudAPI, capability: @escaping @Sendable (String) async throws -> String) throws {
+        let directory = try AppGroupQueue.tusStorageDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        headerProvider = ScopedHeaderProvider(capability: capability)
+        let configuration = URLSessionConfiguration.background(withIdentifier: "dev.phanan.familyphotocloud.tus")
+        configuration.sessionSendsLaunchEvents = true
+        configuration.waitsForConnectivity = true
+        configuration.isDiscretionary = false
+        client = try TUSClient(
+            server: try api.absoluteURL(for: "/v1/uploads/"),
+            sessionIdentifier: "dev.phanan.familyphotocloud.tus",
+            sessionConfiguration: configuration,
+            storageDirectory: directory,
+            chunkSize: 32 * 1024 * 1024,
+            generateHeaders: headerProvider.resolve
+        )
+        super.init()
+        client.delegate = self
+        restoreStoredContexts()
+    }
+
+    func enqueue(item: QueuedUpload, endpoint: URL, uploadToken: String) throws -> UUID {
+        guard let sessionID = item.serverSessionID else { throw URLError(.badURL) }
+        let id = try client.uploadFileAt(
+            filePath: try AppGroupQueue.payloadURL(for: item),
+            uploadURL: endpoint,
+            customHeaders: ["Authorization": "Bearer \(uploadToken)"],
+            context: ["queue_id": item.id.uuidString, "session_id": sessionID]
+        )
+        headerProvider.register(id: id, sessionID: sessionID)
+        return id
+    }
+
+    func resumeStoredUploads() {
+        restoreStoredContexts()
+        for upload in (try? client.getStoredUploads()) ?? [] {
+            try? client.resume(id: upload.id)
+        }
+    }
+
+    func registerBackgroundHandler(_ completion: @escaping () -> Void, identifier: String) {
+        client.registerBackgroundHandler(completion, forSession: identifier)
+    }
+
+    func didStartUpload(id: UUID, context: [String: String]?, client: TUSClient) {}
+    func fileError(error: TUSClientError, client: TUSClient) {}
+    func totalProgress(bytesUploaded: Int, totalBytes: Int, client: TUSClient) {}
+    func progressFor(id: UUID, context: [String: String]?, bytesUploaded: Int, totalBytes: Int, client: TUSClient) {}
+
+    func didFinishUpload(id: UUID, url: URL, context: [String: String]?, client: TUSClient) {
+        uploadFinished?(id, context)
+    }
+
+    func uploadFailed(id: UUID, error: Error, context: [String: String]?, client: TUSClient) {
+        uploadFailed?(id, context, error)
+    }
+
+    private func restoreStoredContexts() {
+        for upload in (try? client.getStoredUploads()) ?? [] {
+            if let sessionID = upload.context?["session_id"] {
+                headerProvider.register(id: upload.id, sessionID: sessionID)
+            }
+        }
+    }
+}
+
+private final class ScopedHeaderProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessionIDs: [UUID: String] = [:]
+    private let capability: @Sendable (String) async throws -> String
+
+    init(capability: @escaping @Sendable (String) async throws -> String) {
+        self.capability = capability
+    }
+
+    func register(id: UUID, sessionID: String) {
+        lock.lock()
+        sessionIDs[id] = sessionID
+        lock.unlock()
+    }
+
+    func resolve(requestID: UUID, headers: [String: String], completion: @escaping ([String: String]) -> Void) {
+        lock.lock()
+        let sessionID = sessionIDs[requestID]
+        lock.unlock()
+        guard let sessionID else { completion(headers); return }
+        Task {
+            do {
+                let token = try await capability(sessionID)
+                var fresh = headers
+                fresh["Authorization"] = "Bearer \(token)"
+                completion(fresh)
+            } catch {
+                // Keep the last scoped capability; TUSKit will retry after a
+                // transient auth/network failure. A general access token never
+                // reaches this persisted header path.
+                completion(headers)
+            }
+        }
+    }
+}

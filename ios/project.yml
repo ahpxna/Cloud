@@ -1,0 +1,57 @@
+name: FamilyPhotoCloud
+
+options:
+  bundleIdPrefix: dev.phanan
+  deploymentTarget:
+    iOS: "17.0"
+
+packages:
+  TUSKit:
+    url: https://github.com/tus/TUSKit.git
+    exactVersion: 3.7.1
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    TARGETED_DEVICE_FAMILY: "1"
+
+targets:
+  FamilyPhotoCloud:
+    type: application
+    platform: iOS
+    sources:
+      - path: FamilyPhotoCloud
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.phanan.FamilyPhotoCloud
+        PRODUCT_NAME: Family Photo Cloud
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_PhotoCloudAPIBaseURL: https://photos.example.com
+    entitlements:
+      path: FamilyPhotoCloud/FamilyPhotoCloud.entitlements
+    dependencies:
+      - package: TUSKit
+      - target: FamilyPhotoCloudShare
+        embed: true
+
+  FamilyPhotoCloudShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.phanan.FamilyPhotoCloud.Share
+        PRODUCT_NAME: Family Photo Cloud Share
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        INFOPLIST_FILE: ShareExtension/Info.plist
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    entitlements:
+      path: ShareExtension/FamilyPhotoCloudShare.entitlements
