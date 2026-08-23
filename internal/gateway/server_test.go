@@ -121,8 +121,8 @@ func TestTusUploadResumesAndRejectsCrossUserAccess(t *testing.T) {
 
 	crossUserHead := fixture.request(http.MethodHead, location.Path, tokenB, nil, map[string]string{"Tus-Resumable": "1.0.0"})
 	crossUserHead.Body.Close()
-	if crossUserHead.StatusCode != http.StatusNotFound {
-		t.Fatalf("cross-user HEAD status = %d, want 404", crossUserHead.StatusCode)
+	if crossUserHead.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("general access JWT must not reach TUS: status = %d, want 401", crossUserHead.StatusCode)
 	}
 
 	first := content[:4]

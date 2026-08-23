@@ -83,21 +83,26 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	maxActiveUploadSessions, err := envInt("MAX_ACTIVE_UPLOAD_SESSIONS", 200)
+	if err != nil {
+		return err
+	}
 	repository := upload.NewPostgresRepository(pool)
 	application, err := gateway.New(gateway.Config{
-		Repository:           repository,
-		Accounts:             account.NewPostgresRepository(pool),
-		Tokens:               tokens,
-		MediaRoot:            envString("PHOTO_MEDIA_ROOT", "/srv/media"),
-		MaxUploadBytes:       maxUploadBytes,
-		ChunkBytes:           chunkBytes,
-		VerificationJobs:     verificationJobs,
-		MaxConcurrentPatches: maxConcurrentPatches,
-		MaxPatchesPerUser:    maxPatchesPerUser,
-		MinimumFreeBytes:     minimumFreeBytes,
-		ReconcileInterval:    reconcileInterval,
-		VerificationLease:    verificationLease,
-		Logger:               logger,
+		Repository:              repository,
+		Accounts:                account.NewPostgresRepository(pool),
+		Tokens:                  tokens,
+		MediaRoot:               envString("PHOTO_MEDIA_ROOT", "/srv/media"),
+		MaxUploadBytes:          maxUploadBytes,
+		ChunkBytes:              chunkBytes,
+		VerificationJobs:        verificationJobs,
+		MaxConcurrentPatches:    maxConcurrentPatches,
+		MaxPatchesPerUser:       maxPatchesPerUser,
+		MinimumFreeBytes:        minimumFreeBytes,
+		ReconcileInterval:       reconcileInterval,
+		VerificationLease:       verificationLease,
+		MaxActiveUploadSessions: maxActiveUploadSessions,
+		Logger:                  logger,
 	})
 	if err != nil {
 		return err

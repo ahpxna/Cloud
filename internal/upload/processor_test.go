@@ -241,9 +241,15 @@ func TestCompletedTusUploadsFindsDurableFinalByteAfterEventLoss(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID+".info"), sidecar, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), "corrupt.info"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	completed, err := processor.CompletedTusUploads()
 	if err != nil || len(completed) != 1 || completed[0].ID != session.ID || completed[0].Offset != int64(len(content)) {
 		t.Fatalf("durable completed uploads=%#v err=%v", completed, err)
+	}
+	if _, err := os.Stat(filepath.Join(processor.mediaRoot, ".quarantine", "corrupt.info.bad-info")); err != nil {
+		t.Fatalf("corrupt sidecar was not isolated: %v", err)
 	}
 	if err := repository.MarkReceived(context.Background(), completed[0].ID, completed[0].Offset); err != nil {
 		t.Fatal(err)
@@ -290,6 +296,26 @@ func TestResetForRetryRemovesOnlyIncompleteTusResource(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(processor.StagingDirectory(), session.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("reset staging data remained: %v", err)
+	}
+}
+
+func TestVerificationFenceRejectsStaleWorkerTransition(t *testing.T) {
+	t.Parallel()
+	repository := NewMemoryRepository()
+	content := []byte("fenced verification")
+	processor, session := prepareReceivedSession(t, repository, content, sha256.Sum256(content), "fence.mov")
+	claimed, err := repository.ClaimVerification(context.Background(), "worker-a", time.Minute, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim=%#v err=%v", claimed, err)
+	}
+	stale := WithVerificationFence(context.Background(), claimed[0].VerificationClaim)
+	repository.mu.Lock()
+	current := repository.sessions[session.ID]
+	current.VerificationClaim = "newer-claim"
+	repository.sessions[session.ID] = current
+	repository.mu.Unlock()
+	if err := processor.Process(stale, session.ID); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("stale verifier transition err=%v, want invalid state", err)
 	}
 }
 

@@ -26,6 +26,21 @@ engineering remediation record, not a production-launch approval.
 | Tracked compiled manifest binary | Removed and ignored local binary artifact | Git index change |
 | Go patch level/config fallback | Go 1.26.7 used in module, Docker, CI; duration configuration now fails closed | race suite and Docker build |
 
+## Follow-up source hardening (audit round 3)
+
+- Verification claims have a per-claim fencing UUID; stale workers cannot make
+  any verifier state transition after their lease is reclaimed.
+- Workers claim one item only when idle; no leased backlog sits in RAM.
+- SHA-256 checks cancellation between bounded reads; lost leases stop further
+  hashing before a stale worker can transition state.
+- Malformed TUS sidecars and App Group queue records are isolated so healthy
+  records continue recovery. Payload originals are retained.
+- TUS accepts scoped upload capabilities only. Incomplete per-user session
+  count is bounded; restart and PATCH share an in-process resource lock.
+
+These source changes do not close the physical-device background-transfer,
+MFA, edge-control, or off-site backup/restore launch gates.
+
 ## Intentionally still blocked outside source code
 
 These findings need real authority, money, host hardware, identity policy, or

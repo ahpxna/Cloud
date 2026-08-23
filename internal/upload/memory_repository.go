@@ -51,6 +51,17 @@ func (r *MemoryRepository) CreateSession(_ context.Context, input CreateSessionI
 		}
 		return existing, false, nil
 	}
+	if input.MaxActiveSessions > 0 {
+		active := 0
+		for _, existing := range r.sessions {
+			if existing.OwnerID == input.OwnerID && (existing.State == StateCreated || existing.State == StateUploading || existing.State == StateReceived || existing.State == StateVerifying || existing.State == StateVerified || existing.State == StateCommitting) {
+				active++
+			}
+		}
+		if active >= input.MaxActiveSessions {
+			return Session{}, false, ErrSessionLimit
+		}
+	}
 
 	id, err := NewID()
 	if err != nil {
@@ -142,11 +153,17 @@ func (r *MemoryRepository) ClaimVerification(_ context.Context, _ string, _ time
 	for id, session := range r.sessions {
 		switch session.State {
 		case StateReceived:
+			claim, err := NewID()
+			if err != nil {
+				return nil, err
+			}
 			session.State = StateVerifying
+			session.VerificationClaim = claim
 			r.sessions[id] = session
 			result = append(result, session)
 		case StateVerifying, StateVerified, StateCommitting:
-			result = append(result, session)
+			// Memory tests do not model time-based expiry; never hand an active
+			// claim to a second worker.
 		}
 		if len(result) == limit {
 			break
@@ -155,16 +172,19 @@ func (r *MemoryRepository) ClaimVerification(_ context.Context, _ string, _ time
 	return result, nil
 }
 
-func (r *MemoryRepository) RenewVerificationLease(_ context.Context, _ string, _ string, _ time.Duration) error {
+func (r *MemoryRepository) RenewVerificationLease(_ context.Context, _ string, _ string, _ string, _ time.Duration) error {
 	return nil
 }
 
-func (r *MemoryRepository) BeginVerification(_ context.Context, id string) (Session, error) {
+func (r *MemoryRepository) BeginVerification(ctx context.Context, id string) (Session, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[id]
 	if !ok {
 		return Session{}, ErrNotFound
+	}
+	if !matchesFence(ctx, session) {
+		return Session{}, ErrInvalidState
 	}
 	switch session.State {
 	case StateReceived:
@@ -177,14 +197,14 @@ func (r *MemoryRepository) BeginVerification(_ context.Context, id string) (Sess
 	return session, nil
 }
 
-func (r *MemoryRepository) MarkVerified(_ context.Context, id string, hash [32]byte) error {
+func (r *MemoryRepository) MarkVerified(ctx context.Context, id string, hash [32]byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if session.State != StateVerifying {
+	if session.State != StateVerifying || !matchesFence(ctx, session) {
 		return ErrInvalidState
 	}
 	session.ServerSHA256 = &hash
@@ -193,14 +213,14 @@ func (r *MemoryRepository) MarkVerified(_ context.Context, id string, hash [32]b
 	return nil
 }
 
-func (r *MemoryRepository) MarkCommitting(_ context.Context, id, storageKey string) error {
+func (r *MemoryRepository) MarkCommitting(ctx context.Context, id, storageKey string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if session.State != StateVerified && session.State != StateCommitting {
+	if (session.State != StateVerified && session.State != StateCommitting) || !matchesFence(ctx, session) {
 		return ErrInvalidState
 	}
 	session.State = StateCommitting
@@ -209,7 +229,7 @@ func (r *MemoryRepository) MarkCommitting(_ context.Context, id, storageKey stri
 	return nil
 }
 
-func (r *MemoryRepository) MarkAvailable(_ context.Context, id, storageKey string, hash [32]byte) error {
+func (r *MemoryRepository) MarkAvailable(ctx context.Context, id, storageKey string, hash [32]byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[id]
@@ -219,12 +239,13 @@ func (r *MemoryRepository) MarkAvailable(_ context.Context, id, storageKey strin
 	if session.State == StateAvailable {
 		return nil
 	}
-	if session.State != StateCommitting || subtle.ConstantTimeCompare(session.ClientSHA256[:], hash[:]) != 1 {
+	if session.State != StateCommitting || !matchesFence(ctx, session) || subtle.ConstantTimeCompare(session.ClientSHA256[:], hash[:]) != 1 {
 		return ErrInvalidState
 	}
 	session.State = StateAvailable
 	session.ServerSHA256 = &hash
 	session.FinalStorageKey = storageKey
+	session.VerificationClaim = ""
 	for assetID, asset := range r.assets {
 		if asset.OwnerID == session.OwnerID && subtle.ConstantTimeCompare(asset.ContentSHA256[:], hash[:]) == 1 {
 			if asset.StorageKey != storageKey {
@@ -293,32 +314,42 @@ func assetBefore(asset Asset, cursor AssetCursor) bool {
 	return asset.CreatedAt.Equal(cursor.CreatedAt) && asset.ID < cursor.ID
 }
 
-func (r *MemoryRepository) MarkQuarantined(_ context.Context, id string, hash [32]byte, _ string) error {
+func (r *MemoryRepository) MarkQuarantined(ctx context.Context, id string, hash [32]byte, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[id]
 	if !ok {
 		return ErrNotFound
 	}
+	if !matchesFence(ctx, session) {
+		return ErrInvalidState
+	}
 	session.State = StateQuarantined
 	session.ServerSHA256 = &hash
+	session.VerificationClaim = ""
 	r.sessions[id] = session
 	return nil
 }
 
-func (r *MemoryRepository) MarkFailed(_ context.Context, id, _ string) error {
+func (r *MemoryRepository) MarkFailed(ctx context.Context, id, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	session, ok := r.sessions[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if session.State == StateAvailable || session.State == StateQuarantined {
+	if session.State == StateAvailable || session.State == StateQuarantined || !matchesFence(ctx, session) {
 		return fmt.Errorf("terminal session: %w", ErrInvalidState)
 	}
 	session.State = StateFailed
+	session.VerificationClaim = ""
 	r.sessions[id] = session
 	return nil
+}
+
+func matchesFence(ctx context.Context, session Session) bool {
+	claim := VerificationFence(ctx)
+	return claim == "" || (session.VerificationClaim != "" && claim == session.VerificationClaim)
 }
 
 func (r *MemoryRepository) PendingVerification(_ context.Context, limit int) ([]Session, error) {

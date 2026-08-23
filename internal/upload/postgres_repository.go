@@ -23,7 +23,7 @@ const sessionColumns = `
     id::text, owner_id::text, client_asset_id, original_filename, media_type,
     expected_size, received_size, client_sha256, server_sha256, state,
     COALESCE(transport_resource_id, ''), COALESCE(final_storage_key, ''), expires_at,
-    COALESCE(asset_id::text, '')`
+    COALESCE(asset_id::text, ''), COALESCE(verification_claim_token::text, '')`
 
 type rowScanner interface {
 	Scan(...any) error
@@ -39,6 +39,7 @@ func scanSession(row rowScanner) (Session, error) {
 		&session.ReceivedSize, &clientHash, &serverHash, &session.State,
 		&session.TransportResource, &session.FinalStorageKey, &session.ExpiresAt,
 		&session.AssetID,
+		&session.VerificationClaim,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -116,6 +117,15 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 	var quotaBytes *int64
 	if err := tx.QueryRow(ctx, `SELECT quota_bytes FROM users WHERE id = $1::uuid FOR UPDATE`, input.OwnerID).Scan(&quotaBytes); err != nil {
 		return Session{}, false, err
+	}
+	if input.MaxActiveSessions > 0 {
+		var activeCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM upload_sessions WHERE owner_id = $1::uuid AND state IN ('created','uploading','received','verifying','verified','committing')`, input.OwnerID).Scan(&activeCount); err != nil {
+			return Session{}, false, err
+		}
+		if activeCount >= input.MaxActiveSessions {
+			return Session{}, false, ErrSessionLimit
+		}
 	}
 	// Quota represents visible unique assets plus unique content still on its
 	// way to becoming an asset. Historical available upload sessions must not
@@ -308,6 +318,7 @@ func (r *PostgresRepository) ClaimVerification(ctx context.Context, workerID str
 			UPDATE upload_sessions AS session
 			SET state = CASE WHEN candidates.previous_state = 'received' THEN 'verifying' ELSE session.state END,
 				verification_worker_id = $1,
+				verification_claim_token = uuidv7(),
 				verification_claimed_at = now(),
 				verification_lease_until = now() + $2::bigint * interval '1 microsecond',
 				updated_at = now()
@@ -336,15 +347,15 @@ func (r *PostgresRepository) ClaimVerification(ctx context.Context, workerID str
 	return claimed, rows.Err()
 }
 
-func (r *PostgresRepository) RenewVerificationLease(ctx context.Context, id, workerID string, lease time.Duration) error {
-	if workerID == "" || lease <= 0 {
+func (r *PostgresRepository) RenewVerificationLease(ctx context.Context, id, workerID, claim string, lease time.Duration) error {
+	if workerID == "" || claim == "" || lease <= 0 {
 		return ErrInvalidState
 	}
 	command, err := r.pool.Exec(ctx, `
 		UPDATE upload_sessions
 		SET verification_lease_until = now() + $3::bigint * interval '1 microsecond', updated_at = now()
-		WHERE id = $1::uuid AND verification_worker_id = $2
-		  AND state IN ('verifying', 'verified', 'committing')`, id, workerID, lease.Microseconds())
+		WHERE id = $1::uuid AND verification_worker_id = $2 AND verification_claim_token::text = $4
+		  AND state IN ('verifying', 'verified', 'committing')`, id, workerID, lease.Microseconds(), claim)
 	if err != nil {
 		return err
 	}
@@ -365,6 +376,9 @@ func (r *PostgresRepository) BeginVerification(ctx context.Context, id string) (
         SELECT `+sessionColumns+` FROM upload_sessions WHERE id = $1::uuid FOR UPDATE`, id))
 	if err != nil {
 		return Session{}, err
+	}
+	if fence := VerificationFence(ctx); fence != "" && session.VerificationClaim != fence {
+		return Session{}, ErrInvalidState
 	}
 	if session.State == StateReceived {
 		if _, err := tx.Exec(ctx, `
@@ -391,15 +405,17 @@ func (r *PostgresRepository) BeginVerification(ctx context.Context, id string) (
 }
 
 func (r *PostgresRepository) MarkVerified(ctx context.Context, id string, hash [32]byte) error {
+	fence := VerificationFence(ctx)
 	command, err := r.pool.Exec(ctx, `
         WITH changed AS (
             UPDATE upload_sessions
             SET state = 'verified', server_sha256 = $2, verified_at = now(), updated_at = now()
-            WHERE id = $1::uuid AND state = 'verifying'
+			WHERE id = $1::uuid AND state = 'verifying'
+			  AND ($3 = '' OR verification_claim_token::text = $3)
             RETURNING id, owner_id
         )
         INSERT INTO upload_events (upload_session_id, owner_id, event_type)
-        SELECT id, owner_id, 'verified' FROM changed`, id, hash[:])
+		SELECT id, owner_id, 'verified' FROM changed`, id, hash[:], fence)
 	if err != nil {
 		return err
 	}
@@ -410,15 +426,17 @@ func (r *PostgresRepository) MarkVerified(ctx context.Context, id string, hash [
 }
 
 func (r *PostgresRepository) MarkCommitting(ctx context.Context, id, storageKey string) error {
+	fence := VerificationFence(ctx)
 	command, err := r.pool.Exec(ctx, `
         WITH changed AS (
             UPDATE upload_sessions
             SET state = 'committing', final_storage_key = $2, updated_at = now()
-            WHERE id = $1::uuid AND state IN ('verified', 'committing')
+			WHERE id = $1::uuid AND state IN ('verified', 'committing')
+			  AND ($3 = '' OR verification_claim_token::text = $3)
             RETURNING id, owner_id
         )
         INSERT INTO upload_events (upload_session_id, owner_id, event_type)
-        SELECT id, owner_id, 'commit_started' FROM changed`, id, storageKey)
+		SELECT id, owner_id, 'commit_started' FROM changed`, id, storageKey, fence)
 	if err != nil {
 		return err
 	}
@@ -441,9 +459,12 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 		return err
 	}
 	if session.State == StateAvailable {
+		if fence := VerificationFence(ctx); fence != "" && session.VerificationClaim != fence {
+			return ErrInvalidState
+		}
 		return tx.Commit(ctx)
 	}
-	if session.State != StateCommitting || !bytes.Equal(session.ClientSHA256[:], hash[:]) {
+	if session.State != StateCommitting || !bytes.Equal(session.ClientSHA256[:], hash[:]) || (VerificationFence(ctx) != "" && session.VerificationClaim != VerificationFence(ctx)) {
 		return ErrInvalidState
 	}
 	var assetID string
@@ -471,13 +492,18 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 	} else if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `
+	command, err := tx.Exec(ctx, `
         UPDATE upload_sessions
         SET state = 'available', server_sha256 = $2, final_storage_key = $3,
             asset_id = $4::uuid, committed_at = now(), verification_worker_id = NULL,
-            verification_claimed_at = NULL, verification_lease_until = NULL, updated_at = now()
-        WHERE id = $1::uuid`, id, hash[:], storageKey, assetID); err != nil {
+            verification_claimed_at = NULL, verification_claim_token = NULL,
+            verification_lease_until = NULL, updated_at = now()
+	        WHERE id = $1::uuid AND ($5 = '' OR verification_claim_token::text = $5)`, id, hash[:], storageKey, assetID, VerificationFence(ctx))
+	if err != nil {
 		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidState
 	}
 	if _, err := tx.Exec(ctx, `
         INSERT INTO upload_events (upload_session_id, owner_id, event_type)
@@ -498,9 +524,10 @@ func (r *PostgresRepository) MarkQuarantined(ctx context.Context, id string, has
         UPDATE upload_sessions
         SET state = 'quarantined', server_sha256 = $2, last_error_code = $3,
             verification_worker_id = NULL, verification_claimed_at = NULL,
-            verification_lease_until = NULL, updated_at = now()
+            verification_claim_token = NULL, verification_lease_until = NULL, updated_at = now()
         WHERE id = $1::uuid AND state NOT IN ('available', 'quarantined')
-        RETURNING owner_id::text`, id, hash[:], errorCode).Scan(&ownerID)
+          AND ($4 = '' OR verification_claim_token::text = $4)
+        RETURNING owner_id::text`, id, hash[:], errorCode, VerificationFence(ctx)).Scan(&ownerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrInvalidState
 	}
@@ -518,16 +545,19 @@ func (r *PostgresRepository) MarkQuarantined(ctx context.Context, id string, has
 }
 
 func (r *PostgresRepository) MarkFailed(ctx context.Context, id, errorCode string) error {
+	fence := VerificationFence(ctx)
 	command, err := r.pool.Exec(ctx, `
         WITH changed AS (
         UPDATE upload_sessions
         SET state = 'failed', last_error_code = $2, verification_worker_id = NULL,
-            verification_claimed_at = NULL, verification_lease_until = NULL, updated_at = now()
+            verification_claimed_at = NULL, verification_claim_token = NULL,
+            verification_lease_until = NULL, updated_at = now()
             WHERE id = $1::uuid AND state NOT IN ('available', 'quarantined')
+              AND ($3 = '' OR verification_claim_token::text = $3)
             RETURNING id, owner_id
         )
         INSERT INTO upload_events (upload_session_id, owner_id, event_type, error_code)
-        SELECT id, owner_id, 'failed', $2 FROM changed`, id, errorCode)
+		SELECT id, owner_id, 'failed', $2 FROM changed`, id, errorCode, fence)
 	if err != nil {
 		return err
 	}

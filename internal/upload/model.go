@@ -31,6 +31,7 @@ var (
 	ErrOwnerMismatch       = errors.New("upload owner mismatch")
 	ErrChecksumMismatch    = errors.New("uploaded content checksum mismatch")
 	ErrInsufficientStorage = errors.New("insufficient storage capacity")
+	ErrSessionLimit        = errors.New("too many active upload sessions")
 )
 
 type Session struct {
@@ -48,18 +49,33 @@ type Session struct {
 	FinalStorageKey   string
 	ExpiresAt         time.Time
 	AssetID           string
+	VerificationClaim string
+}
+
+type verificationFenceKey struct{}
+
+// WithVerificationFence carries the claim token from the worker that acquired
+// a lease. Repository transitions reject a stale token after a lease reclaim.
+func WithVerificationFence(ctx context.Context, claim string) context.Context {
+	return context.WithValue(ctx, verificationFenceKey{}, claim)
+}
+
+func VerificationFence(ctx context.Context) string {
+	claim, _ := ctx.Value(verificationFenceKey{}).(string)
+	return claim
 }
 
 type CreateSessionInput struct {
-	OwnerID          string
-	ClientAssetID    string
-	OriginalFilename string
-	MediaType        string
-	ExpectedSize     int64
-	ClientSHA256     [32]byte
-	ExpiresAt        time.Time
-	AvailableBytes   int64
-	MinimumFreeBytes int64
+	OwnerID           string
+	ClientAssetID     string
+	OriginalFilename  string
+	MediaType         string
+	ExpectedSize      int64
+	ClientSHA256      [32]byte
+	ExpiresAt         time.Time
+	AvailableBytes    int64
+	MinimumFreeBytes  int64
+	MaxActiveSessions int
 }
 
 type Repository interface {
@@ -72,7 +88,7 @@ type Repository interface {
 	// in-memory worker queue. A process crash therefore delays work only until
 	// the lease expires; it cannot create unbounded duplicate hash jobs.
 	ClaimVerification(context.Context, string, time.Duration, int) ([]Session, error)
-	RenewVerificationLease(context.Context, string, string, time.Duration) error
+	RenewVerificationLease(context.Context, string, string, string, time.Duration) error
 	BeginVerification(context.Context, string) (Session, error)
 	MarkVerified(context.Context, string, [32]byte) error
 	MarkCommitting(context.Context, string, string) error

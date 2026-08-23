@@ -24,19 +24,20 @@ import (
 const tusBasePath = "/v1/uploads/"
 
 type Config struct {
-	Repository           upload.Repository
-	Accounts             account.Repository
-	Tokens               *auth.AccessTokenManager
-	MediaRoot            string
-	MaxUploadBytes       int64
-	ChunkBytes           int64
-	VerificationJobs     int
-	MaxConcurrentPatches int
-	MaxPatchesPerUser    int
-	MinimumFreeBytes     int64
-	ReconcileInterval    time.Duration
-	VerificationLease    time.Duration
-	Logger               *slog.Logger
+	Repository              upload.Repository
+	Accounts                account.Repository
+	Tokens                  *auth.AccessTokenManager
+	MediaRoot               string
+	MaxUploadBytes          int64
+	ChunkBytes              int64
+	VerificationJobs        int
+	MaxConcurrentPatches    int
+	MaxPatchesPerUser       int
+	MinimumFreeBytes        int64
+	ReconcileInterval       time.Duration
+	VerificationLease       time.Duration
+	MaxActiveUploadSessions int
+	Logger                  *slog.Logger
 }
 
 type Server struct {
@@ -72,6 +73,9 @@ func New(config Config) (*Server, error) {
 	}
 	if config.VerificationLease <= 0 {
 		config.VerificationLease = 10 * time.Minute
+	}
+	if config.MaxActiveUploadSessions <= 0 {
+		config.MaxActiveUploadSessions = 200
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -144,26 +148,21 @@ func New(config Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{cancel: cancel}
-	queue := make(chan string, config.VerificationJobs*4)
+	// Workers claim one job only when they are about to process it. Never lease
+	// a backlog into RAM: queued work must remain claimable in PostgreSQL.
+	wakeWorkers := make(chan struct{}, config.VerificationJobs)
 	workerID, err := upload.NewID()
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create verifier identity: %w", err)
 	}
 	workerID = "gateway-" + workerID
-	claimAndEnqueue := func() {
-		// The database lease is acquired before queue insertion. This makes a
-		// repeated reconciliation tick harmless even when hashing takes longer
-		// than the tick interval.
-		claimed, err := config.Repository.ClaimVerification(ctx, workerID, config.VerificationLease, 100)
-		if err != nil {
-			config.Logger.Error("claim verification recovery queue", "error", err)
-			return
-		}
-		for _, session := range claimed {
+	resourceLocks := newResourceLocks()
+	wake := func() {
+		for range config.VerificationJobs {
 			select {
-			case queue <- session.ID:
-			case <-ctx.Done():
+			case wakeWorkers <- struct{}{}:
+			default:
 				return
 			}
 		}
@@ -196,7 +195,7 @@ func New(config Config) (*Server, error) {
 					config.Logger.Error("mark upload received", "upload_id", event.Upload.ID, "error", err)
 					continue
 				}
-				claimAndEnqueue()
+				wake()
 			}
 		}
 	}()
@@ -228,7 +227,10 @@ func New(config Config) (*Server, error) {
 				return
 			}
 			for _, session := range expired {
-				if err := processor.Expire(ctx, session); err != nil && !errors.Is(err, upload.ErrInvalidState) {
+				unlock := resourceLocks.lock(session.ID)
+				err := processor.Expire(ctx, session)
+				unlock()
+				if err != nil && !errors.Is(err, upload.ErrInvalidState) {
 					config.Logger.Error("expire stale upload", "upload_id", session.ID, "error", err)
 				}
 			}
@@ -240,7 +242,7 @@ func New(config Config) (*Server, error) {
 	go func() {
 		defer server.wg.Done()
 		recoverCompletedTus()
-		claimAndEnqueue()
+		wake()
 		expireStale()
 		ticker := time.NewTicker(config.ReconcileInterval)
 		defer ticker.Stop()
@@ -250,7 +252,7 @@ func New(config Config) (*Server, error) {
 				return
 			case <-ticker.C:
 				recoverCompletedTus()
-				claimAndEnqueue()
+				wake()
 				expireStale()
 			}
 		}
@@ -263,9 +265,19 @@ func New(config Config) (*Server, error) {
 				select {
 				case <-ctx.Done():
 					return
-				case id := <-queue:
-					if err := processWithLease(ctx, config.Repository, processor, id, workerID, config.VerificationLease, config.Logger); err != nil && !errors.Is(err, upload.ErrChecksumMismatch) {
-						config.Logger.Error("verify and commit upload", "upload_id", id, "error", err)
+				case <-wakeWorkers:
+					for {
+						claimed, err := config.Repository.ClaimVerification(ctx, workerID, config.VerificationLease, 1)
+						if err != nil {
+							config.Logger.Error("claim verification job", "error", err)
+							break
+						}
+						if len(claimed) == 0 {
+							break
+						}
+						if err := processWithLease(ctx, config.Repository, processor, claimed[0], workerID, config.VerificationLease, config.Logger); err != nil && !errors.Is(err, upload.ErrChecksumMismatch) {
+							config.Logger.Error("verify and commit upload", "upload_id", claimed[0].ID, "error", err)
+						}
 					}
 				}
 			}
@@ -301,7 +313,11 @@ func New(config Config) (*Server, error) {
 	// Compatibility alias for local probes; readiness is deliberately stricter
 	// than liveness and is the endpoint used by Compose.
 	mux.Handle("GET /healthz", readyHandler)
-	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, processor.ResetForRetry)
+	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, config.MaxActiveUploadSessions, func(requestContext context.Context, id, ownerID string) (upload.Session, error) {
+		unlock := resourceLocks.lock(id)
+		defer unlock()
+		return processor.ResetForRetry(requestContext, id, ownerID)
+	})
 	if config.Accounts != nil {
 		accountAPI := account.NewAPI(config.Accounts, config.Tokens, config.Logger)
 		mux.Handle("/v1/auth/", accountAPI)
@@ -321,11 +337,61 @@ func New(config Config) (*Server, error) {
 
 	strippedTus := http.StripPrefix(strings.TrimSuffix(tusBasePath, "/"), tusHandler)
 	limiter := newPatchLimiter(config.MaxConcurrentPatches, config.MaxPatchesPerUser)
-	protectedTus := authenticateTus(config.Tokens, config.Repository, limiter, config.ChunkBytes, strippedTus)
+	protectedTus := lockPatches(resourceLocks, authenticateTus(config.Tokens, config.Repository, limiter, config.ChunkBytes, strippedTus))
 	mux.Handle(strings.TrimSuffix(tusBasePath, "/"), protectedTus)
 	mux.Handle(tusBasePath, protectedTus)
 	server.handler = securityHeaders(mux)
 	return server, nil
+}
+
+type resourceLocks struct {
+	mu      sync.Mutex
+	entries map[string]*resourceLock
+}
+type resourceLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newResourceLocks() *resourceLocks {
+	return &resourceLocks{entries: make(map[string]*resourceLock)}
+}
+func (locks *resourceLocks) lock(id string) func() {
+	locks.mu.Lock()
+	entry := locks.entries[id]
+	if entry == nil {
+		entry = &resourceLock{}
+		locks.entries[id] = entry
+	}
+	entry.refs++
+	locks.mu.Unlock()
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		locks.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(locks.entries, id)
+		}
+		locks.mu.Unlock()
+	}
+}
+
+func lockPatches(locks *resourceLocks, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			next.ServeHTTP(w, r)
+			return
+		}
+		id := strings.Trim(strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(tusBasePath, "/")), "/")
+		if id == "" || strings.Contains(id, "/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		unlock := locks.lock(id)
+		defer unlock()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -341,7 +407,7 @@ func processWithLease(
 	ctx context.Context,
 	repository upload.Repository,
 	processor *upload.Processor,
-	id, workerID string,
+	session upload.Session, workerID string,
 	lease time.Duration,
 	logger *slog.Logger,
 ) error {
@@ -365,8 +431,8 @@ func processWithLease(
 			case <-processContext.Done():
 				return
 			case <-ticker.C:
-				if err := repository.RenewVerificationLease(processContext, id, workerID, lease); err != nil {
-					logger.Error("renew verification lease", "upload_id", id, "error", err)
+				if err := repository.RenewVerificationLease(processContext, session.ID, workerID, session.VerificationClaim, lease); err != nil {
+					logger.Error("renew verification lease", "upload_id", session.ID, "error", err)
 					// Continuing after ownership is lost risks two workers committing
 					// the same staging object. The durable state remains reclaimable.
 					cancel()
@@ -375,7 +441,7 @@ func processWithLease(
 			}
 		}
 	}()
-	err := processor.Process(processContext, id)
+	err := processor.Process(upload.WithVerificationFence(processContext, session.VerificationClaim), session.ID)
 	close(done)
 	heartbeat.Wait()
 	return err
@@ -512,10 +578,7 @@ func authenticateTusHeader(tokens *auth.AccessTokenManager, header string) (auth
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		return auth.Principal{}, false
 	}
-	if principal, err := tokens.VerifyUpload(parts[1]); err == nil {
-		return principal, true
-	}
-	principal, err := tokens.Verify(parts[1])
+	principal, err := tokens.VerifyUpload(parts[1])
 	return principal, err == nil
 }
 

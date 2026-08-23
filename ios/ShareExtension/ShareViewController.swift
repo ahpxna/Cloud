@@ -38,7 +38,7 @@ final class ShareViewController: SLComposeServiceViewController {
                 // imply every selected item was backed up; return an explicit
                 // receipt the share sheet can show instead of silently omitting
                 // failed providers.
-                self.cancel(with: "(succeeded) item(s) queued; (failures.count) could not be imported. Keep the originals and try sharing the failed item(s) again.")
+                self.cancel(with: "\(succeeded) item(s) queued; \(failures.count) could not be imported. Keep the originals and try sharing the failed item(s) again.")
             } else {
                 self.cancel(with: failures.first ?? "Could not add the selected items to the queue.")
             }

@@ -76,14 +76,25 @@ enum AppGroupQueue {
     static func all(in root: URL) throws -> [QueuedUpload] {
         let records = root.appending(path: "records", directoryHint: .isDirectory)
         guard FileManager.default.fileExists(atPath: records.path()) else { return [] }
-        return try FileManager.default.contentsOfDirectory(
+        let files = try FileManager.default.contentsOfDirectory(
             at: records,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
         .filter { $0.pathExtension == "json" }
-        .map { try JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: $0)) }
-        .sorted { $0.createdAt < $1.createdAt }
+        var items: [QueuedUpload] = []
+        for file in files {
+            do {
+                items.append(try JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: file)))
+            } catch {
+                // Preserve the original payload; isolate only malformed queue
+                // metadata so one record cannot stop every healthy upload.
+                let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
+                try? createProtectedDirectory(quarantine)
+                try? FileManager.default.moveItem(at: file, to: quarantine.appending(path: file.lastPathComponent + ".corrupt"))
+            }
+        }
+        return items.sorted { $0.createdAt < $1.createdAt }
     }
 
     static func save(_ item: QueuedUpload) throws {

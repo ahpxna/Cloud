@@ -88,12 +88,8 @@ func Apply(ctx context.Context, conn *pgx.Conn, migrations []Migration, baseline
 		return fmt.Errorf("count schema migrations: %w", err)
 	}
 	if appliedCount == 0 && baselineVersion > 0 {
-		var usersTable *string
-		if err := conn.QueryRow(ctx, `SELECT to_regclass('public.users')::text`).Scan(&usersTable); err != nil {
-			return fmt.Errorf("inspect legacy schema: %w", err)
-		}
-		if usersTable == nil {
-			return errors.New("refusing to baseline: legacy users table is absent")
+		if err := verifyBaselineSchema(ctx, conn, baselineVersion); err != nil {
+			return err
 		}
 		if err := baseline(ctx, conn, migrations, baselineVersion); err != nil {
 			return err
@@ -114,6 +110,40 @@ func Apply(ctx context.Context, conn *pgx.Conn, migrations []Migration, baseline
 		}
 		if err := applyOne(ctx, conn, migration); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) error {
+	required := []string{"users", "user_sessions", "upload_sessions", "assets", "upload_events", "signed_manifests"}
+	if version >= 2 {
+		required = append(required, "upload_sessions.asset_id", "user_sessions.session_family_id", "user_sessions.parent_session_id", "user_sessions.reused_at")
+	}
+	if version >= 3 {
+		required = append(required, "upload_sessions.verification_worker_id", "upload_sessions.verification_claimed_at", "upload_sessions.verification_lease_until")
+	}
+	if version >= 4 {
+		required = append(required, "upload_sessions.verification_claim_token")
+	}
+	for _, item := range required {
+		parts := strings.Split(item, ".")
+		if len(parts) == 1 {
+			var table *string
+			if err := conn.QueryRow(ctx, `SELECT to_regclass('public.' || $1)::text`, parts[0]).Scan(&table); err != nil {
+				return fmt.Errorf("inspect baseline table %s: %w", item, err)
+			}
+			if table == nil {
+				return fmt.Errorf("refusing baseline %d: required table %s is absent", version, item)
+			}
+			continue
+		}
+		var exists bool
+		if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2)`, parts[0], parts[1]).Scan(&exists); err != nil {
+			return fmt.Errorf("inspect baseline column %s: %w", item, err)
+		}
+		if !exists {
+			return fmt.Errorf("refusing baseline %d: required column %s is absent", version, item)
 		}
 	}
 	return nil

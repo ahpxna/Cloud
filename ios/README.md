@@ -21,7 +21,7 @@ account, queue, or integrity code.
 
 The Share Extension appears in Photos' system Share Sheet because it declares
 the `com.apple.share-services` extension point and image/movie activation rule.
-MVP accepts one selected image or video at a time and only copies the temporary
+MVP attempts every selected image or video independently and only copies the temporary
 `NSItemProvider` file into the App Group queue.
 It never reads Keychain credentials, logs in, or starts a network transfer.
 

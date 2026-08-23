@@ -69,11 +69,13 @@ func (p *Processor) CompletedTusUploads() ([]CompletedTusUpload, error) {
 		}
 		contents, err := os.ReadFile(filepath.Join(p.StagingDirectory(), entry.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read tus sidecar %q: %w", entry.Name(), err)
+			p.quarantineBadSidecar(entry.Name())
+			continue
 		}
 		var info tusFileInfo
 		if err := json.Unmarshal(contents, &info); err != nil {
-			return nil, fmt.Errorf("decode tus sidecar %q: %w", entry.Name(), err)
+			p.quarantineBadSidecar(entry.Name())
+			continue
 		}
 		if !safeID.MatchString(info.ID) || info.ID+".info" != entry.Name() || info.Size < 0 || info.Offset != info.Size {
 			continue
@@ -91,6 +93,17 @@ func (p *Processor) CompletedTusUploads() ([]CompletedTusUpload, error) {
 		completed = append(completed, CompletedTusUpload{ID: info.ID, Offset: info.Offset})
 	}
 	return completed, nil
+}
+
+func (p *Processor) quarantineBadSidecar(name string) {
+	source := filepath.Join(p.StagingDirectory(), name)
+	destination := filepath.Join(p.mediaRoot, ".quarantine", name+".bad-info")
+	if _, err := os.Stat(destination); err == nil {
+		return
+	}
+	if err := os.Rename(source, destination); err == nil {
+		_ = syncDirectory(filepath.Dir(destination))
+	}
 }
 
 func (p *Processor) Process(ctx context.Context, id string) error {
@@ -121,7 +134,7 @@ func (p *Processor) Process(ctx context.Context, id string) error {
 		return p.fail(ctx, session.ID, "staging_stat_failed", statErr)
 	}
 
-	observedHash, observedSize, err := hashAndSync(sourcePath)
+	observedHash, observedSize, err := hashAndSync(ctx, sourcePath)
 	if err != nil {
 		return p.fail(ctx, session.ID, "content_read_failed", err)
 	}
@@ -182,7 +195,7 @@ func (p *Processor) recoverQuarantine(ctx context.Context, session Session) erro
 		}
 		return p.fail(ctx, session.ID, "content_missing", err)
 	}
-	hash, size, err := hashAndSync(matches[0])
+	hash, size, err := hashAndSync(ctx, matches[0])
 	if err != nil {
 		return p.fail(ctx, session.ID, "quarantine_read_failed", err)
 	}
@@ -263,16 +276,32 @@ func (p *Processor) ResetForRetry(ctx context.Context, id, ownerID string) (Sess
 	return session, nil
 }
 
-func hashAndSync(path string) ([32]byte, int64, error) {
+func hashAndSync(ctx context.Context, path string) ([32]byte, int64, error) {
 	file, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return [32]byte{}, 0, err
 	}
 	defer file.Close()
 	hasher := sha256.New()
-	size, err := io.Copy(hasher, file)
-	if err != nil {
-		return [32]byte{}, size, err
+	buffer := make([]byte, 1<<20)
+	var size int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return [32]byte{}, size, err
+		}
+		read, err := file.Read(buffer)
+		if read > 0 {
+			if _, writeErr := hasher.Write(buffer[:read]); writeErr != nil {
+				return [32]byte{}, size, writeErr
+			}
+			size += int64(read)
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return [32]byte{}, size, err
+		}
 	}
 	if err := file.Sync(); err != nil {
 		return [32]byte{}, size, err
@@ -302,7 +331,7 @@ func commitWithoutReplace(source, destination string, expectedHash [32]byte, exp
 		if !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("create no-replace durable link: %w", err)
 		}
-		hash, size, verifyErr := hashAndSync(destination)
+		hash, size, verifyErr := hashAndSync(context.Background(), destination)
 		if verifyErr != nil {
 			return fmt.Errorf("verify existing destination: %w", verifyErr)
 		}

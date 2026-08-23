@@ -20,26 +20,28 @@ import (
 )
 
 type API struct {
-	repository       Repository
-	maxBytes         int64
-	chunkBytes       int64
-	tokens           *auth.AccessTokenManager
-	now              func() time.Time
-	availableBytes   func() (int64, error)
-	minimumFreeBytes int64
-	restart          func(context.Context, string, string) (Session, error)
+	repository        Repository
+	maxBytes          int64
+	chunkBytes        int64
+	tokens            *auth.AccessTokenManager
+	now               func() time.Time
+	availableBytes    func() (int64, error)
+	minimumFreeBytes  int64
+	maxActiveSessions int
+	restart           func(context.Context, string, string) (Session, error)
 }
 
-func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64, restart func(context.Context, string, string) (Session, error)) *API {
+func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64, maxActiveSessions int, restart func(context.Context, string, string) (Session, error)) *API {
 	return &API{
-		repository:       repository,
-		maxBytes:         maxBytes,
-		chunkBytes:       chunkBytes,
-		tokens:           tokens,
-		now:              time.Now,
-		availableBytes:   availableBytes,
-		minimumFreeBytes: minimumFreeBytes,
-		restart:          restart,
+		repository:        repository,
+		maxBytes:          maxBytes,
+		chunkBytes:        chunkBytes,
+		tokens:            tokens,
+		now:               time.Now,
+		availableBytes:    availableBytes,
+		minimumFreeBytes:  minimumFreeBytes,
+		maxActiveSessions: maxActiveSessions,
+		restart:           restart,
 	}
 }
 
@@ -144,15 +146,16 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		return
 	}
 	session, created, err := api.repository.CreateSession(r.Context(), CreateSessionInput{
-		OwnerID:          principal.UserID,
-		ClientAssetID:    request.ClientAssetID,
-		OriginalFilename: request.OriginalFilename,
-		MediaType:        request.MediaType,
-		ExpectedSize:     request.ExpectedSize,
-		ClientSHA256:     hash,
-		ExpiresAt:        api.now().UTC().Add(7 * 24 * time.Hour),
-		AvailableBytes:   availableBytes,
-		MinimumFreeBytes: api.minimumFreeBytes,
+		OwnerID:           principal.UserID,
+		ClientAssetID:     request.ClientAssetID,
+		OriginalFilename:  request.OriginalFilename,
+		MediaType:         request.MediaType,
+		ExpectedSize:      request.ExpectedSize,
+		ClientSHA256:      hash,
+		ExpiresAt:         api.now().UTC().Add(7 * 24 * time.Hour),
+		AvailableBytes:    availableBytes,
+		MinimumFreeBytes:  api.minimumFreeBytes,
+		MaxActiveSessions: api.maxActiveSessions,
 	})
 	if errors.Is(err, ErrConflict) {
 		writeProblem(w, http.StatusConflict, "idempotency_conflict", "client_asset_id already has different immutable metadata")
@@ -160,6 +163,10 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 	}
 	if errors.Is(err, ErrInsufficientStorage) {
 		writeProblem(w, http.StatusInsufficientStorage, "insufficient_storage", "storage quota or free-space reserve would be exceeded")
+		return
+	}
+	if errors.Is(err, ErrSessionLimit) {
+		writeProblem(w, http.StatusTooManyRequests, "active_upload_limit", "too many incomplete uploads; resume or allow stale sessions to expire")
 		return
 	}
 	if err != nil {

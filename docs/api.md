@@ -54,11 +54,15 @@ recommended 32 MiB chunk size, and an `upload_token` capability valid only for
 that upload session. Session creation is admission-controlled: it returns `507
 Insufficient Storage` if either the owner's quota or the filesystem safety
 reserve (including active-upload reservations) would be exceeded.
+It returns `429 active_upload_limit` once the configured per-user count of
+incomplete sessions is reached; this bounds database/event growth from a
+compromised authenticated account.
 
 ## TUS upload
 
 Create the TUS resource by POSTing to `/v1/uploads/` with `Authorization:
-Bearer <upload_token>`:
+Bearer <upload_token>` only. General access JWTs are intentionally rejected by
+the TUS endpoint:
 
 ```text
 Tus-Resumable: 1.0.0
