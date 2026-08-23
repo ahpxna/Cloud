@@ -15,7 +15,9 @@ account, queue, or integrity code.
    `PhotoCloudAPIBaseURL` with the HTTPS hostname configured in Cloudflare.
 5. Add the App Group capability to both targets in the Apple Developer portal.
 6. Run `make ios-parse` for a fast local syntax/configuration check, then use
-   `xcodebuild` from full Xcode for a real SDK and package build.
+   `make ios-test` from full Xcode for a real SDK/package build and XCTest on
+   an iPhone 16 simulator. This command does not sign, archive, upload, or
+   require paid Apple Developer membership.
 
 The Share Extension appears in Photos' system Share Sheet because it declares
 the `com.apple.share-services` extension point and image/movie activation rule.
@@ -47,6 +49,15 @@ original only when its detail view is opened. Original bytes stay in the app's
 private cache; before being cached, each download is streamed through SHA-256
 and must match the server's verified asset digest. No stable download URL or
 bearer credential is exposed to the Share Extension.
+
+The Library follows the server's opaque `next_cursor` until no page remains, so
+libraries larger than 50 assets are not truncated. Infinite scrolling has an
+explicit Load More fallback when automatic prefetch does not fire.
+
+The App Group payload and its queue record are removed only after the server
+reports `available`, which means verification and durable commit have finished.
+Failed, interrupted, and quarantined uploads retain their local payload. Cleanup
+is idempotent and retries on the next queue reload after an interrupted delete.
 
 The generated project still requires a physical-device acceptance test for
 Share Sheet import, background URLSession wakeup, app termination, airplane

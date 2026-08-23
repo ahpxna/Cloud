@@ -38,6 +38,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: gateway
     profiles: ["gateway"]
     user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
     environment:
@@ -53,6 +54,8 @@ services:
       VERIFICATION_WORKERS: ${VERIFICATION_WORKERS:-2}
       MAX_CONCURRENT_PATCHES: ${MAX_CONCURRENT_PATCHES:-6}
       MAX_PATCHES_PER_USER: ${MAX_PATCHES_PER_USER:-2}
+      PHOTO_MIN_FREE_BYTES: ${PHOTO_MIN_FREE_BYTES:-214748364800}
+      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-1m}
       HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-20m}
       HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-30m}
       HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-2m}
@@ -68,7 +71,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -80,6 +83,58 @@ services:
       - no-new-privileges:true
     cap_drop: ["ALL"]
     restart: unless-stopped
+
+  # Administrative tooling is not shipped in the Internet-facing gateway
+  # image. Invoke this one-shot profile only from the private host.
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: admin
+    profiles: ["admin"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: ${POSTGRES_USER:-photo_cloud}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    networks: [database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  # The signing key is mounted only for this explicitly invoked job, never in
+  # the gateway runtime. Production deployment must add a read-only key mount.
+  manifest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: manifest
+    profiles: ["manifest"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: ${POSTGRES_USER:-photo_cloud}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    networks: [database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
 
   cloudflared:
     image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.7.2}

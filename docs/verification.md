@@ -1,6 +1,6 @@
 # Verification Status
 
-Date: 2026-08-20
+Date: 2026-08-23
 
 ## Passed
 
@@ -30,10 +30,16 @@ Date: 2026-08-20
 - Cloudflared is isolated from PostgreSQL by separate ingress/database networks.
 - The `pki-sentinel` working tree was not modified; its untracked reuse
   assessment remains present.
+- The 2026-08 audit correctness fixes pass `go test -race ./...`: canonical
+  deduplication across filename extensions, asset/session association, bounded
+  login-limiter cardinality, Argon2 concurrency budget, expiry cleanup/retry,
+  periodic reconciliation wiring, strict duration parsing, and readiness/
+  admission-control source paths.
+- `go test -tags=integration -count=1 ./internal/upload` passes after applying
+  both PostgreSQL migrations.
 
 ## Pending
 
-- PostgreSQL execution of `db/migrations/0001_core.sql` on this Mac.
 - Docker-image build and Compose runtime startup on this Mac.
 - Physical-device TUSKit background test.
 - Cloudflare Tunnel end-to-end test, including request limits and HTTP 104.

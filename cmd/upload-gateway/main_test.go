@@ -5,20 +5,21 @@ import (
 	"time"
 )
 
-func TestEnvDuration(t *testing.T) {
+func TestEnvDurationStrict(t *testing.T) {
 	const fallback = 2 * time.Minute
 	t.Setenv("PHOTO_TEST_DURATION", "45s")
-	if got := envDuration("PHOTO_TEST_DURATION", fallback); got != 45*time.Second {
-		t.Fatalf("envDuration valid value = %s, want 45s", got)
+	got, err := envDurationStrict("PHOTO_TEST_DURATION", fallback)
+	if err != nil || got != 45*time.Second {
+		t.Fatalf("envDurationStrict valid value = %s, err=%v", got, err)
 	}
 
 	t.Setenv("PHOTO_TEST_DURATION", "not-a-duration")
-	if got := envDuration("PHOTO_TEST_DURATION", fallback); got != fallback {
-		t.Fatalf("envDuration invalid value = %s, want fallback %s", got, fallback)
+	if _, err := envDurationStrict("PHOTO_TEST_DURATION", fallback); err == nil {
+		t.Fatal("invalid duration silently used fallback")
 	}
 
 	t.Setenv("PHOTO_TEST_DURATION", "0s")
-	if got := envDuration("PHOTO_TEST_DURATION", fallback); got != fallback {
-		t.Fatalf("envDuration zero value = %s, want fallback %s", got, fallback)
+	if _, err := envDurationStrict("PHOTO_TEST_DURATION", fallback); err == nil {
+		t.Fatal("zero duration silently used fallback")
 	}
 }

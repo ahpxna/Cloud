@@ -5,6 +5,9 @@ artifacts/
 work/
 .cache/
 coverage.out
+manifest
+admin
+upload-gateway
 *.log
 *.pem
 *.key

@@ -49,7 +49,7 @@ struct LibraryAsset: Codable, Identifiable, Sendable {
     }
 }
 
-private struct LibraryPage: Codable {
+struct LibraryPage: Codable, Sendable {
     let assets: [LibraryAsset]
     let nextCursor: String?
 
@@ -103,8 +103,22 @@ struct PhotoCloudAPI: Sendable {
         try await request(path: "/v1/upload-sessions/\(id)", method: "GET", body: Optional<String>.none, bearer: accessToken, response: UploadSession.self)
     }
 
-    func library(accessToken: String) async throws -> [LibraryAsset] {
-        try await request(path: "/v1/assets", method: "GET", body: Optional<String>.none, bearer: accessToken, response: LibraryPage.self).assets
+    func libraryPage(cursor: String?, limit: Int = 50, accessToken: String) async throws -> LibraryPage {
+        guard (1...100).contains(limit) else {
+            throw APIProblem(status: 400, code: "invalid_limit", detail: "Library page size must be between 1 and 100.")
+        }
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor, !cursor.isEmpty {
+            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        return try await request(
+            path: "/v1/assets",
+            method: "GET",
+            queryItems: queryItems,
+            body: Optional<String>.none,
+            bearer: accessToken,
+            response: LibraryPage.self
+        )
     }
 
     func downloadOriginal(_ asset: LibraryAsset, accessToken: String) async throws -> URL {
@@ -124,8 +138,11 @@ struct PhotoCloudAPI: Sendable {
         return url
     }
 
-    private func request<Body: Encodable, Response: Decodable>(path: String, method: String, body: Body?, bearer: String?, response: Response.Type) async throws -> Response {
-        var request = URLRequest(url: baseURL.appending(path: path))
+    private func request<Body: Encodable, Response: Decodable>(path: String, method: String, queryItems: [URLQueryItem] = [], body: Body?, bearer: String?, response: Response.Type) async throws -> Response {
+        var components = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
+        components?.queryItems = queryItems.isEmpty ? nil : queryItems
+        guard let url = components?.url else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let bearer { request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
@@ -188,6 +205,7 @@ private struct CredentialResponse: Codable {
 
 actor AuthenticationStore {
     private var credential: Credential?
+    private var refreshTask: Task<Credential, Error>?
 
     func login(email: String, password: String, deviceName: String, api: PhotoCloudAPI) async throws {
         let newCredential = try await api.login(email: email, password: password, deviceName: deviceName)
@@ -204,7 +222,19 @@ actor AuthenticationStore {
             credential = nil
             throw APIProblem(status: 401, code: "session_expired", detail: "Sign in again to continue uploads.")
         }
-        current = try await api.refresh(current.refreshToken)
+        if let refreshTask {
+            current = try await refreshTask.value
+        } else {
+            let task = Task { try await api.refresh(current.refreshToken) }
+            refreshTask = task
+            do {
+                current = try await task.value
+            } catch {
+                refreshTask = nil
+                throw error
+            }
+            refreshTask = nil
+        }
         try KeychainStore.save(current)
         credential = current
         return current.accessToken

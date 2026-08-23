@@ -24,8 +24,14 @@ make create-user EMAIL=parent@example.com ROLE=member
 The response contains a 15-minute HS256 access token and a 30-day opaque
 refresh token. Store the refresh token in iOS Keychain, never UserDefaults or
 the photo queue database. `POST /v1/auth/refresh` rotates the refresh token;
-replaying the old token returns `401`. `POST /v1/auth/logout` revokes it and is
-idempotent.
+replaying the old token returns `401`. Refresh sessions are token families:
+reuse of a revoked token revokes every live descendant and emits a security
+warning without revealing the account to the caller. `POST /v1/auth/logout`
+revokes its token and is idempotent.
+
+`GET /v1/auth/sessions` requires an access token and lists active device
+sessions. `DELETE /v1/auth/sessions/{session_id}` revokes only a session owned
+by the caller; another account receives `404`.
 
 ## Create an upload session
 
@@ -45,7 +51,9 @@ The `(owner, client_asset_id)` pair is an idempotency key. Repeating identical
 immutable metadata returns the same session with `200`; changing it returns
 `409`. The response provides `upload_endpoint`, `session_id_metadata`, a
 recommended 32 MiB chunk size, and an `upload_token` capability valid only for
-that upload session.
+that upload session. Session creation is admission-controlled: it returns `507
+Insufficient Storage` if either the owner's quota or the filesystem safety
+reserve (including active-upload reservations) would be exceeded.
 
 ## TUS upload
 
@@ -88,7 +96,8 @@ storage path is never exposed in the API.
 
 ## Current omissions
 
-Thumbnails, EXIF extraction, device-session management, deletion, scheduled
-manifest generation, backup APIs, and physical-device iOS uploads are not yet
-implemented in this vertical slice. The administrative signed-manifest CLI is
-documented separately in `docs/runbooks/integrity-manifest.md`.
+MFA, thumbnails, EXIF extraction, deletion, scheduled manifest generation,
+encrypted off-site backup/restore, audit export, alert delivery, and
+physical-device iOS acceptance are not yet implemented. They remain public
+launch blockers. The administrative signed-manifest CLI is documented separately
+in `docs/runbooks/integrity-manifest.md`.

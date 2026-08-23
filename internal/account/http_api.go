@@ -25,12 +25,13 @@ const (
 )
 
 type API struct {
-	repository Repository
-	tokens     *auth.AccessTokenManager
-	logger     *slog.Logger
-	now        func() time.Time
-	limiter    *loginLimiter
-	dummyHash  string
+	repository   Repository
+	tokens       *auth.AccessTokenManager
+	logger       *slog.Logger
+	now          func() time.Time
+	limiter      *loginLimiter
+	passwordGate chan struct{}
+	dummyHash    string
 }
 
 func NewAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog.Logger) *API {
@@ -42,12 +43,13 @@ func NewAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog
 		panic("construct fixed-valid dummy password: " + err.Error())
 	}
 	return &API{
-		repository: repository,
-		tokens:     tokens,
-		logger:     logger,
-		now:        time.Now,
-		limiter:    newLoginLimiter(5, 10*time.Minute),
-		dummyHash:  dummyHash,
+		repository:   repository,
+		tokens:       tokens,
+		logger:       logger,
+		now:          time.Now,
+		limiter:      newLoginLimiter(5, 10*time.Minute, 10_000),
+		passwordGate: make(chan struct{}, 4),
+		dummyHash:    dummyHash,
 	}
 }
 
@@ -78,10 +80,60 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.refresh(w, r)
 	case r.URL.Path == "/v1/auth/logout" && r.Method == http.MethodPost:
 		api.logout(w, r)
+	case r.URL.Path == "/v1/auth/sessions" && r.Method == http.MethodGet:
+		api.listSessions(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/auth/sessions/") && r.Method == http.MethodDelete:
+		api.revokeSession(w, r, strings.TrimPrefix(r.URL.Path, "/v1/auth/sessions/"))
 	default:
-		w.Header().Set("Allow", "POST")
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		accountProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
+}
+
+func (api *API) listSessions(w http.ResponseWriter, r *http.Request) {
+	principal, ok := api.accessPrincipal(r)
+	if !ok {
+		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
+		return
+	}
+	sessions, err := api.repository.ListDeviceSessions(r.Context(), principal.UserID)
+	if err != nil {
+		api.logger.Error("list device sessions", "user_id", principal.UserID, "error", err)
+		accountProblem(w, http.StatusInternalServerError, "session_list_failed", "could not list signed-in devices")
+		return
+	}
+	accountJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (api *API) revokeSession(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if sessionID == "" || strings.Contains(sessionID, "/") {
+		accountProblem(w, http.StatusNotFound, "not_found", "device session not found")
+		return
+	}
+	principal, ok := api.accessPrincipal(r)
+	if !ok {
+		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
+		return
+	}
+	if err := api.repository.RevokeDeviceSession(r.Context(), principal.UserID, sessionID); err != nil {
+		if errors.Is(err, ErrInvalidCredentials) {
+			accountProblem(w, http.StatusNotFound, "not_found", "device session not found")
+			return
+		}
+		api.logger.Error("revoke device session", "user_id", principal.UserID, "error", err)
+		accountProblem(w, http.StatusInternalServerError, "session_revoke_failed", "could not revoke device")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (api *API) accessPrincipal(r *http.Request) (auth.Principal, bool) {
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return auth.Principal{}, false
+	}
+	principal, err := api.tokens.Verify(parts[1])
+	return principal, err == nil
 }
 
 func (api *API) login(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +149,14 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	if !api.limiter.Allow(email, api.now()) {
 		w.Header().Set("Retry-After", "600")
 		accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
+		return
+	}
+	select {
+	case api.passwordGate <- struct{}{}:
+		defer func() { <-api.passwordGate }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		accountProblem(w, http.StatusTooManyRequests, "login_busy", "try again shortly")
 		return
 	}
 
@@ -143,6 +203,9 @@ func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
 	now := api.now().UTC()
 	user, sessionID, err := api.repository.RotateRefreshSession(r.Context(), oldHash, newHash, now.Add(refreshTokenTTL))
 	if err != nil {
+		if errors.Is(err, ErrRefreshReplay) {
+			api.logger.Warn("refresh token replay; revoked token family")
+		}
 		accountProblem(w, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid or expired")
 		return
 	}
@@ -269,20 +332,29 @@ type loginAttempt struct {
 }
 
 type loginLimiter struct {
-	mu      sync.Mutex
-	entries map[string]loginAttempt
-	limit   int
-	window  time.Duration
+	mu       sync.Mutex
+	entries  map[string]loginAttempt
+	limit    int
+	window   time.Duration
+	capacity int
 }
 
-func newLoginLimiter(limit int, window time.Duration) *loginLimiter {
-	return &loginLimiter{entries: make(map[string]loginAttempt), limit: limit, window: window}
+func newLoginLimiter(limit int, window time.Duration, capacity int) *loginLimiter {
+	return &loginLimiter{entries: make(map[string]loginAttempt), limit: limit, window: window, capacity: capacity}
 }
 
 func (limiter *loginLimiter) Allow(key string, now time.Time) bool {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
+	for existingKey, existing := range limiter.entries {
+		if now.Sub(existing.windowStart) >= limiter.window {
+			delete(limiter.entries, existingKey)
+		}
+	}
 	attempt := limiter.entries[key]
+	if attempt.windowStart.IsZero() && len(limiter.entries) >= limiter.capacity {
+		return false
+	}
 	if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) >= limiter.window {
 		limiter.entries[key] = loginAttempt{count: 1, windowStart: now}
 		return true

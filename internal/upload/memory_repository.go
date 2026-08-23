@@ -39,6 +39,16 @@ func (r *MemoryRepository) CreateSession(_ context.Context, input CreateSessionI
 			subtle.ConstantTimeCompare(existing.ClientSHA256[:], input.ClientSHA256[:]) != 1 {
 			return Session{}, false, ErrConflict
 		}
+		if existing.State == StateExpired {
+			existing.State = StateCreated
+			existing.ReceivedSize = 0
+			existing.ServerSHA256 = nil
+			existing.TransportResource = ""
+			existing.FinalStorageKey = ""
+			existing.AssetID = ""
+			existing.ExpiresAt = input.ExpiresAt
+			r.sessions[id] = existing
+		}
 		return existing, false, nil
 	}
 
@@ -188,29 +198,31 @@ func (r *MemoryRepository) MarkAvailable(_ context.Context, id, storageKey strin
 	session.State = StateAvailable
 	session.ServerSHA256 = &hash
 	session.FinalStorageKey = storageKey
-	duplicate := false
-	for _, asset := range r.assets {
+	for assetID, asset := range r.assets {
 		if asset.OwnerID == session.OwnerID && subtle.ConstantTimeCompare(asset.ContentSHA256[:], hash[:]) == 1 {
-			duplicate = true
-			break
+			if asset.StorageKey != storageKey {
+				return fmt.Errorf("duplicate digest has inconsistent storage key: %w", ErrInvalidState)
+			}
+			session.AssetID = assetID
+			r.sessions[id] = session
+			return nil
 		}
 	}
-	if !duplicate {
-		assetID, err := NewID()
-		if err != nil {
-			return err
-		}
-		r.assets[assetID] = Asset{
-			ID:               assetID,
-			OwnerID:          session.OwnerID,
-			StorageKey:       storageKey,
-			OriginalFilename: session.OriginalFilename,
-			MediaType:        session.MediaType,
-			ByteSize:         session.ExpectedSize,
-			ContentSHA256:    hash,
-			CreatedAt:        time.Now().UTC(),
-		}
+	assetID, err := NewID()
+	if err != nil {
+		return err
 	}
+	r.assets[assetID] = Asset{
+		ID:               assetID,
+		OwnerID:          session.OwnerID,
+		StorageKey:       storageKey,
+		OriginalFilename: session.OriginalFilename,
+		MediaType:        session.MediaType,
+		ByteSize:         session.ExpectedSize,
+		ContentSHA256:    hash,
+		CreatedAt:        time.Now().UTC(),
+	}
+	session.AssetID = assetID
 	r.sessions[id] = session
 	return nil
 }
@@ -296,4 +308,34 @@ func (r *MemoryRepository) PendingVerification(_ context.Context, limit int) ([]
 		}
 	}
 	return result, nil
+}
+
+func (r *MemoryRepository) ExpiredSessions(_ context.Context, now time.Time, limit int) ([]Session, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]Session, 0, limit)
+	for _, session := range r.sessions {
+		if !session.ExpiresAt.After(now) && (session.State == StateCreated || session.State == StateUploading || session.State == StateFailed) {
+			result = append(result, session)
+			if len(result) == limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func (r *MemoryRepository) MarkExpired(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.sessions[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if session.State != StateCreated && session.State != StateUploading && session.State != StateFailed && session.State != StateExpired {
+		return ErrInvalidState
+	}
+	session.State = StateExpired
+	r.sessions[id] = session
+	return nil
 }

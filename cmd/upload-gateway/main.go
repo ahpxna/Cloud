@@ -71,6 +71,14 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	minimumFreeBytes, err := envInt64("PHOTO_MIN_FREE_BYTES", 200<<30)
+	if err != nil {
+		return err
+	}
+	reconcileInterval, err := envDurationStrict("RECONCILE_INTERVAL", time.Minute)
+	if err != nil {
+		return err
+	}
 	repository := upload.NewPostgresRepository(pool)
 	application, err := gateway.New(gateway.Config{
 		Repository:           repository,
@@ -82,6 +90,8 @@ func run(logger *slog.Logger) error {
 		VerificationJobs:     verificationJobs,
 		MaxConcurrentPatches: maxConcurrentPatches,
 		MaxPatchesPerUser:    maxPatchesPerUser,
+		MinimumFreeBytes:     minimumFreeBytes,
+		ReconcileInterval:    reconcileInterval,
 		Logger:               logger,
 	})
 	if err != nil {
@@ -89,13 +99,25 @@ func run(logger *slog.Logger) error {
 	}
 	defer application.Close()
 
+	readTimeout, err := envDurationStrict("HTTP_READ_TIMEOUT", 20*time.Minute)
+	if err != nil {
+		return err
+	}
+	writeTimeout, err := envDurationStrict("HTTP_WRITE_TIMEOUT", 30*time.Minute)
+	if err != nil {
+		return err
+	}
+	idleTimeout, err := envDurationStrict("HTTP_IDLE_TIMEOUT", 2*time.Minute)
+	if err != nil {
+		return err
+	}
 	server := &http.Server{
 		Addr:              envString("HTTP_ADDR", "127.0.0.1:8080"),
 		Handler:           application,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       envDuration("HTTP_READ_TIMEOUT", 20*time.Minute),
-		WriteTimeout:      envDuration("HTTP_WRITE_TIMEOUT", 30*time.Minute),
-		IdleTimeout:       envDuration("HTTP_IDLE_TIMEOUT", 2*time.Minute),
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    64 << 10,
 	}
 	serverErrors := make(chan error, 1)
@@ -160,14 +182,14 @@ func envInt(name string, fallback int) (int, error) {
 	return int(value), err
 }
 
-func envDuration(name string, fallback time.Duration) time.Duration {
+func envDurationStrict(name string, fallback time.Duration) (time.Duration, error) {
 	value := os.Getenv(name)
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
-		return fallback
+		return 0, fmt.Errorf("%s must be a positive Go duration", name)
 	}
-	return parsed
+	return parsed, nil
 }

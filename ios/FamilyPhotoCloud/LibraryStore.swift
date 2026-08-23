@@ -3,28 +3,77 @@ import CryptoKit
 import SwiftUI
 import UIKit
 
+struct LibraryPagination {
+    private(set) var assets: [LibraryAsset] = []
+    private(set) var nextCursor: String?
+
+    var hasMore: Bool { nextCursor != nil }
+
+    mutating func replace(with page: LibraryPage) {
+        assets = page.assets
+        nextCursor = page.nextCursor
+    }
+
+    mutating func append(_ page: LibraryPage, requestedCursor: String) {
+        let existingIDs = Set(assets.map(\.id))
+        assets.append(contentsOf: page.assets.filter { !existingIDs.contains($0.id) })
+        nextCursor = page.nextCursor == requestedCursor ? nil : page.nextCursor
+    }
+}
+
 @MainActor
 final class LibraryStore: ObservableObject {
     @Published private(set) var assets: [LibraryAsset] = []
     @Published private(set) var error: String?
     @Published private(set) var isLoading = false
+    @Published private(set) var isLoadingMore = false
+    @Published private(set) var hasMore = false
 
     private let coordinator: UploadCoordinator
     private var cachedURLs: [String: URL] = [:]
+    private var pagination = LibraryPagination()
+    private let pageSize = 50
 
     init(coordinator: UploadCoordinator) {
         self.coordinator = coordinator
     }
 
     func reload() async {
+        guard !isLoading, !isLoadingMore else { return }
         isLoading = true
         defer { isLoading = false }
         do {
-            assets = try await coordinator.libraryAssets()
+            let page = try await coordinator.libraryPage(cursor: nil, limit: pageSize)
+            pagination.replace(with: page)
+            applyPaginationState()
             error = nil
         } catch {
             error = error.localizedDescription
         }
+    }
+
+    func loadMoreIfNeeded(current asset: LibraryAsset) async {
+        guard asset.id == assets.last?.id else { return }
+        await loadMore()
+    }
+
+    func loadMore() async {
+        guard !isLoading, !isLoadingMore, let cursor = pagination.nextCursor else { return }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+        do {
+            let page = try await coordinator.libraryPage(cursor: cursor, limit: pageSize)
+            pagination.append(page, requestedCursor: cursor)
+            applyPaginationState()
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func applyPaginationState() {
+        assets = pagination.assets
+        hasMore = pagination.hasMore
     }
 
     func localURL(for asset: LibraryAsset) async throws -> URL {
@@ -75,9 +124,19 @@ struct LibraryView: View {
                 if store.assets.isEmpty && !store.isLoading {
                     ContentUnavailableView("No verified photos yet", systemImage: "photo.on.rectangle", description: Text(store.error ?? "Add a photo from the Share Sheet, then wait for server verification."))
                 } else {
-                    List(store.assets) { asset in
-                        NavigationLink(asset.originalFilename) {
-                            AssetDetailView(asset: asset, store: store)
+                    List {
+                        ForEach(store.assets) { asset in
+                            NavigationLink(asset.originalFilename) {
+                                AssetDetailView(asset: asset, store: store)
+                            }
+                            .task { await store.loadMoreIfNeeded(current: asset) }
+                        }
+                        if store.isLoadingMore {
+                            ProgressView("Loading more…")
+                                .frame(maxWidth: .infinity)
+                        } else if store.hasMore {
+                            Button("Load more") { Task { await store.loadMore() } }
+                                .frame(maxWidth: .infinity)
                         }
                     }
                     .refreshable { await store.reload() }

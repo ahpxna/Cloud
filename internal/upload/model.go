@@ -20,15 +20,17 @@ const (
 	StateCommitting  State = "committing"
 	StateAvailable   State = "available"
 	StateFailed      State = "failed"
+	StateExpired     State = "expired"
 	StateQuarantined State = "quarantined"
 )
 
 var (
-	ErrNotFound         = errors.New("upload session not found")
-	ErrConflict         = errors.New("upload session conflict")
-	ErrInvalidState     = errors.New("invalid upload state transition")
-	ErrOwnerMismatch    = errors.New("upload owner mismatch")
-	ErrChecksumMismatch = errors.New("uploaded content checksum mismatch")
+	ErrNotFound            = errors.New("upload session not found")
+	ErrConflict            = errors.New("upload session conflict")
+	ErrInvalidState        = errors.New("invalid upload state transition")
+	ErrOwnerMismatch       = errors.New("upload owner mismatch")
+	ErrChecksumMismatch    = errors.New("uploaded content checksum mismatch")
+	ErrInsufficientStorage = errors.New("insufficient storage capacity")
 )
 
 type Session struct {
@@ -45,6 +47,7 @@ type Session struct {
 	TransportResource string
 	FinalStorageKey   string
 	ExpiresAt         time.Time
+	AssetID           string
 }
 
 type CreateSessionInput struct {
@@ -55,6 +58,8 @@ type CreateSessionInput struct {
 	ExpectedSize     int64
 	ClientSHA256     [32]byte
 	ExpiresAt        time.Time
+	AvailableBytes   int64
+	MinimumFreeBytes int64
 }
 
 type Repository interface {
@@ -70,6 +75,8 @@ type Repository interface {
 	MarkQuarantined(context.Context, string, [32]byte, string) error
 	MarkFailed(context.Context, string, string) error
 	PendingVerification(context.Context, int) ([]Session, error)
+	ExpiredSessions(context.Context, time.Time, int) ([]Session, error)
+	MarkExpired(context.Context, string) error
 }
 
 // AssetRepository is deliberately read-only. Asset visibility is granted only

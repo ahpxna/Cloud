@@ -153,8 +153,10 @@ func (p *Processor) fail(ctx context.Context, id, code string, cause error) erro
 
 func finalStorageKey(session Session) string {
 	hash := hex.EncodeToString(session.ClientSHA256[:])
-	extension := safeExtension(session.OriginalFilename)
-	return filepath.ToSlash(filepath.Join("originals", session.OwnerID, hash[:2], hash+extension))
+	// Physical object identity is content-addressed and intentionally does not
+	// contain a client-supplied extension. Database uniqueness is per owner and
+	// digest, so extension-based paths would otherwise create orphan duplicates.
+	return filepath.ToSlash(filepath.Join("originals", session.OwnerID, hash[:2], hash))
 }
 
 func safeExtension(filename string) string {
@@ -168,6 +170,23 @@ func safeExtension(filename string) string {
 		}
 	}
 	return extension
+}
+
+// Expire removes only incomplete staging data, then records the terminal
+// state. If a process dies in either half, the periodic sweeper retries safely.
+func (p *Processor) Expire(ctx context.Context, session Session) error {
+	for _, path := range []string{
+		filepath.Join(p.StagingDirectory(), session.ID),
+		filepath.Join(p.StagingDirectory(), session.ID+".info"),
+	} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove expired staging data: %w", err)
+		}
+	}
+	if err := syncDirectory(p.StagingDirectory()); err != nil {
+		return fmt.Errorf("sync expired staging cleanup: %w", err)
+	}
+	return p.repository.MarkExpired(ctx, session.ID)
 }
 
 func hashAndSync(path string) ([32]byte, int64, error) {
@@ -194,7 +213,7 @@ func moveWithoutReplace(source, destination string) error {
 		return err
 	}
 	if _, err := os.Stat(destination); err == nil {
-		return nil
+		return errors.New("quarantine destination already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

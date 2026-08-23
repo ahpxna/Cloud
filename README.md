@@ -9,7 +9,10 @@ This repository now contains the first backend vertical slice: invite-only
 accounts, Argon2id password verification, rotating refresh sessions, short-lived
 access tokens, an authenticated tus gateway, owner isolation, bounded upload
 concurrency, SHA-256 verification, quarantine, crash recovery, and durable
-no-overwrite commit. The standalone `tusd-lab` remains intentionally unsafe and
+no-overwrite commit. It now also has content-addressed per-owner deduplication,
+quota/free-space admission control, stale-upload expiry, periodic reconciliation,
+readiness checks, bounded password-hash concurrency, and refresh-token-family
+replay revocation. The standalone `tusd-lab` remains intentionally unsafe and
 must never be routed from the Internet.
 
 The accepted direction is:
@@ -35,6 +38,16 @@ Extension queue, TUSKit-based upload transport, and private Library viewer, but
 it is unbuilt on this machine because full Xcode is absent. Thumbnails,
 scheduled manifest generation, backups, and physical-device background tests
 remain before an App Store release.
+
+## Budget-first order
+
+The current accepted path is documented in
+[ADR-0006](docs/adr/0006-complete-free-first-before-storage-purchase.md):
+complete source checks, local-only operator tests, and host preflight without
+new recurring cost; buy the 20 TB media disk next; then fund encrypted off-site
+backup and prove a restore before enabling public family use. A single 20 TB
+disk is primary storage, not a backup. See the
+[free-first commissioning checklist](docs/runbooks/free-first-commissioning.md).
 
 ## Production security gate
 
@@ -86,5 +99,9 @@ The lab endpoint binds to `127.0.0.1:1080`; do not publish it.
   upload metadata.
 - No public route may bypass the authenticated gateway.
 - A single storage disk is not a backup.
+- The gateway refuses new uploads when quota or the media free-space reserve
+  would be exceeded; `507` is a safety result, not a transient client error.
+- `/livez` only proves process liveness. `/readyz` also requires storage above
+  its reserve and a responsive repository; Compose uses `/readyz`.
 - The media filesystem must support hard links and durable directory `fsync`
   (use ext4 or XFS on Linux; do not use FAT/exFAT for originals).

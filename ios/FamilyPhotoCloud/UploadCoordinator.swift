@@ -2,6 +2,52 @@ import CryptoKit
 import Foundation
 import UIKit
 
+enum AvailableUploadFinalization {
+    case cleaned(QueuedUpload)
+    case persistencePending(QueuedUpload, Error)
+    case cleanupPending(QueuedUpload, Error)
+}
+
+enum AvailableUploadFinalizer {
+    static func finalize(
+        _ original: QueuedUpload,
+        persist: (QueuedUpload) throws -> Void,
+        cleanup: (QueuedUpload) throws -> Void
+    ) -> AvailableUploadFinalization {
+        var item = original
+        item.state = .available
+        item.lastError = nil
+
+        do {
+            try persist(item)
+        } catch {
+            return .persistencePending(item, error)
+        }
+
+        do {
+            try cleanup(item)
+        } catch {
+            return .cleanupPending(item, error)
+        }
+
+        return .cleaned(item)
+    }
+}
+
+enum HashWorker {
+    static func sha256(of url: URL) async throws -> String {
+        try await Task.detached(priority: .utility) {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var hasher = SHA256()
+            while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
+                hasher.update(data: data)
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }.value
+    }
+}
+
 @MainActor
 final class UploadCoordinator: ObservableObject {
     @Published private(set) var uploads: [QueuedUpload] = []
@@ -28,6 +74,8 @@ final class UploadCoordinator: ObservableObject {
     }
 
     func reload() {
+        do { try AppGroupQueue.cleanupCompleted() }
+        catch { lastError = error.localizedDescription }
         do { uploads = try AppGroupQueue.all() }
         catch { lastError = error.localizedDescription }
     }
@@ -45,6 +93,8 @@ final class UploadCoordinator: ObservableObject {
         for item in uploads where item.state != .available && item.state != .quarantined {
             if item.serverSessionID == nil {
                 await begin(item)
+            } else if item.tusUploadID == nil {
+                await recoverTransfer(item)
             } else {
                 await reconcile(item)
             }
@@ -55,9 +105,9 @@ final class UploadCoordinator: ObservableObject {
         transport.registerBackgroundHandler(completion, identifier: identifier)
     }
 
-    func libraryAssets() async throws -> [LibraryAsset] {
+    func libraryPage(cursor: String?, limit: Int) async throws -> LibraryPage {
         let accessToken = try await auth.accessToken(api: api)
-        return try await api.library(accessToken: accessToken)
+        return try await api.libraryPage(cursor: cursor, limit: limit, accessToken: accessToken)
     }
 
     func downloadOriginal(_ asset: LibraryAsset) async throws -> URL {
@@ -66,9 +116,10 @@ final class UploadCoordinator: ObservableObject {
     }
 
     private func begin(_ original: QueuedUpload) async {
+        var item = original
         do {
             let payload = try AppGroupQueue.payloadURL(for: original)
-            let digest = try sha256(of: payload)
+            let digest = try await HashWorker.sha256(of: payload)
             let attributes = try FileManager.default.attributesOfItem(atPath: payload.path())
             guard let size = attributes[.size] as? NSNumber else { throw URLError(.cannotOpenFile) }
             let accessToken = try await auth.accessToken(api: api)
@@ -82,35 +133,80 @@ final class UploadCoordinator: ObservableObject {
                 ),
                 accessToken: accessToken
             )
-            var item = original
             item.byteCount = size.int64Value
             item.sha256 = digest
             item.serverSessionID = session.id
-            item.state = .transferring
+            // Persist the desired transfer before asking TUSKit to create its
+            // resource. A crash here is recoverable from the server `created`
+            // state rather than becoming a silent stuck upload.
+            item.state = .queued
             item.lastError = nil
             try AppGroupQueue.save(item)
-            let uploadToken: String
-            if let token = session.uploadToken, !token.isEmpty {
-                uploadToken = token
-            } else {
-                let refreshed = try await api.uploadSession(id: session.id, accessToken: accessToken)
-                uploadToken = try Self.requireUploadToken(refreshed)
-            }
-            item.tusUploadID = try transport.enqueue(
-                item: item,
-                endpoint: try api.absoluteURL(for: session.uploadEndpoint),
-                uploadToken: uploadToken
-            )
-            try AppGroupQueue.save(item)
+            try await enqueueTransfer(&item, session: session, accessToken: accessToken)
             reload()
         } catch {
-            var item = original
-            item.state = .failed
+            // Once a server session exists, retain a queued record and retry
+            // reconciliation. Marking it failed would discard resumability.
+            item.state = item.serverSessionID == nil ? .failed : .queued
             item.lastError = error.localizedDescription
             try? AppGroupQueue.save(item)
             lastError = error.localizedDescription
             reload()
         }
+    }
+
+    private func recoverTransfer(_ original: QueuedUpload) async {
+        guard let sessionID = original.serverSessionID else { return }
+        var item = original
+        do {
+            let accessToken = try await auth.accessToken(api: api)
+            let session = try await api.uploadSession(id: sessionID, accessToken: accessToken)
+            switch session.state {
+            case "created":
+                try await enqueueTransfer(&item, session: session, accessToken: accessToken)
+            case "uploading":
+                guard let storedID = transport.storedUploadID(forSessionID: sessionID) else {
+                    // TUSKit persists its context before returning from enqueue;
+                    // if the process died before then, preserve the record and
+                    // surface an explicit recovery error instead of pretending
+                    // the upload has resumed.
+                    throw APIProblem(status: 409, code: "missing_local_tus_context", detail: "The upload was created on the server before the phone saved its resume state. Reopen the app to retry recovery; keep the original file.")
+                }
+                item.tusUploadID = storedID
+                item.state = .transferring
+                item.lastError = nil
+                try AppGroupQueue.save(item)
+                try transport.resumeStoredUpload(id: storedID)
+            default:
+                await reconcile(item)
+                return
+            }
+        } catch {
+            item.state = .queued
+            item.lastError = error.localizedDescription
+            try? AppGroupQueue.save(item)
+            lastError = error.localizedDescription
+        }
+        reload()
+    }
+
+    private func enqueueTransfer(_ item: inout QueuedUpload, session: UploadSession, accessToken: String) async throws {
+        try transport.validateChunkSize(session.recommendedChunkBytes)
+        let uploadToken: String
+        if let token = session.uploadToken, !token.isEmpty {
+            uploadToken = token
+        } else {
+            let refreshed = try await api.uploadSession(id: session.id, accessToken: accessToken)
+            uploadToken = try Self.requireUploadToken(refreshed)
+        }
+        item.tusUploadID = try transport.enqueue(
+            item: item,
+            endpoint: try api.absoluteURL(for: session.uploadEndpoint),
+            uploadToken: uploadToken
+        )
+        item.state = .transferring
+        item.lastError = nil
+        try AppGroupQueue.save(item)
     }
 
     private func tusFinished(context: [String: String]?) async {
@@ -130,9 +226,21 @@ final class UploadCoordinator: ObservableObject {
                 let status = try await api.uploadSession(id: sessionID, accessToken: accessToken)
                 switch status.state {
                 case "available":
-                    item.state = .available
-                    item.lastError = nil
-                    try AppGroupQueue.save(item)
+                    let finalization = AvailableUploadFinalizer.finalize(
+                        item,
+                        persist: { try AppGroupQueue.save($0) },
+                        cleanup: { try AppGroupQueue.removeCompleted($0) }
+                    )
+                    switch finalization {
+                    case .cleaned(let availableItem):
+                        item = availableItem
+                    case .persistencePending(let availableItem, let error):
+                        item = availableItem
+                        lastError = "Upload verified by the server, but its local queue state could not be saved; reconciliation will retry: \(error.localizedDescription)"
+                    case .cleanupPending(let availableItem, let error):
+                        item = availableItem
+                        lastError = "Upload verified, but local queue cleanup will retry: \(error.localizedDescription)"
+                    }
                     reload()
                     return
                 case "quarantined":
@@ -141,7 +249,17 @@ final class UploadCoordinator: ObservableObject {
                     try AppGroupQueue.save(item)
                     reload()
                     return
-                case "created", "uploading":
+                case "created":
+                    item.tusUploadID = nil
+                    item.state = .queued
+                    try AppGroupQueue.save(item)
+                    await recoverTransfer(item)
+                    return
+                case "uploading":
+                    if item.tusUploadID == nil {
+                        await recoverTransfer(item)
+                        return
+                    }
                     item.state = .transferring
                     item.lastError = nil
                     try AppGroupQueue.save(item)
@@ -175,16 +293,6 @@ final class UploadCoordinator: ObservableObject {
         item.lastError = error.localizedDescription
         try? AppGroupQueue.save(item)
         reload()
-    }
-
-    private func sha256(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
-            hasher.update(data: data)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func mediaType(for item: QueuedUpload) -> String {

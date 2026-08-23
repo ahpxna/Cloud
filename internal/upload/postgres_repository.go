@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -21,7 +22,8 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 const sessionColumns = `
     id::text, owner_id::text, client_asset_id, original_filename, media_type,
     expected_size, received_size, client_sha256, server_sha256, state,
-    COALESCE(transport_resource_id, ''), COALESCE(final_storage_key, ''), expires_at`
+    COALESCE(transport_resource_id, ''), COALESCE(final_storage_key, ''), expires_at,
+    COALESCE(asset_id::text, '')`
 
 type rowScanner interface {
 	Scan(...any) error
@@ -36,6 +38,7 @@ func scanSession(row rowScanner) (Session, error) {
 		&session.OriginalFilename, &session.MediaType, &session.ExpectedSize,
 		&session.ReceivedSize, &clientHash, &serverHash, &session.State,
 		&session.TransportResource, &session.FinalStorageKey, &session.ExpiresAt,
+		&session.AssetID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -65,49 +68,99 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 	}
 	defer tx.Rollback(ctx)
 
-	row := tx.QueryRow(ctx, `
-        INSERT INTO upload_sessions (
-            owner_id, client_asset_id, original_filename, media_type,
-            expected_size, client_sha256, transport, expires_at
-        ) VALUES ($1::uuid, $2, $3, $4, $5, $6, 'tus-v1', $7)
-        ON CONFLICT (owner_id, client_asset_id) DO NOTHING
-        RETURNING `+sessionColumns,
-		input.OwnerID, input.ClientAssetID, input.OriginalFilename, input.MediaType,
-		input.ExpectedSize, input.ClientSHA256[:], input.ExpiresAt,
-	)
-	session, scanErr := scanSession(row)
-	created := scanErr == nil
-	if scanErr != nil && !errors.Is(scanErr, ErrNotFound) {
-		return Session{}, false, scanErr
+	// Serialize admission only, not TUS PATCH traffic. `pg_advisory_xact_lock`
+	// keeps the reservation calculation correct across simultaneous creators.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(70420260823)`); err != nil {
+		return Session{}, false, err
 	}
 
-	if !created {
-		session, err = scanSession(tx.QueryRow(ctx, `
-            SELECT `+sessionColumns+` FROM upload_sessions
-            WHERE owner_id = $1::uuid AND client_asset_id = $2`,
-			input.OwnerID, input.ClientAssetID,
-		))
-		if err != nil {
-			return Session{}, false, err
-		}
+	session, lookupErr := scanSession(tx.QueryRow(ctx, `
+        SELECT `+sessionColumns+` FROM upload_sessions
+        WHERE owner_id = $1::uuid AND client_asset_id = $2`, input.OwnerID, input.ClientAssetID))
+	if lookupErr == nil {
 		if session.OriginalFilename != input.OriginalFilename ||
 			session.MediaType != input.MediaType ||
 			session.ExpectedSize != input.ExpectedSize ||
 			!bytes.Equal(session.ClientSHA256[:], input.ClientSHA256[:]) {
 			return Session{}, false, ErrConflict
 		}
-	} else {
-		if _, err := tx.Exec(ctx, `
-            INSERT INTO upload_events (upload_session_id, owner_id, event_type)
-            VALUES ($1::uuid, $2::uuid, 'created')`, session.ID, session.OwnerID); err != nil {
+		if session.State == StateExpired {
+			if _, err := tx.Exec(ctx, `
+                UPDATE upload_sessions
+                SET state = 'created', received_size = 0, server_sha256 = NULL,
+                    transport_resource_id = NULL, final_storage_key = NULL,
+                    asset_id = NULL, last_error_code = NULL, expires_at = $2,
+                    updated_at = now()
+                WHERE id = $1::uuid`, session.ID, input.ExpiresAt); err != nil {
+				return Session{}, false, err
+			}
+			if _, err := tx.Exec(ctx, `
+                INSERT INTO upload_events (upload_session_id, owner_id, event_type)
+                VALUES ($1::uuid, $2::uuid, 'resumed')`, session.ID, session.OwnerID); err != nil {
+				return Session{}, false, err
+			}
+			session, err = scanSession(tx.QueryRow(ctx, `SELECT `+sessionColumns+` FROM upload_sessions WHERE id = $1::uuid`, session.ID))
+			if err != nil {
+				return Session{}, false, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
 			return Session{}, false, err
 		}
+		return session, false, nil
+	}
+	if !errors.Is(lookupErr, ErrNotFound) {
+		return Session{}, false, lookupErr
+	}
+
+	var quotaBytes *int64
+	if err := tx.QueryRow(ctx, `SELECT quota_bytes FROM users WHERE id = $1::uuid FOR UPDATE`, input.OwnerID).Scan(&quotaBytes); err != nil {
+		return Session{}, false, err
+	}
+	var ownerReserved int64
+	if err := tx.QueryRow(ctx, `
+            SELECT COALESCE(SUM(expected_size), 0)
+            FROM upload_sessions
+            WHERE owner_id = $1::uuid
+              AND state NOT IN ('failed', 'expired', 'quarantined')`, input.OwnerID).Scan(&ownerReserved); err != nil {
+		return Session{}, false, err
+	}
+	if quotaBytes != nil && input.ExpectedSize > *quotaBytes-ownerReserved {
+		return Session{}, false, ErrInsufficientStorage
+	}
+	var activeReserved int64
+	if err := tx.QueryRow(ctx, `
+            SELECT COALESCE(SUM(expected_size), 0)
+            FROM upload_sessions
+	            WHERE state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing')`).Scan(&activeReserved); err != nil {
+		return Session{}, false, err
+	}
+	if input.AvailableBytes < input.MinimumFreeBytes || input.ExpectedSize > input.AvailableBytes-input.MinimumFreeBytes-activeReserved {
+		return Session{}, false, ErrInsufficientStorage
+	}
+
+	session, err = scanSession(tx.QueryRow(ctx, `
+        INSERT INTO upload_sessions (
+            owner_id, client_asset_id, original_filename, media_type,
+            expected_size, client_sha256, transport, expires_at
+        ) VALUES ($1::uuid, $2, $3, $4, $5, $6, 'tus-v1', $7)
+        RETURNING `+sessionColumns,
+		input.OwnerID, input.ClientAssetID, input.OriginalFilename, input.MediaType,
+		input.ExpectedSize, input.ClientSHA256[:], input.ExpiresAt,
+	))
+	if err != nil {
+		return Session{}, false, err
+	}
+	if _, err := tx.Exec(ctx, `
+        INSERT INTO upload_events (upload_session_id, owner_id, event_type)
+        VALUES ($1::uuid, $2::uuid, 'created')`, session.ID, session.OwnerID); err != nil {
+		return Session{}, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return Session{}, false, err
 	}
-	return session, created, nil
+	return session, true, nil
 }
 
 func (r *PostgresRepository) SessionByID(ctx context.Context, id string) (Session, error) {
@@ -289,21 +342,36 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 	if session.State != StateCommitting || !bytes.Equal(session.ClientSHA256[:], hash[:]) {
 		return ErrInvalidState
 	}
-	if _, err := tx.Exec(ctx, `
+	var assetID string
+	err = tx.QueryRow(ctx, `
         INSERT INTO assets (
             owner_id, upload_session_id, storage_key, original_filename,
             media_type, byte_size, content_sha256
         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
-        ON CONFLICT (owner_id, content_sha256) DO NOTHING`,
+        ON CONFLICT (owner_id, content_sha256) DO NOTHING
+        RETURNING id::text`,
 		session.OwnerID, session.ID, storageKey, session.OriginalFilename,
-		session.MediaType, session.ExpectedSize, hash[:]); err != nil {
+		session.MediaType, session.ExpectedSize, hash[:]).Scan(&assetID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var existingStorageKey string
+		err = tx.QueryRow(ctx, `
+            SELECT id::text, storage_key FROM assets
+            WHERE owner_id = $1::uuid AND content_sha256 = $2 AND deleted_at IS NULL
+	            FOR SHARE`, session.OwnerID, hash[:]).Scan(&assetID, &existingStorageKey)
+		if err != nil {
+			return err
+		}
+		if existingStorageKey != storageKey || storageKey != session.FinalStorageKey {
+			return fmt.Errorf("deduplicated asset has inconsistent storage key: %w", ErrInvalidState)
+		}
+	} else if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
         UPDATE upload_sessions
         SET state = 'available', server_sha256 = $2, final_storage_key = $3,
-            committed_at = now(), updated_at = now()
-        WHERE id = $1::uuid`, id, hash[:], storageKey); err != nil {
+            asset_id = $4::uuid, committed_at = now(), updated_at = now()
+        WHERE id = $1::uuid`, id, hash[:], storageKey, assetID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -381,6 +449,46 @@ func (r *PostgresRepository) PendingVerification(ctx context.Context, limit int)
 		sessions = append(sessions, session)
 	}
 	return sessions, rows.Err()
+}
+
+func (r *PostgresRepository) ExpiredSessions(ctx context.Context, now time.Time, limit int) ([]Session, error) {
+	rows, err := r.pool.Query(ctx, `
+        SELECT `+sessionColumns+` FROM upload_sessions
+        WHERE state IN ('created', 'uploading', 'failed') AND expires_at <= $1
+        ORDER BY expires_at, id
+        LIMIT $2`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sessions := make([]Session, 0, limit)
+	for rows.Next() {
+		session, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
+func (r *PostgresRepository) MarkExpired(ctx context.Context, id string) error {
+	command, err := r.pool.Exec(ctx, `
+        WITH changed AS (
+            UPDATE upload_sessions
+            SET state = 'expired', updated_at = now()
+            WHERE id = $1::uuid AND state IN ('created', 'uploading', 'failed')
+            RETURNING id, owner_id
+        )
+        INSERT INTO upload_events (upload_session_id, owner_id, event_type)
+        SELECT id, owner_id, 'expired' FROM changed`, id)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	return nil
 }
 
 func (r *PostgresRepository) ListAssets(ctx context.Context, ownerID string, before *AssetCursor, limit int) ([]Asset, error) {

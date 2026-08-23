@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 enum AppGroupQueueError: LocalizedError {
     case appGroupUnavailable
     case unsupportedPayload
+    case cleanupRequiresAvailable
 
     var errorDescription: String? {
         switch self {
@@ -11,6 +12,8 @@ enum AppGroupQueueError: LocalizedError {
             return "The shared app storage is unavailable. Check the App Group entitlement."
         case .unsupportedPayload:
             return "The shared item is not an image or video file."
+        case .cleanupRequiresAvailable:
+            return "An upload can only be removed after server verification is complete."
         }
     }
 }
@@ -67,7 +70,11 @@ enum AppGroupQueue {
     }
 
     static func all() throws -> [QueuedUpload] {
-        let records = try rootURL().appending(path: "records", directoryHint: .isDirectory)
+        try all(in: rootURL())
+    }
+
+    static func all(in root: URL) throws -> [QueuedUpload] {
+        let records = root.appending(path: "records", directoryHint: .isDirectory)
         guard FileManager.default.fileExists(atPath: records.path()) else { return [] }
         return try FileManager.default.contentsOfDirectory(
             at: records,
@@ -86,12 +93,39 @@ enum AppGroupQueue {
     }
 
     static func payloadURL(for item: QueuedUpload) throws -> URL {
+        try payloadURL(for: item, in: rootURL())
+    }
+
+    static func payloadURL(for item: QueuedUpload, in root: URL) throws -> URL {
         guard item.payloadFilename.range(of: #"^[0-9A-Fa-f-]+\.[A-Za-z0-9]+$"#, options: .regularExpression) != nil else {
             throw AppGroupQueueError.unsupportedPayload
         }
-        return try rootURL()
+        return root
             .appending(path: "payloads", directoryHint: .isDirectory)
             .appending(path: item.payloadFilename)
+    }
+
+    static func cleanupCompleted() throws {
+        try cleanupCompleted(in: rootURL())
+    }
+
+    static func cleanupCompleted(in root: URL) throws {
+        for item in try all(in: root) where item.state == .available {
+            try removeCompleted(item, in: root)
+        }
+    }
+
+    static func removeCompleted(_ item: QueuedUpload) throws {
+        try removeCompleted(item, in: rootURL())
+    }
+
+    static func removeCompleted(_ item: QueuedUpload, in root: URL) throws {
+        guard item.state == .available else {
+            throw AppGroupQueueError.cleanupRequiresAvailable
+        }
+        let payload = try payloadURL(for: item, in: root)
+        try removeIfPresent(payload)
+        try removeIfPresent(recordURL(for: item.id, in: root))
     }
 
     static func tusStorageDirectory() throws -> URL {
@@ -111,6 +145,17 @@ enum AppGroupQueue {
         let destination = records.appending(path: "\(item.id.uuidString).json")
         try JSONEncoder.photoCloud.encode(item).write(to: destination, options: [.atomic])
         try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: destination.path())
+    }
+
+    private static func recordURL(for id: UUID, in root: URL) -> URL {
+        root
+            .appending(path: "records", directoryHint: .isDirectory)
+            .appending(path: "\(id.uuidString).json")
+    }
+
+    private static func removeIfPresent(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path()) else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
     private static func createProtectedDirectory(_ directory: URL) throws {

@@ -5,6 +5,7 @@ package upload_test
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -48,12 +49,14 @@ func TestPostgresVerifiedCommitAndLibraryRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	migration, err := os.ReadFile(migrationPath(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	for _, migrationPath := range migrationPaths(t) {
+		migration, err := os.ReadFile(migrationPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, string(migration)); err != nil {
+			t.Fatalf("apply migration %s: %v", migrationPath, err)
+		}
 	}
 
 	var ownerID string
@@ -75,6 +78,8 @@ func TestPostgresVerifiedCommitAndLibraryRead(t *testing.T) {
 		ExpectedSize:     int64(len(content)),
 		ClientSHA256:     hash,
 		ExpiresAt:        time.Now().Add(time.Hour),
+		AvailableBytes:   1 << 40,
+		MinimumFreeBytes: 1,
 	})
 	if err != nil || !created {
 		t.Fatalf("create upload session: created=%v err=%v", created, err)
@@ -114,6 +119,34 @@ func TestPostgresVerifiedCommitAndLibraryRead(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE upload_events SET event_type = 'failed'`); err == nil {
 		t.Fatal("append-only upload_events trigger allowed mutation")
 	}
+
+	if _, err := pool.Exec(ctx, `UPDATE users SET quota_bytes = $2 WHERE id = $1::uuid`, ownerID, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = repository.CreateSession(ctx, upload.CreateSessionInput{
+		OwnerID: ownerID, ClientAssetID: "over-owner-quota", OriginalFilename: "next.jpg",
+		MediaType: "image/jpeg", ExpectedSize: 1, ClientSHA256: sha256.Sum256([]byte("x")),
+		ExpiresAt: time.Now().Add(time.Hour), AvailableBytes: 1 << 40, MinimumFreeBytes: 1,
+	})
+	if !errors.Is(err, upload.ErrInsufficientStorage) {
+		t.Fatalf("owner quota error = %v, want insufficient storage", err)
+	}
+
+	var secondOwnerID string
+	if err := pool.QueryRow(ctx, `
+        INSERT INTO users (email, password_hash, state)
+        VALUES ('second@example.com', 'test-only-password-hash', 'active')
+        RETURNING id::text`).Scan(&secondOwnerID); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = repository.CreateSession(ctx, upload.CreateSessionInput{
+		OwnerID: secondOwnerID, ClientAssetID: "below-free-floor", OriginalFilename: "next.jpg",
+		MediaType: "image/jpeg", ExpectedSize: 2, ClientSHA256: sha256.Sum256([]byte("xy")),
+		ExpiresAt: time.Now().Add(time.Hour), AvailableBytes: 10, MinimumFreeBytes: 10,
+	})
+	if !errors.Is(err, upload.ErrInsufficientStorage) {
+		t.Fatalf("free space reserve error = %v, want insufficient storage", err)
+	}
 }
 
 func availablePort(t *testing.T) uint32 {
@@ -126,11 +159,16 @@ func availablePort(t *testing.T) uint32 {
 	return uint32(listener.Addr().(*net.TCPAddr).Port)
 }
 
-func migrationPath(t *testing.T) string {
+func migrationPaths(t *testing.T) []string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve test location")
 	}
-	return filepath.Join(filepath.Dir(file), "..", "..", "db", "migrations", "0001_core.sql")
+	directory := filepath.Join(filepath.Dir(file), "..", "..", "db", "migrations")
+	paths, err := filepath.Glob(filepath.Join(directory, "*.sql"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("find migrations: %v", err)
+	}
+	return paths
 }

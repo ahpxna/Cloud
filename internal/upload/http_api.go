@@ -8,8 +8,10 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -17,20 +19,24 @@ import (
 )
 
 type API struct {
-	repository Repository
-	maxBytes   int64
-	chunkBytes int64
-	tokens     *auth.AccessTokenManager
-	now        func() time.Time
+	repository       Repository
+	maxBytes         int64
+	chunkBytes       int64
+	tokens           *auth.AccessTokenManager
+	now              func() time.Time
+	availableBytes   func() (int64, error)
+	minimumFreeBytes int64
 }
 
-func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager) *API {
+func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64) *API {
 	return &API{
-		repository: repository,
-		maxBytes:   maxBytes,
-		chunkBytes: chunkBytes,
-		tokens:     tokens,
-		now:        time.Now,
+		repository:       repository,
+		maxBytes:         maxBytes,
+		chunkBytes:       chunkBytes,
+		tokens:           tokens,
+		now:              time.Now,
+		availableBytes:   availableBytes,
+		minimumFreeBytes: minimumFreeBytes,
 	}
 }
 
@@ -98,6 +104,15 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 	var hash [32]byte
 	copy(hash[:], hashBytes)
 
+	if api.availableBytes == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "storage_unavailable", "storage admission control is unavailable")
+		return
+	}
+	availableBytes, err := api.availableBytes()
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "storage_unavailable", "storage capacity cannot be checked")
+		return
+	}
 	session, created, err := api.repository.CreateSession(r.Context(), CreateSessionInput{
 		OwnerID:          principal.UserID,
 		ClientAssetID:    request.ClientAssetID,
@@ -106,9 +121,15 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		ExpectedSize:     request.ExpectedSize,
 		ClientSHA256:     hash,
 		ExpiresAt:        api.now().UTC().Add(7 * 24 * time.Hour),
+		AvailableBytes:   availableBytes,
+		MinimumFreeBytes: api.minimumFreeBytes,
 	})
 	if errors.Is(err, ErrConflict) {
 		writeProblem(w, http.StatusConflict, "idempotency_conflict", "client_asset_id already has different immutable metadata")
+		return
+	}
+	if errors.Is(err, ErrInsufficientStorage) {
+		writeProblem(w, http.StatusInsufficientStorage, "insufficient_storage", "storage quota or free-space reserve would be exceeded")
 		return
 	}
 	if err != nil {
@@ -139,6 +160,39 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 	})
 }
 
+// AvailableBytes reports usable filesystem bytes from the media volume. The
+// caller still subtracts reservations inside the repository transaction.
+func AvailableBytes(mediaRoot string) func() (int64, error) {
+	return func() (int64, error) {
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(mediaRoot, &stat); err != nil {
+			return 0, err
+		}
+		return int64(stat.Bavail) * int64(stat.Bsize), nil
+	}
+}
+
+// CheckWritable proves that the staging path on the same media filesystem can
+// create, sync, and remove a tiny sentinel. It is used by readiness rather
+// than liveness because a mounted-but-read-only disk must stop new uploads.
+func CheckWritable(mediaRoot string) error {
+	directory := filepath.Join(mediaRoot, ".staging")
+	file, err := os.CreateTemp(directory, ".ready-")
+	if err != nil {
+		return err
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncDirectory(directory)
+}
+
 func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Principal, id string) {
 	if strings.Contains(id, "/") {
 		writeProblem(w, http.StatusNotFound, "not_found", "upload session not found")
@@ -150,6 +204,10 @@ func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Princ
 		return
 	}
 	now := api.now().UTC()
+	if !session.ExpiresAt.After(now) || session.State == StateExpired {
+		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
+		return
+	}
 	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, session.ExpiresAt.Sub(now))
 	if err != nil {
 		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")

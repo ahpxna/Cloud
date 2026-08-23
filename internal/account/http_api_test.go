@@ -24,6 +24,14 @@ type memoryAccountRepository struct {
 	nextID   int
 }
 
+func (repository *memoryAccountRepository) ListDeviceSessions(_ context.Context, _ string) ([]DeviceSession, error) {
+	return nil, nil
+}
+
+func (repository *memoryAccountRepository) RevokeDeviceSession(_ context.Context, _ string, _ string) error {
+	return ErrInvalidCredentials
+}
+
 func (repository *memoryAccountRepository) ActiveUserByEmail(_ context.Context, email string) (User, error) {
 	if strings.EqualFold(email, repository.user.Email) {
 		return repository.user, nil
@@ -159,6 +167,31 @@ func TestLoginDoesNotRevealUnknownAccount(t *testing.T) {
 		if response.StatusCode != http.StatusUnauthorized || problem["code"] != "invalid_credentials" {
 			t.Fatalf("unexpected login rejection: status=%d problem=%v", response.StatusCode, problem)
 		}
+	}
+}
+
+func TestLoginLimiterExpiresEntriesAndBoundsCardinality(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 0, 0, 0, 0, time.UTC)
+	limiter := newLoginLimiter(2, time.Minute, 2)
+	if !limiter.Allow("first@example.com", now) || !limiter.Allow("second@example.com", now) {
+		t.Fatal("expected initial limiter entries to be accepted")
+	}
+	if limiter.Allow("third@example.com", now) {
+		t.Fatal("unbounded unique-email attempts bypassed limiter capacity")
+	}
+	if !limiter.Allow("third@example.com", now.Add(time.Minute)) {
+		t.Fatal("expired attempts were not evicted")
+	}
+}
+
+func TestLoginLimiterLocksAccountWithinWindow(t *testing.T) {
+	now := time.Date(2026, time.August, 23, 0, 0, 0, 0, time.UTC)
+	limiter := newLoginLimiter(2, time.Minute, 10)
+	if !limiter.Allow("parent@example.com", now) || !limiter.Allow("parent@example.com", now) {
+		t.Fatal("expected attempts within limit")
+	}
+	if limiter.Allow("parent@example.com", now) {
+		t.Fatal("expected account limiter to reject third attempt")
 	}
 }
 

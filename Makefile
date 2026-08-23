@@ -33,7 +33,7 @@ edge-up: env ## Start gateway plus Cloudflare Tunnel after configuring its token
 .PHONY: create-user
 create-user: ## Create an invite-only family user in the running gateway stack
 	@test -n "$(EMAIL)" || (echo "usage: make create-user EMAIL=name@example.com [ROLE=member]"; exit 1)
-	docker compose --profile gateway exec upload-gateway admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
+	docker compose --profile admin run --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
 
 .PHONY: status
 status: ## Show local container state
@@ -58,6 +58,14 @@ test: config ## Run Go tests, vet, and repository contract checks
 ios-parse: ## Parse the iOS/Share Extension scaffold without full Xcode
 	swiftc -parse $$(rg --files ios -g '*.swift')
 	ruby -e 'require "yaml"; YAML.load_file("ios/project.yml")'
+
+.PHONY: host-preflight
+host-preflight: ## Read-only Linux/media-disk readiness check for the future host
+	bash scripts/host-preflight.sh
+
+.PHONY: ios-test
+ios-test: ## Generate the iOS project and run simulator XCTest (requires full Xcode + XcodeGen)
+	bash scripts/ios-test.sh
 
 .PHONY: integration-test
 integration-test: ## Run PostgreSQL 18 integration test without Docker

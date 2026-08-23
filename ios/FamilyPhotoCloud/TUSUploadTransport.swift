@@ -4,6 +4,7 @@ import TUSKit
 /// TUSKit retains custom headers in its own persistence. Its header is therefore
 /// a narrowly scoped upload capability, never the general access token.
 final class TUSUploadTransport: NSObject, TUSClientDelegate {
+    static let chunkSizeBytes = 32 * 1024 * 1024
     private let headerProvider: ScopedHeaderProvider
     private let client: TUSClient
     var uploadFinished: ((UUID, [String: String]?) -> Void)?
@@ -23,7 +24,7 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
             sessionIdentifier: "dev.phanan.familyphotocloud.tus",
             sessionConfiguration: configuration,
             storageDirectory: directory,
-            chunkSize: 32 * 1024 * 1024,
+            chunkSize: Self.chunkSizeBytes,
             generateHeaders: headerProvider.resolve
         )
         super.init()
@@ -47,6 +48,24 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         restoreStoredContexts()
         for upload in (try? client.getStoredUploads()) ?? [] {
             try? client.resume(id: upload.id)
+        }
+    }
+
+    func storedUploadID(forSessionID sessionID: String) -> UUID? {
+        (try? client.getStoredUploads())?.first(where: { $0.context?["session_id"] == sessionID })?.id
+    }
+
+    func resumeStoredUpload(id: UUID) throws {
+        try client.resume(id: id)
+    }
+
+    func validateChunkSize(_ serverRecommendation: Int64) throws {
+        guard serverRecommendation == Int64(Self.chunkSizeBytes) else {
+            throw APIProblem(
+                status: 409,
+                code: "upload_chunk_size_mismatch",
+                detail: "The server upload chunk size does not match this app version. Update the app or server before uploading."
+            )
         }
     }
 

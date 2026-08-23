@@ -55,3 +55,16 @@ targets:
         SKIP_INSTALL: YES
     entitlements:
       path: ShareExtension/FamilyPhotoCloudShare.entitlements
+
+  FamilyPhotoCloudTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: FamilyPhotoCloudTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.phanan.FamilyPhotoCloudTests
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+    dependencies:
+      - target: FamilyPhotoCloud

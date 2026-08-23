@@ -33,6 +33,8 @@ type Config struct {
 	VerificationJobs     int
 	MaxConcurrentPatches int
 	MaxPatchesPerUser    int
+	MinimumFreeBytes     int64
+	ReconcileInterval    time.Duration
 	Logger               *slog.Logger
 }
 
@@ -60,6 +62,12 @@ func New(config Config) (*Server, error) {
 	}
 	if config.MaxPatchesPerUser > config.MaxConcurrentPatches {
 		return nil, errors.New("per-user PATCH limit cannot exceed global limit")
+	}
+	if config.MinimumFreeBytes < 0 {
+		return nil, errors.New("minimum free bytes cannot be negative")
+	}
+	if config.ReconcileInterval <= 0 {
+		config.ReconcileInterval = time.Minute
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -108,7 +116,7 @@ func New(config Config) (*Server, error) {
 			}
 			session, err := config.Repository.SessionByID(event.Context, sessionID)
 			if err != nil || subtle.ConstantTimeCompare([]byte(session.OwnerID), []byte(principal.UserID)) != 1 ||
-				time.Now().After(session.ExpiresAt) {
+				time.Now().After(session.ExpiresAt) || session.State == upload.StateExpired {
 				return tusd.HTTPResponse{}, tusd.FileInfoChanges{}, tusd.NewError(
 					"ERR_PRODUCT_SESSION", "upload session is unavailable", http.StatusForbidden,
 				)
@@ -169,9 +177,10 @@ func New(config Config) (*Server, error) {
 			}
 		}
 	}()
-	go func() {
-		defer server.wg.Done()
-		pending, err := config.Repository.PendingVerification(ctx, 1000)
+	enqueuePending := func() {
+		// One bounded batch per tick prevents the same first page from being
+		// inserted forever before workers can transition it.
+		pending, err := config.Repository.PendingVerification(ctx, 100)
 		if err != nil {
 			config.Logger.Error("load verification recovery queue", "error", err)
 			return
@@ -181,6 +190,39 @@ func New(config Config) (*Server, error) {
 			case queue <- session.ID:
 			case <-ctx.Done():
 				return
+			}
+		}
+	}
+	expireStale := func() {
+		for {
+			expired, err := config.Repository.ExpiredSessions(ctx, time.Now().UTC(), 100)
+			if err != nil {
+				config.Logger.Error("load expired upload sessions", "error", err)
+				return
+			}
+			for _, session := range expired {
+				if err := processor.Expire(ctx, session); err != nil && !errors.Is(err, upload.ErrInvalidState) {
+					config.Logger.Error("expire stale upload", "upload_id", session.ID, "error", err)
+				}
+			}
+			if len(expired) < 100 {
+				return
+			}
+		}
+	}
+	go func() {
+		defer server.wg.Done()
+		enqueuePending()
+		expireStale()
+		ticker := time.NewTicker(config.ReconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				enqueuePending()
+				expireStale()
 			}
 		}
 	}()
@@ -202,12 +244,35 @@ func New(config Config) (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
 	})
-	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens)
+	readyHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		available, err := upload.AvailableBytes(config.MediaRoot)()
+		if err != nil || available < config.MinimumFreeBytes || upload.CheckWritable(config.MediaRoot) != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("{\"status\":\"not_ready\"}\n"))
+			return
+		}
+		readyContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if _, err := config.Repository.PendingVerification(readyContext, 1); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("{\"status\":\"not_ready\"}\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"status\":\"ready\"}\n"))
+	})
+	mux.Handle("GET /readyz", readyHandler)
+	// Compatibility alias for local probes; readiness is deliberately stricter
+	// than liveness and is the endpoint used by Compose.
+	mux.Handle("GET /healthz", readyHandler)
+	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes)
 	if config.Accounts != nil {
 		accountAPI := account.NewAPI(config.Accounts, config.Tokens, config.Logger)
 		mux.Handle("/v1/auth/", accountAPI)
@@ -286,6 +351,10 @@ func authenticateTus(
 			session, err := repository.SessionByID(r.Context(), resourceID)
 			if err != nil || subtle.ConstantTimeCompare([]byte(session.OwnerID), []byte(principal.UserID)) != 1 {
 				http.NotFound(w, r)
+				return
+			}
+			if time.Now().After(session.ExpiresAt) || session.State == upload.StateExpired {
+				http.Error(w, "upload session expired", http.StatusGone)
 				return
 			}
 		}
