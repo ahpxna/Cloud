@@ -170,14 +170,17 @@ func TestLoginDoesNotRevealUnknownAccount(t *testing.T) {
 	}
 }
 
-func TestLoginLimiterExpiresEntriesAndBoundsCardinality(t *testing.T) {
+func TestLoginLimiterEvictsOldestWhenCardinalityIsSaturated(t *testing.T) {
 	now := time.Date(2026, time.August, 23, 0, 0, 0, 0, time.UTC)
 	limiter := newLoginLimiter(2, time.Minute, 2)
 	if !limiter.Allow("first@example.com", now) || !limiter.Allow("second@example.com", now) {
 		t.Fatal("expected initial limiter entries to be accepted")
 	}
-	if limiter.Allow("third@example.com", now) {
-		t.Fatal("unbounded unique-email attempts bypassed limiter capacity")
+	if !limiter.Allow("third@example.com", now.Add(time.Second)) {
+		t.Fatal("a saturated limiter must evict instead of denying every unseen identity")
+	}
+	if len(limiter.entries) != 2 {
+		t.Fatalf("limiter cardinality = %d, want 2", len(limiter.entries))
 	}
 	if !limiter.Allow("third@example.com", now.Add(time.Minute)) {
 		t.Fatal("expired attempts were not evicted")

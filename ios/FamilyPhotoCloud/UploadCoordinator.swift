@@ -166,11 +166,16 @@ final class UploadCoordinator: ObservableObject {
                 try await enqueueTransfer(&item, session: session, accessToken: accessToken)
             case "uploading":
                 guard let storedID = transport.storedUploadID(forSessionID: sessionID) else {
-                    // TUSKit persists its context before returning from enqueue;
-                    // if the process died before then, preserve the record and
-                    // surface an explicit recovery error instead of pretending
-                    // the upload has resumed.
-                    throw APIProblem(status: 409, code: "missing_local_tus_context", detail: "The upload was created on the server before the phone saved its resume state. Reopen the app to retry recovery; keep the original file.")
+                    // A TUS resource cannot be resumed safely without its
+                    // local TUSKit context. Reset the incomplete server object
+                    // under owner authentication, then recreate the same
+                    // deterministic resource from byte zero. This deliberately
+                    // keeps the original local payload until availability.
+                    let reset = try await api.restartUploadSession(id: sessionID, accessToken: accessToken)
+                    item.tusUploadID = nil
+                    try await enqueueTransfer(&item, session: reset, accessToken: accessToken)
+                    reload()
+                    return
                 }
                 item.tusUploadID = storedID
                 item.state = .transferring

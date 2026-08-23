@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -210,6 +211,85 @@ func TestProcessorExpiresIncompleteSessionAndPermitsSameClientRetry(t *testing.T
 	})
 	if err != nil || created || retried.ID != session.ID || retried.State != StateCreated {
 		t.Fatalf("expired client retry=%#v created=%v err=%v", retried, created, err)
+	}
+}
+
+func TestCompletedTusUploadsFindsDurableFinalByteAfterEventLoss(t *testing.T) {
+	t.Parallel()
+	repository := NewMemoryRepository()
+	processor, err := NewProcessor(repository, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("final PATCH persisted before gateway notification")
+	hash := sha256.Sum256(content)
+	session, _, err := repository.CreateSession(context.Background(), CreateSessionInput{
+		OwnerID: testOwnerID, ClientAssetID: "crash-after-final-patch", OriginalFilename: "final.mov",
+		MediaType: "video/quicktime", ExpectedSize: int64(len(content)), ClientSHA256: hash,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ClaimTusCreation(context.Background(), session.ID, session.OwnerID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := []byte(`{"ID":"` + session.ID + `","Size":` + fmt.Sprint(len(content)) + `,"Offset":` + fmt.Sprint(len(content)) + `}`)
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID+".info"), sidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := processor.CompletedTusUploads()
+	if err != nil || len(completed) != 1 || completed[0].ID != session.ID || completed[0].Offset != int64(len(content)) {
+		t.Fatalf("durable completed uploads=%#v err=%v", completed, err)
+	}
+	if err := repository.MarkReceived(context.Background(), completed[0].ID, completed[0].Offset); err != nil {
+		t.Fatal(err)
+	}
+	if err := processor.Process(context.Background(), session.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.SessionByID(context.Background(), session.ID)
+	if err != nil || got.State != StateAvailable {
+		t.Fatalf("completed upload was not recovered: %#v err=%v", got, err)
+	}
+}
+
+func TestResetForRetryRemovesOnlyIncompleteTusResource(t *testing.T) {
+	t.Parallel()
+	repository := NewMemoryRepository()
+	processor, err := NewProcessor(repository, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("resettable bytes"))
+	session, _, err := repository.CreateSession(context.Background(), CreateSessionInput{
+		OwnerID: testOwnerID, ClientAssetID: "lost-tus-context", OriginalFilename: "retry.mov",
+		MediaType: "video/quicktime", ExpectedSize: 100, ClientSHA256: hash, ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ClaimTusCreation(context.Background(), session.ID, session.OwnerID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RecordProgress(context.Background(), session.ID, 25); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := processor.ResetForRetry(context.Background(), session.ID, testOwnerID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.SessionByID(context.Background(), session.ID)
+	if err != nil || got.State != StateCreated || got.ReceivedSize != 0 {
+		t.Fatalf("reset session=%#v err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(processor.StagingDirectory(), session.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reset staging data remained: %v", err)
 	}
 }
 

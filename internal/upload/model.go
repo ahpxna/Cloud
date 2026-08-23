@@ -68,6 +68,11 @@ type Repository interface {
 	ClaimTusCreation(context.Context, string, string, int64) error
 	RecordProgress(context.Context, string, int64) error
 	MarkReceived(context.Context, string, int64) error
+	// ClaimVerification durably leases pending work before it enters an
+	// in-memory worker queue. A process crash therefore delays work only until
+	// the lease expires; it cannot create unbounded duplicate hash jobs.
+	ClaimVerification(context.Context, string, time.Duration, int) ([]Session, error)
+	RenewVerificationLease(context.Context, string, string, time.Duration) error
 	BeginVerification(context.Context, string) (Session, error)
 	MarkVerified(context.Context, string, [32]byte) error
 	MarkCommitting(context.Context, string, string) error
@@ -77,6 +82,7 @@ type Repository interface {
 	PendingVerification(context.Context, int) ([]Session, error)
 	ExpiredSessions(context.Context, time.Time, int) ([]Session, error)
 	MarkExpired(context.Context, string) error
+	ResetForRetry(context.Context, string, string) (Session, error)
 }
 
 // AssetRepository is deliberately read-only. Asset visibility is granted only

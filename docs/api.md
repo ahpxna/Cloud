@@ -71,11 +71,18 @@ forces that ID to be the TUS resource ID. Every later `HEAD` and `PATCH` checks
 that the capability is scoped to that exact session; a different user receives
 `404`, not an existence oracle. PATCH requires `Content-Length`, permits at
 most 32 MiB, and returns `429 Retry-After: 2` when concurrency capacity is full.
+Upload capabilities expire after at most 10 minutes (even though the upload
+session may live longer); TUSKit fetches a fresh scoped capability before a
+network request. This limits the damage window after device-session revocation.
 
 TUSKit persists its applied custom headers. Therefore it must persist this
 scoped upload capability, never the general 15-minute access token. If the app
-needs to resume after it has lost local TUS metadata, it uses its access token
-to `GET /v1/upload-sessions/{id}` and receives a fresh scoped `upload_token`.
+has lost its local TUS metadata while an incomplete server resource is still
+`uploading`, it calls `POST /v1/upload-sessions/{id}/restart` with its access
+token. The gateway rejects stale PATCH requests, removes only that incomplete
+staging resource, and returns the session in `created` state; the client starts
+the same idempotent upload from byte zero. A complete resource is never
+restartable.
 
 On connection loss, keep the returned `Location`, issue authenticated `HEAD`,
 read `Upload-Offset`, and resume exactly there. Do not mark the local queue item

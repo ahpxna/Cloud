@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,20 @@ var safeID = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 type Processor struct {
 	repository Repository
 	mediaRoot  string
+}
+
+// CompletedTusUpload is reconstructed from tusd's durable FileInfo sidecar.
+// It closes the crash window between tusd acknowledging the final PATCH and
+// the gateway consuming its in-memory CompleteUploads notification.
+type CompletedTusUpload struct {
+	ID     string
+	Offset int64
+}
+
+type tusFileInfo struct {
+	ID     string `json:"ID"`
+	Size   int64  `json:"Size"`
+	Offset int64  `json:"Offset"`
 }
 
 func NewProcessor(repository Repository, mediaRoot string) (*Processor, error) {
@@ -40,6 +55,42 @@ func NewProcessor(repository Repository, mediaRoot string) (*Processor, error) {
 
 func (p *Processor) StagingDirectory() string {
 	return filepath.Join(p.mediaRoot, ".staging", "tus")
+}
+
+func (p *Processor) CompletedTusUploads() ([]CompletedTusUpload, error) {
+	entries, err := os.ReadDir(p.StagingDirectory())
+	if err != nil {
+		return nil, fmt.Errorf("read tus staging directory: %w", err)
+	}
+	completed := make([]CompletedTusUpload, 0)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".info") {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(p.StagingDirectory(), entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read tus sidecar %q: %w", entry.Name(), err)
+		}
+		var info tusFileInfo
+		if err := json.Unmarshal(contents, &info); err != nil {
+			return nil, fmt.Errorf("decode tus sidecar %q: %w", entry.Name(), err)
+		}
+		if !safeID.MatchString(info.ID) || info.ID+".info" != entry.Name() || info.Size < 0 || info.Offset != info.Size {
+			continue
+		}
+		stat, err := os.Stat(filepath.Join(p.StagingDirectory(), info.ID))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("stat completed tus object %q: %w", info.ID, err)
+		}
+		if stat.Size() != info.Size {
+			continue
+		}
+		completed = append(completed, CompletedTusUpload{ID: info.ID, Offset: info.Offset})
+	}
+	return completed, nil
 }
 
 func (p *Processor) Process(ctx context.Context, id string) error {
@@ -187,6 +238,29 @@ func (p *Processor) Expire(ctx context.Context, session Session) error {
 		return fmt.Errorf("sync expired staging cleanup: %w", err)
 	}
 	return p.repository.MarkExpired(ctx, session.ID)
+}
+
+// ResetForRetry is used only when an authenticated device has lost its local
+// TUSKit resume context. State is first moved away from `uploading`, causing
+// the gateway to reject any stale PATCH, then the old server resource is
+// removed so a deterministic TUS POST can create it again safely.
+func (p *Processor) ResetForRetry(ctx context.Context, id, ownerID string) (Session, error) {
+	session, err := p.repository.ResetForRetry(ctx, id, ownerID)
+	if err != nil {
+		return Session{}, err
+	}
+	for _, path := range []string{
+		filepath.Join(p.StagingDirectory(), session.ID),
+		filepath.Join(p.StagingDirectory(), session.ID+".info"),
+	} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return Session{}, fmt.Errorf("remove reset staging data: %w", err)
+		}
+	}
+	if err := syncDirectory(p.StagingDirectory()); err != nil {
+		return Session{}, fmt.Errorf("sync reset staging cleanup: %w", err)
+	}
+	return session, nil
 }
 
 func hashAndSync(path string) ([32]byte, int64, error) {

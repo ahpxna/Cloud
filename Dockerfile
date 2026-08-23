@@ -9,7 +9,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/upload-gateway ./cmd/upload-gateway \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/admin ./cmd/admin \
-    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/manifest ./cmd/manifest
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/manifest ./cmd/manifest \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
 FROM alpine:3.23 AS runtime-base
 RUN apk add --no-cache ca-certificates \
@@ -29,3 +30,12 @@ ENTRYPOINT ["/usr/local/bin/admin"]
 FROM runtime-base AS manifest
 COPY --from=build /out/manifest /usr/local/bin/manifest
 ENTRYPOINT ["/usr/local/bin/manifest"]
+
+FROM runtime-base AS migrate
+COPY --from=build /out/migrate /usr/local/bin/migrate
+COPY db/migrations /app/migrations
+ENTRYPOINT ["/usr/local/bin/migrate"]
+
+# Keep the Internet-facing gateway as Docker's default final target. CI still
+# builds and scans every privileged/offline tool target explicitly.
+FROM gateway AS release

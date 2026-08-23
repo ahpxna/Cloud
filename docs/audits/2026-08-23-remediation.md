@@ -8,19 +8,21 @@ engineering remediation record, not a production-launch approval.
 | Audit finding | Change | Evidence |
 |---|---|---|
 | Extension-dependent dedup paths could orphan blobs | Per-owner content-addressed path is now extensionless; `available` sessions reference either their newly inserted asset or the existing deduplicated asset | `TestProcessorDeduplicatesDifferentExtensionsToOneCanonicalObject`; PostgreSQL integration migration test |
-| Login limiter had unbounded keys and unbounded Argon2 work | Expiring, cardinality-bounded account limiter plus a global four-worker password verification gate | account limiter unit tests; `go test -race ./...` |
+| Login limiter had unbounded keys and unbounded Argon2 work | Expiring bounded cache evicts oldest entries when saturated, plus a global four-worker password verification gate | account limiter unit tests; `go test -race ./...` |
 | iOS queue could crash before a transfer intent existed | Desired transfer is saved before TUS enqueue; recovery re-enqueues `created` sessions or resumes stored TUS context; unresolvable missing local context is explicit and retains the original | Swift source parse; full Xcode/device test remains required |
 | iOS library ignored `next_cursor` | Cursor pagination and explicit Load More fallback are present | `LibraryPaginationTests` |
 | Share Extension imported only one provider | It now attempts every selected image/movie provider, retaining each successful queue record | Swift source parse; full Xcode acceptance remains required |
 | SHA-256 ran on MainActor | Hashing moved to a utility-priority detached worker | Swift source parse; device performance measurement remains required |
 | Refresh race | `AuthenticationStore` has one shared refresh task | Swift source parse; XCTest pending full Xcode |
 | Completed local payloads leaked | Available-only idempotent queue cleanup is implemented | `AppGroupQueueTests` |
-| Startup recovery was capped/one-shot | Bounded periodic reconciliation and stale-session expiry sweeper added | gateway/unit and PostgreSQL integration tests |
+| Final PATCH could be durable while in-memory completion event was lost | Periodic recovery inspects complete tusd sidecars, moves `uploading` to `received`, then claims verification | `TestCompletedTusUploadsFindsDurableFinalByteAfterEventLoss` |
+| Startup recovery was capped/one-shot and could duplicate large hash jobs | Periodic reconciliation uses a durable PostgreSQL verification lease with renewal | PostgreSQL integration lease assertion |
 | Expiry existed only in schema | Expiry state, staging cleanup, event, and retry of the same idempotency key added | `TestProcessorExpiresIncompleteSessionAndPermitsSameClientRetry` |
 | Health endpoint was only liveness | `/livez` is liveness; `/readyz` checks media free reserve, staging write/sync/removal, and repository responsiveness | Compose healthcheck targets `/readyz` |
-| No storage admission | Per-user quota plus globally serialized free-space reservation and `507` response added | PostgreSQL integration test |
+| No storage admission | Per-user unique-asset quota plus pending reservation and remaining-byte global free-space reservation with `507` response | PostgreSQL integration test |
+| PostgreSQL init scripts could not upgrade an existing volume | Checksum-protected transactional migration runner gates dependent services | PostgreSQL integration migration-ledger assertion |
 | Refresh replay lacked family revocation | Migration adds session family/parent/reuse fields; replay revokes active family descendants | account repository implementation; production migration evidence pending |
-| Gateway image included admin/signer binaries | Multi-stage Docker targets make gateway/admin/manifest distinct runtime images | `docker build --target gateway`; runtime inspection confirms only gateway binary |
+| CI scanned Docker's last stage instead of the public gateway | CI/security build and scan gateway, admin, manifest, and migration targets independently; Docker default is gateway | workflow matrix + Dockerfile target layout |
 | Tracked compiled manifest binary | Removed and ignored local binary artifact | Git index change |
 | Go patch level/config fallback | Go 1.26.7 used in module, Docker, CI; duration configuration now fails closed | race suite and Docker build |
 

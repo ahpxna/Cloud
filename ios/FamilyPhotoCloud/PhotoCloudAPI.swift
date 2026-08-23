@@ -103,6 +103,10 @@ struct PhotoCloudAPI: Sendable {
         try await request(path: "/v1/upload-sessions/\(id)", method: "GET", body: Optional<String>.none, bearer: accessToken, response: UploadSession.self)
     }
 
+    func restartUploadSession(id: String, accessToken: String) async throws -> UploadSession {
+        try await request(path: "/v1/upload-sessions/\(id)/restart", method: "POST", body: Optional<String>.none, bearer: accessToken, response: UploadSession.self)
+    }
+
     func libraryPage(cursor: String?, limit: Int = 50, accessToken: String) async throws -> LibraryPage {
         guard (1...100).contains(limit) else {
             throw APIProblem(status: 400, code: "invalid_limit", detail: "Library page size must be between 1 and 100.")

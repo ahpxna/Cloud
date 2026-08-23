@@ -15,6 +15,10 @@ readiness checks, bounded password-hash concurrency, and refresh-token-family
 replay revocation. The standalone `tusd-lab` remains intentionally unsafe and
 must never be routed from the Internet.
 
+Schema changes run through the `migrate` one-shot service, which records a
+version and SHA-256 checksum for every migration. PostgreSQL's first-boot init
+directory is not used because it silently skips upgrades of existing volumes.
+
 The accepted direction is:
 
 - Cloudflare Tunnel for the MVP ingress.
@@ -90,6 +94,18 @@ make protocol-lab-up
 
 The lab endpoint binds to `127.0.0.1:1080`; do not publish it.
 
+### Schema upgrades
+
+For a fresh host, `migrate` runs automatically before the gateway/admin/manifest
+services. Never edit a migration that has reached a host: the runner rejects a
+checksum mismatch. Take a verified backup before any upgrade.
+
+The only exception is a one-time upgrade from the old pre-ledger Compose
+deployment. After independently confirming which SQL files were already
+applied, set `PHOTO_MIGRATION_BASELINE_VERSION` to that exact version for one
+run, then remove it. This is explicit operator acknowledgement, not an
+automatic guess about a production schema.
+
 ## Project rules
 
 - Originals are immutable after a verified commit.
@@ -101,6 +117,14 @@ The lab endpoint binds to `127.0.0.1:1080`; do not publish it.
 - A single storage disk is not a backup.
 - The gateway refuses new uploads when quota or the media free-space reserve
   would be exceeded; `507` is a safety result, not a transient client error.
+  Quota is visible unique assets plus unique pending content; free-space
+  reservation is only bytes not yet persisted by active TUS transfers.
+- A verifier gets a PostgreSQL lease before entering the in-memory worker queue
+  and renews it while hashing large videos, avoiding reconciliation-induced
+  duplicate work.
+- Startup and periodic reconciliation inspect durable tusd `.info` sidecars.
+  A full staged file stuck in database state `uploading` after an event-boundary
+  crash moves idempotently to verification rather than being expired.
 - `/livez` only proves process liveness. `/readyz` also requires storage above
   its reserve and a responsive repository; Compose uses `/readyz`.
 - The media filesystem must support hard links and durable directory `fsync`

@@ -1,5 +1,4 @@
 import AVKit
-import CryptoKit
 import SwiftUI
 import UIKit
 
@@ -82,7 +81,9 @@ final class LibraryStore: ObservableObject {
         }
         let temporaryURL = try await coordinator.downloadOriginal(asset)
         do {
-            let digest = try sha256(of: temporaryURL)
+            // Verification can read multi-gigabyte videos. Reuse the detached
+            // uploader hash worker rather than monopolising MainActor.
+            let digest = try await HashWorker.sha256(of: temporaryURL)
             guard digest.caseInsensitiveCompare(asset.contentSHA256) == .orderedSame else {
                 throw APIProblem(status: 409, code: "download_integrity_mismatch", detail: "Downloaded original does not match the server's verified SHA-256.")
             }
@@ -104,15 +105,6 @@ final class LibraryStore: ObservableObject {
         return target
     }
 
-    private func sha256(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
-            hasher.update(data: data)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
 }
 
 struct LibraryView: View {

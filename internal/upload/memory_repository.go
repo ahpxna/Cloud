@@ -132,6 +132,33 @@ func (r *MemoryRepository) MarkReceived(_ context.Context, id string, size int64
 	return nil
 }
 
+// MemoryRepository executes verification synchronously in tests, so a durable
+// lease is not required. Keep the same claiming contract as PostgreSQL to make
+// failure-path tests exercise the production scheduler shape.
+func (r *MemoryRepository) ClaimVerification(_ context.Context, _ string, _ time.Duration, limit int) ([]Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]Session, 0, limit)
+	for id, session := range r.sessions {
+		switch session.State {
+		case StateReceived:
+			session.State = StateVerifying
+			r.sessions[id] = session
+			result = append(result, session)
+		case StateVerifying, StateVerified, StateCommitting:
+			result = append(result, session)
+		}
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (r *MemoryRepository) RenewVerificationLease(_ context.Context, _ string, _ string, _ time.Duration) error {
+	return nil
+}
+
 func (r *MemoryRepository) BeginVerification(_ context.Context, id string) (Session, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -338,4 +365,21 @@ func (r *MemoryRepository) MarkExpired(_ context.Context, id string) error {
 	session.State = StateExpired
 	r.sessions[id] = session
 	return nil
+}
+
+func (r *MemoryRepository) ResetForRetry(_ context.Context, id, ownerID string) (Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.sessions[id]
+	if !ok {
+		return Session{}, ErrNotFound
+	}
+	if session.OwnerID != ownerID || (session.State != StateCreated && session.State != StateUploading) || session.ReceivedSize >= session.ExpectedSize {
+		return Session{}, ErrInvalidState
+	}
+	session.State = StateCreated
+	session.ReceivedSize = 0
+	session.TransportResource = ""
+	r.sessions[id] = session
+	return session, nil
 }

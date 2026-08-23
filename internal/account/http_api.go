@@ -346,16 +346,32 @@ func newLoginLimiter(limit int, window time.Duration, capacity int) *loginLimite
 func (limiter *loginLimiter) Allow(key string, now time.Time) bool {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	for existingKey, existing := range limiter.entries {
-		if now.Sub(existing.windowStart) >= limiter.window {
-			delete(limiter.entries, existingKey)
+	attempt, known := limiter.entries[key]
+	if known && now.Sub(attempt.windowStart) >= limiter.window {
+		delete(limiter.entries, key)
+		known = false
+	}
+	if !known && len(limiter.entries) >= limiter.capacity {
+		// A bounded cache must not become an attacker-controlled deny-list.
+		// Sweep only when saturated, then evict the oldest window if every
+		// entry is still active. This keeps the mutex path O(1) normally and
+		// lets a legitimate previously unseen account reach the worker gate.
+		var oldestKey string
+		var oldest time.Time
+		for existingKey, existing := range limiter.entries {
+			if now.Sub(existing.windowStart) >= limiter.window {
+				delete(limiter.entries, existingKey)
+				continue
+			}
+			if oldestKey == "" || existing.windowStart.Before(oldest) {
+				oldestKey, oldest = existingKey, existing.windowStart
+			}
+		}
+		if len(limiter.entries) >= limiter.capacity && oldestKey != "" {
+			delete(limiter.entries, oldestKey)
 		}
 	}
-	attempt := limiter.entries[key]
-	if attempt.windowStart.IsZero() && len(limiter.entries) >= limiter.capacity {
-		return false
-	}
-	if attempt.windowStart.IsZero() || now.Sub(attempt.windowStart) >= limiter.window {
+	if !known {
 		limiter.entries[key] = loginAttempt{count: 1, windowStart: now}
 		return true
 	}

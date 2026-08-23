@@ -79,6 +79,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	verificationLease, err := envDurationStrict("VERIFICATION_LEASE", 10*time.Minute)
+	if err != nil {
+		return err
+	}
 	repository := upload.NewPostgresRepository(pool)
 	application, err := gateway.New(gateway.Config{
 		Repository:           repository,
@@ -92,6 +96,7 @@ func run(logger *slog.Logger) error {
 		MaxPatchesPerUser:    maxPatchesPerUser,
 		MinimumFreeBytes:     minimumFreeBytes,
 		ReconcileInterval:    reconcileInterval,
+		VerificationLease:    verificationLease,
 		Logger:               logger,
 	})
 	if err != nil {

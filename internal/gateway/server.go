@@ -35,6 +35,7 @@ type Config struct {
 	MaxPatchesPerUser    int
 	MinimumFreeBytes     int64
 	ReconcileInterval    time.Duration
+	VerificationLease    time.Duration
 	Logger               *slog.Logger
 }
 
@@ -68,6 +69,9 @@ func New(config Config) (*Server, error) {
 	}
 	if config.ReconcileInterval <= 0 {
 		config.ReconcileInterval = time.Minute
+	}
+	if config.VerificationLease <= 0 {
+		config.VerificationLease = 10 * time.Minute
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -141,6 +145,29 @@ func New(config Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{cancel: cancel}
 	queue := make(chan string, config.VerificationJobs*4)
+	workerID, err := upload.NewID()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create verifier identity: %w", err)
+	}
+	workerID = "gateway-" + workerID
+	claimAndEnqueue := func() {
+		// The database lease is acquired before queue insertion. This makes a
+		// repeated reconciliation tick harmless even when hashing takes longer
+		// than the tick interval.
+		claimed, err := config.Repository.ClaimVerification(ctx, workerID, config.VerificationLease, 100)
+		if err != nil {
+			config.Logger.Error("claim verification recovery queue", "error", err)
+			return
+		}
+		for _, session := range claimed {
+			select {
+			case queue <- session.ID:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 
 	server.wg.Add(3)
 	go func() {
@@ -169,27 +196,27 @@ func New(config Config) (*Server, error) {
 					config.Logger.Error("mark upload received", "upload_id", event.Upload.ID, "error", err)
 					continue
 				}
-				select {
-				case queue <- event.Upload.ID:
-				case <-ctx.Done():
-					return
-				}
+				claimAndEnqueue()
 			}
 		}
 	}()
-	enqueuePending := func() {
-		// One bounded batch per tick prevents the same first page from being
-		// inserted forever before workers can transition it.
-		pending, err := config.Repository.PendingVerification(ctx, 100)
+	recoverCompletedTus := func() {
+		completed, err := processor.CompletedTusUploads()
 		if err != nil {
-			config.Logger.Error("load verification recovery queue", "error", err)
+			config.Logger.Error("scan completed tus uploads", "error", err)
 			return
 		}
-		for _, session := range pending {
-			select {
-			case queue <- session.ID:
-			case <-ctx.Done():
-				return
+		for _, durable := range completed {
+			session, err := config.Repository.SessionByID(ctx, durable.ID)
+			if err != nil {
+				config.Logger.Error("load completed tus upload", "upload_id", durable.ID, "error", err)
+				continue
+			}
+			if session.State != upload.StateUploading {
+				continue
+			}
+			if err := config.Repository.MarkReceived(ctx, durable.ID, durable.Offset); err != nil && !errors.Is(err, upload.ErrInvalidState) {
+				config.Logger.Error("recover completed tus upload", "upload_id", durable.ID, "error", err)
 			}
 		}
 	}
@@ -212,7 +239,8 @@ func New(config Config) (*Server, error) {
 	}
 	go func() {
 		defer server.wg.Done()
-		enqueuePending()
+		recoverCompletedTus()
+		claimAndEnqueue()
 		expireStale()
 		ticker := time.NewTicker(config.ReconcileInterval)
 		defer ticker.Stop()
@@ -221,7 +249,8 @@ func New(config Config) (*Server, error) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				enqueuePending()
+				recoverCompletedTus()
+				claimAndEnqueue()
 				expireStale()
 			}
 		}
@@ -235,7 +264,7 @@ func New(config Config) (*Server, error) {
 				case <-ctx.Done():
 					return
 				case id := <-queue:
-					if err := processor.Process(ctx, id); err != nil && !errors.Is(err, upload.ErrChecksumMismatch) {
+					if err := processWithLease(ctx, config.Repository, processor, id, workerID, config.VerificationLease, config.Logger); err != nil && !errors.Is(err, upload.ErrChecksumMismatch) {
 						config.Logger.Error("verify and commit upload", "upload_id", id, "error", err)
 					}
 				}
@@ -272,7 +301,7 @@ func New(config Config) (*Server, error) {
 	// Compatibility alias for local probes; readiness is deliberately stricter
 	// than liveness and is the endpoint used by Compose.
 	mux.Handle("GET /healthz", readyHandler)
-	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes)
+	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, processor.ResetForRetry)
 	if config.Accounts != nil {
 		accountAPI := account.NewAPI(config.Accounts, config.Tokens, config.Logger)
 		mux.Handle("/v1/auth/", accountAPI)
@@ -306,6 +335,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Close() {
 	s.cancel()
 	s.wg.Wait()
+}
+
+func processWithLease(
+	ctx context.Context,
+	repository upload.Repository,
+	processor *upload.Processor,
+	id, workerID string,
+	lease time.Duration,
+	logger *slog.Logger,
+) error {
+	processContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	interval := lease / 3
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	done := make(chan struct{})
+	var heartbeat sync.WaitGroup
+	heartbeat.Add(1)
+	go func() {
+		defer heartbeat.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-processContext.Done():
+				return
+			case <-ticker.C:
+				if err := repository.RenewVerificationLease(processContext, id, workerID, lease); err != nil {
+					logger.Error("renew verification lease", "upload_id", id, "error", err)
+					// Continuing after ownership is lost risks two workers committing
+					// the same staging object. The durable state remains reclaimable.
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	err := processor.Process(processContext, id)
+	close(done)
+	heartbeat.Wait()
+	return err
 }
 
 func authenticate(tokens *auth.AccessTokenManager, next http.Handler) http.Handler {
@@ -355,6 +428,10 @@ func authenticateTus(
 			}
 			if time.Now().After(session.ExpiresAt) || session.State == upload.StateExpired {
 				http.Error(w, "upload session expired", http.StatusGone)
+				return
+			}
+			if r.Method == http.MethodPatch && session.State != upload.StateUploading {
+				http.Error(w, "upload session is not accepting chunks", http.StatusConflict)
 				return
 			}
 		}

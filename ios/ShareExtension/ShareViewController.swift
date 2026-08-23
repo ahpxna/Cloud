@@ -30,11 +30,15 @@ final class ShareViewController: SLComposeServiceViewController {
                 }
             }
             guard let self else { return }
-            if succeeded > 0 {
-                // Every selected provider was attempted. A partial failure does
-                // not cancel successfully queued originals; the host app shows
-                // retry state for each record it owns.
+            if failures.isEmpty {
                 self.extensionContext?.completeRequest(returningItems: nil)
+            } else if succeeded > 0 {
+                // Queue writes are already durable, so do not discard the
+                // successful originals. However, completion would falsely
+                // imply every selected item was backed up; return an explicit
+                // receipt the share sheet can show instead of silently omitting
+                // failed providers.
+                self.cancel(with: "(succeeded) item(s) queued; (failures.count) could not be imported. Keep the originals and try sharing the failed item(s) again.")
             } else {
                 self.cancel(with: failures.first ?? "Could not add the selected items to the queue.")
             }

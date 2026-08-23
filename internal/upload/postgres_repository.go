@@ -117,22 +117,63 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 	if err := tx.QueryRow(ctx, `SELECT quota_bytes FROM users WHERE id = $1::uuid FOR UPDATE`, input.OwnerID).Scan(&quotaBytes); err != nil {
 		return Session{}, false, err
 	}
-	var ownerReserved int64
+	// Quota represents visible unique assets plus unique content still on its
+	// way to becoming an asset. Historical available upload sessions must not
+	// consume quota a second time, and two in-flight retries of the same digest
+	// reserve one eventual logical asset rather than N copies.
+	var ownerUsed, ownerReserved int64
 	if err := tx.QueryRow(ctx, `
-            SELECT COALESCE(SUM(expected_size), 0)
-            FROM upload_sessions
-            WHERE owner_id = $1::uuid
-              AND state NOT IN ('failed', 'expired', 'quarantined')`, input.OwnerID).Scan(&ownerReserved); err != nil {
+			SELECT COALESCE(SUM(byte_size), 0)
+			FROM assets
+			WHERE owner_id = $1::uuid AND deleted_at IS NULL`, input.OwnerID).Scan(&ownerUsed); err != nil {
 		return Session{}, false, err
 	}
-	if quotaBytes != nil && input.ExpectedSize > *quotaBytes-ownerReserved {
+	if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(reserved_size), 0)
+			FROM (
+				SELECT MAX(session.expected_size) AS reserved_size
+				FROM upload_sessions AS session
+				WHERE session.owner_id = $1::uuid
+				  AND session.state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing')
+				  AND NOT EXISTS (
+					SELECT 1 FROM assets AS asset
+					WHERE asset.owner_id = session.owner_id
+					  AND asset.content_sha256 = session.client_sha256
+					  AND asset.deleted_at IS NULL
+				  )
+				GROUP BY session.client_sha256
+			) AS reservations`, input.OwnerID).Scan(&ownerReserved); err != nil {
+		return Session{}, false, err
+	}
+	var inputAlreadyReserved bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM assets
+			WHERE owner_id = $1::uuid AND content_sha256 = $2 AND deleted_at IS NULL
+			UNION ALL
+			SELECT 1 FROM upload_sessions
+			WHERE owner_id = $1::uuid AND client_sha256 = $2
+			  AND state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing')
+		)`, input.OwnerID, input.ClientSHA256[:]).Scan(&inputAlreadyReserved); err != nil {
+		return Session{}, false, err
+	}
+	inputQuotaReservation := input.ExpectedSize
+	if inputAlreadyReserved {
+		inputQuotaReservation = 0
+	}
+	if quotaBytes != nil && inputQuotaReservation > *quotaBytes-ownerUsed-ownerReserved {
 		return Session{}, false, ErrInsufficientStorage
 	}
+
+	// Files already received are reflected in Statfs free bytes. Only bytes
+	// that have not yet been persisted need a second reservation. received_size
+	// is updated by tus progress callbacks, so any lag is conservative rather
+	// than allowing an overcommit.
 	var activeReserved int64
 	if err := tx.QueryRow(ctx, `
-            SELECT COALESCE(SUM(expected_size), 0)
+			SELECT COALESCE(SUM(expected_size - received_size), 0)
             FROM upload_sessions
-	            WHERE state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing')`).Scan(&activeReserved); err != nil {
+			WHERE state IN ('created', 'uploading')`).Scan(&activeReserved); err != nil {
 		return Session{}, false, err
 	}
 	if input.AvailableBytes < input.MinimumFreeBytes || input.ExpectedSize > input.AvailableBytes-input.MinimumFreeBytes-activeReserved {
@@ -241,6 +282,69 @@ func (r *PostgresRepository) MarkReceived(ctx context.Context, id string, size i
         INSERT INTO upload_events (
             upload_session_id, owner_id, event_type, offset_from, offset_to
         ) SELECT id, owner_id, 'received', 0, received_size FROM changed`, id, size)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ClaimVerification(ctx context.Context, workerID string, lease time.Duration, limit int) ([]Session, error) {
+	if workerID == "" || lease <= 0 || limit <= 0 {
+		return nil, ErrInvalidState
+	}
+	rows, err := r.pool.Query(ctx, `
+		WITH candidates AS (
+			SELECT id, state AS previous_state
+			FROM upload_sessions
+			WHERE state IN ('received', 'verifying', 'verified', 'committing')
+			  AND (verification_lease_until IS NULL OR verification_lease_until <= now())
+			ORDER BY updated_at, id
+			FOR UPDATE SKIP LOCKED
+			LIMIT $3
+		), claimed AS (
+			UPDATE upload_sessions AS session
+			SET state = CASE WHEN candidates.previous_state = 'received' THEN 'verifying' ELSE session.state END,
+				verification_worker_id = $1,
+				verification_claimed_at = now(),
+				verification_lease_until = now() + $2::bigint * interval '1 microsecond',
+				updated_at = now()
+			FROM candidates
+			WHERE session.id = candidates.id
+			RETURNING session.id, session.owner_id, candidates.previous_state
+		), events AS (
+			INSERT INTO upload_events (upload_session_id, owner_id, event_type)
+			SELECT id, owner_id, 'verification_started' FROM claimed WHERE previous_state = 'received'
+		)
+		SELECT `+sessionColumns+` FROM upload_sessions
+		WHERE id IN (SELECT id FROM claimed)
+		ORDER BY verification_claimed_at, id`, workerID, lease.Microseconds(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	claimed := make([]Session, 0, limit)
+	for rows.Next() {
+		session, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, session)
+	}
+	return claimed, rows.Err()
+}
+
+func (r *PostgresRepository) RenewVerificationLease(ctx context.Context, id, workerID string, lease time.Duration) error {
+	if workerID == "" || lease <= 0 {
+		return ErrInvalidState
+	}
+	command, err := r.pool.Exec(ctx, `
+		UPDATE upload_sessions
+		SET verification_lease_until = now() + $3::bigint * interval '1 microsecond', updated_at = now()
+		WHERE id = $1::uuid AND verification_worker_id = $2
+		  AND state IN ('verifying', 'verified', 'committing')`, id, workerID, lease.Microseconds())
 	if err != nil {
 		return err
 	}
@@ -370,7 +474,8 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 	if _, err := tx.Exec(ctx, `
         UPDATE upload_sessions
         SET state = 'available', server_sha256 = $2, final_storage_key = $3,
-            asset_id = $4::uuid, committed_at = now(), updated_at = now()
+            asset_id = $4::uuid, committed_at = now(), verification_worker_id = NULL,
+            verification_claimed_at = NULL, verification_lease_until = NULL, updated_at = now()
         WHERE id = $1::uuid`, id, hash[:], storageKey, assetID); err != nil {
 		return err
 	}
@@ -391,7 +496,9 @@ func (r *PostgresRepository) MarkQuarantined(ctx context.Context, id string, has
 	var ownerID string
 	err = tx.QueryRow(ctx, `
         UPDATE upload_sessions
-        SET state = 'quarantined', server_sha256 = $2, last_error_code = $3, updated_at = now()
+        SET state = 'quarantined', server_sha256 = $2, last_error_code = $3,
+            verification_worker_id = NULL, verification_claimed_at = NULL,
+            verification_lease_until = NULL, updated_at = now()
         WHERE id = $1::uuid AND state NOT IN ('available', 'quarantined')
         RETURNING owner_id::text`, id, hash[:], errorCode).Scan(&ownerID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -413,8 +520,9 @@ func (r *PostgresRepository) MarkQuarantined(ctx context.Context, id string, has
 func (r *PostgresRepository) MarkFailed(ctx context.Context, id, errorCode string) error {
 	command, err := r.pool.Exec(ctx, `
         WITH changed AS (
-            UPDATE upload_sessions
-            SET state = 'failed', last_error_code = $2, updated_at = now()
+        UPDATE upload_sessions
+        SET state = 'failed', last_error_code = $2, verification_worker_id = NULL,
+            verification_claimed_at = NULL, verification_lease_until = NULL, updated_at = now()
             WHERE id = $1::uuid AND state NOT IN ('available', 'quarantined')
             RETURNING id, owner_id
         )
@@ -489,6 +597,39 @@ func (r *PostgresRepository) MarkExpired(ctx context.Context, id string) error {
 		return ErrInvalidState
 	}
 	return nil
+}
+
+func (r *PostgresRepository) ResetForRetry(ctx context.Context, id, ownerID string) (Session, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return Session{}, err
+	}
+	defer tx.Rollback(ctx)
+	session, err := scanSession(tx.QueryRow(ctx, `
+		SELECT `+sessionColumns+` FROM upload_sessions
+		WHERE id = $1::uuid AND owner_id = $2::uuid FOR UPDATE`, id, ownerID))
+	if err != nil {
+		return Session{}, err
+	}
+	if (session.State != StateCreated && session.State != StateUploading) || session.ReceivedSize >= session.ExpectedSize {
+		return Session{}, ErrInvalidState
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE upload_sessions
+		SET state = 'created', received_size = 0, transport_resource_id = NULL,
+			last_error_code = NULL, updated_at = now()
+		WHERE id = $1::uuid`, id); err != nil {
+		return Session{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO upload_events (upload_session_id, owner_id, event_type)
+		VALUES ($1::uuid, $2::uuid, 'resumed')`, id, ownerID); err != nil {
+		return Session{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Session{}, err
+	}
+	return r.SessionByID(ctx, id)
 }
 
 func (r *PostgresRepository) ListAssets(ctx context.Context, ownerID string, before *AssetCursor, limit int) ([]Asset, error) {

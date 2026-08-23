@@ -1,6 +1,7 @@
 package upload
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -26,9 +27,10 @@ type API struct {
 	now              func() time.Time
 	availableBytes   func() (int64, error)
 	minimumFreeBytes int64
+	restart          func(context.Context, string, string) (Session, error)
 }
 
-func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64) *API {
+func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64, restart func(context.Context, string, string) (Session, error)) *API {
 	return &API{
 		repository:       repository,
 		maxBytes:         maxBytes,
@@ -37,6 +39,7 @@ func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.Acce
 		now:              time.Now,
 		availableBytes:   availableBytes,
 		minimumFreeBytes: minimumFreeBytes,
+		restart:          restart,
 	}
 }
 
@@ -73,10 +76,37 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.create(w, r, principal)
 	case strings.HasPrefix(path, "/") && len(path) > 1 && r.Method == http.MethodGet:
 		api.get(w, r, principal, strings.TrimPrefix(path, "/"))
+	case strings.HasSuffix(path, "/restart") && r.Method == http.MethodPost:
+		api.restartSession(w, r, principal, strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/restart"))
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
+}
+
+func (api *API) restartSession(w http.ResponseWriter, r *http.Request, principal auth.Principal, id string) {
+	if api.restart == nil || id == "" || strings.Contains(id, "/") {
+		writeProblem(w, http.StatusNotFound, "not_found", "upload session not found")
+		return
+	}
+	session, err := api.restart(r.Context(), id, principal.UserID)
+	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrOwnerMismatch) {
+		writeProblem(w, http.StatusNotFound, "not_found", "upload session not found")
+		return
+	}
+	if errors.Is(err, ErrInvalidState) {
+		writeProblem(w, http.StatusConflict, "upload_session_not_restartable", "only an incomplete upload with lost local resume state can be restarted")
+		return
+	}
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "upload_restart_failed", "could not reset the server upload resource")
+		return
+	}
+	writeJSON(w, http.StatusOK, sessionResponse{
+		ID: session.ID, State: session.State, ExpectedSize: session.ExpectedSize,
+		ReceivedSize: session.ReceivedSize, UploadEndpoint: "/v1/uploads/",
+		SessionID: session.ID, ChunkBytes: api.chunkBytes,
+	})
 }
 
 func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
@@ -142,7 +172,7 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		status = http.StatusCreated
 	}
 	now := api.now().UTC()
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, session.ExpiresAt.Sub(now))
+	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, uploadCapabilityTTL(session.ExpiresAt.Sub(now)))
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "upload_token_failed", "could not issue upload capability")
 		return
@@ -182,12 +212,17 @@ func CheckWritable(mediaRoot string) error {
 		return err
 	}
 	path := file.Name()
-	defer os.Remove(path)
 	if err := file.Sync(); err != nil {
 		file.Close()
 		return err
 	}
 	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return syncDirectory(directory)
@@ -208,7 +243,7 @@ func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Princ
 		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
 		return
 	}
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, session.ExpiresAt.Sub(now))
+	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, uploadCapabilityTTL(session.ExpiresAt.Sub(now)))
 	if err != nil {
 		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
 		return
@@ -223,6 +258,14 @@ func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Princ
 		ChunkBytes:     api.chunkBytes,
 		UploadToken:    uploadToken,
 	})
+}
+
+func uploadCapabilityTTL(remaining time.Duration) time.Duration {
+	const maximum = 10 * time.Minute
+	if remaining < maximum {
+		return remaining
+	}
+	return maximum
 }
 
 func validateCreateRequest(request createSessionRequest, maxBytes int64) error {
