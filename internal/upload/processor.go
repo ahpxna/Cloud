@@ -36,6 +36,24 @@ type tusFileInfo struct {
 	Offset int64  `json:"Offset"`
 }
 
+// TusResourceState is derived only from tusd's durable payload and sidecar.
+// It is intentionally independent of the database state so expiry/restart can
+// reconcile the final PATCH crash window before deleting any bytes.
+type TusResourceState int
+
+const (
+	TusAbsent TusResourceState = iota
+	TusIncomplete
+	TusComplete
+	TusInconsistent
+)
+
+type TusResourceInspection struct {
+	State  TusResourceState
+	Offset int64
+	Size   int64
+}
+
 func NewProcessor(repository Repository, mediaRoot string) (*Processor, error) {
 	absolute, err := filepath.Abs(mediaRoot)
 	if err != nil {
@@ -55,6 +73,54 @@ func NewProcessor(repository Repository, mediaRoot string) (*Processor, error) {
 
 func (p *Processor) StagingDirectory() string {
 	return filepath.Join(p.mediaRoot, ".staging", "tus")
+}
+
+func (p *Processor) InspectTusResource(id string, expectedSize int64) (TusResourceInspection, error) {
+	if !safeID.MatchString(id) || expectedSize < 0 {
+		return TusResourceInspection{State: TusInconsistent}, ErrUploadResourceInconsistent
+	}
+	payloadPath := filepath.Join(p.StagingDirectory(), id)
+	infoPath := payloadPath + ".info"
+	payloadStat, payloadErr := os.Stat(payloadPath)
+	infoStat, infoErr := os.Stat(infoPath)
+	payloadMissing := errors.Is(payloadErr, os.ErrNotExist)
+	infoMissing := errors.Is(infoErr, os.ErrNotExist)
+	if payloadErr != nil && !payloadMissing {
+		return TusResourceInspection{}, fmt.Errorf("stat tus payload: %w", payloadErr)
+	}
+	if infoErr != nil && !infoMissing {
+		return TusResourceInspection{}, fmt.Errorf("stat tus sidecar: %w", infoErr)
+	}
+	if payloadMissing && infoMissing {
+		return TusResourceInspection{State: TusAbsent}, nil
+	}
+	if payloadMissing || infoMissing || !payloadStat.Mode().IsRegular() || !infoStat.Mode().IsRegular() {
+		return TusResourceInspection{State: TusInconsistent}, nil
+	}
+
+	contents, err := os.ReadFile(infoPath)
+	if err != nil {
+		return TusResourceInspection{}, fmt.Errorf("read tus sidecar: %w", err)
+	}
+	var info tusFileInfo
+	if err := json.Unmarshal(contents, &info); err != nil {
+		return TusResourceInspection{State: TusInconsistent}, nil
+	}
+	inspection := TusResourceInspection{Offset: info.Offset, Size: info.Size}
+	if info.ID != id || info.Size != expectedSize || info.Size < 0 || info.Offset < 0 || info.Offset > info.Size {
+		inspection.State = TusInconsistent
+		return inspection, nil
+	}
+	if payloadStat.Size() != info.Offset {
+		inspection.State = TusInconsistent
+		return inspection, nil
+	}
+	if info.Offset == info.Size {
+		inspection.State = TusComplete
+		return inspection, nil
+	}
+	inspection.State = TusIncomplete
+	return inspection, nil
 }
 
 func (p *Processor) CompletedTusUploads() ([]CompletedTusUpload, error) {
@@ -139,14 +205,21 @@ func (p *Processor) Process(ctx context.Context, id string) error {
 		return p.fail(ctx, session.ID, "content_read_failed", err)
 	}
 	if observedSize != session.ExpectedSize || !bytes.Equal(observedHash[:], session.ClientSHA256[:]) {
+		if session.State != StateQuarantining {
+			if err := p.repository.MarkQuarantineIntent(ctx, session.ID, observedHash, "sha256_or_size_mismatch"); err != nil {
+				return err
+			}
+		}
 		quarantinePath := filepath.Join(
 			p.mediaRoot, ".quarantine", session.ID+"."+hex.EncodeToString(observedHash[:8])+".bad",
 		)
-		if err := moveWithoutReplace(sourcePath, quarantinePath); err != nil {
-			return p.fail(ctx, session.ID, "quarantine_move_failed", err)
+		if err := quarantineWithoutReplace(ctx, sourcePath, quarantinePath, observedHash, observedSize); err != nil {
+			// Keep state=quarantining and the verifier fence. Reconciliation can
+			// safely retry the idempotent filesystem mutation.
+			return fmt.Errorf("quarantine_move_failed: %w", err)
 		}
 		if err := syncDirectory(filepath.Dir(quarantinePath)); err != nil {
-			return p.fail(ctx, session.ID, "quarantine_sync_failed", err)
+			return fmt.Errorf("quarantine_sync_failed: %w", err)
 		}
 		if err := p.repository.MarkQuarantined(ctx, session.ID, observedHash, "sha256_or_size_mismatch"); err != nil {
 			return err
@@ -193,14 +266,22 @@ func (p *Processor) recoverQuarantine(ctx context.Context, session Session) erro
 		if err == nil {
 			err = errors.New("staging, destination, and unique quarantine object are missing")
 		}
+		if session.State == StateQuarantining {
+			return fmt.Errorf("quarantine_recovery_missing: %w", err)
+		}
 		return p.fail(ctx, session.ID, "content_missing", err)
 	}
 	hash, size, err := hashAndSync(ctx, matches[0])
 	if err != nil {
-		return p.fail(ctx, session.ID, "quarantine_read_failed", err)
+		return fmt.Errorf("quarantine_read_failed: %w", err)
 	}
 	if size == session.ExpectedSize && bytes.Equal(hash[:], session.ClientSHA256[:]) {
-		return p.fail(ctx, session.ID, "unexpected_valid_quarantine", errors.New("quarantine object matches expected content"))
+		return fmt.Errorf("unexpected_valid_quarantine: %w", ErrInvalidState)
+	}
+	if session.State != StateQuarantining {
+		if err := p.repository.MarkQuarantineIntent(ctx, session.ID, hash, "sha256_or_size_mismatch"); err != nil {
+			return err
+		}
 	}
 	if err := p.repository.MarkQuarantined(ctx, session.ID, hash, "sha256_or_size_mismatch"); err != nil {
 		return err
@@ -236,9 +317,36 @@ func safeExtension(filename string) string {
 	return extension
 }
 
-// Expire removes only incomplete staging data, then records the terminal
-// state. If a process dies in either half, the periodic sweeper retries safely.
+// Expire deletes only a durably incomplete TUS resource. A complete final
+// PATCH wins over stale database expiry state; inconsistent metadata is
+// preserved for operator/reconciliation inspection rather than destroyed.
 func (p *Processor) Expire(ctx context.Context, session Session) error {
+	inspection, err := p.InspectTusResource(session.ID, session.ExpectedSize)
+	if err != nil {
+		return err
+	}
+	switch inspection.State {
+	case TusComplete:
+		if err := p.repository.MarkReceived(ctx, session.ID, inspection.Offset); err != nil {
+			if errors.Is(err, ErrInvalidState) {
+				current, loadErr := p.repository.SessionByID(ctx, session.ID)
+				if loadErr == nil && current.State != StateCreated && current.State != StateUploading && current.State != StateFailed {
+					return nil
+				}
+			}
+			return err
+		}
+		return nil
+	case TusInconsistent:
+		return ErrUploadResourceInconsistent
+	case TusAbsent, TusIncomplete:
+		if session.ReceivedSize >= session.ExpectedSize {
+			return ErrUploadResourceInconsistent
+		}
+		// Safe to remove below.
+	default:
+		return ErrUploadResourceInconsistent
+	}
 	for _, path := range []string{
 		filepath.Join(p.StagingDirectory(), session.ID),
 		filepath.Join(p.StagingDirectory(), session.ID+".info"),
@@ -254,17 +362,53 @@ func (p *Processor) Expire(ctx context.Context, session Session) error {
 }
 
 // ResetForRetry is used only when an authenticated device has lost its local
-// TUSKit resume context. State is first moved away from `uploading`, causing
-// the gateway to reject any stale PATCH, then the old server resource is
-// removed so a deterministic TUS POST can create it again safely.
+// TUS resume context. The durable TUS resource is inspected before the database
+// is reset, so a complete final PATCH can never be deleted by a stale client.
 func (p *Processor) ResetForRetry(ctx context.Context, id, ownerID string) (Session, error) {
-	session, err := p.repository.ResetForRetry(ctx, id, ownerID)
+	session, err := p.repository.SessionByID(ctx, id)
+	if err != nil {
+		return Session{}, err
+	}
+	if session.OwnerID != ownerID {
+		return Session{}, ErrOwnerMismatch
+	}
+	if session.State != StateCreated && session.State != StateUploading {
+		return Session{}, ErrInvalidState
+	}
+	inspection, err := p.InspectTusResource(session.ID, session.ExpectedSize)
+	if err != nil {
+		return Session{}, err
+	}
+	switch inspection.State {
+	case TusComplete:
+		if session.State != StateUploading {
+			return Session{}, ErrUploadResourceInconsistent
+		}
+		if err := p.repository.MarkReceived(ctx, session.ID, inspection.Offset); err != nil {
+			return Session{}, err
+		}
+		return p.repository.SessionByID(ctx, session.ID)
+	case TusInconsistent:
+		return Session{}, ErrUploadResourceInconsistent
+	case TusAbsent, TusIncomplete:
+		// A database offset claiming the complete object is authoritative enough
+		// to prevent destructive reset, even when the TUS sidecar/payload no
+		// longer agrees. Preserve the evidence for reconciliation instead.
+		if session.ReceivedSize >= session.ExpectedSize {
+			return Session{}, ErrUploadResourceInconsistent
+		}
+		// Safe to reset below.
+	default:
+		return Session{}, ErrUploadResourceInconsistent
+	}
+
+	reset, err := p.repository.ResetForRetry(ctx, id, ownerID)
 	if err != nil {
 		return Session{}, err
 	}
 	for _, path := range []string{
-		filepath.Join(p.StagingDirectory(), session.ID),
-		filepath.Join(p.StagingDirectory(), session.ID+".info"),
+		filepath.Join(p.StagingDirectory(), reset.ID),
+		filepath.Join(p.StagingDirectory(), reset.ID+".info"),
 	} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return Session{}, fmt.Errorf("remove reset staging data: %w", err)
@@ -273,7 +417,7 @@ func (p *Processor) ResetForRetry(ctx context.Context, id, ownerID string) (Sess
 	if err := syncDirectory(p.StagingDirectory()); err != nil {
 		return Session{}, fmt.Errorf("sync reset staging cleanup: %w", err)
 	}
-	return session, nil
+	return reset, nil
 }
 
 func hashAndSync(ctx context.Context, path string) ([32]byte, int64, error) {
@@ -311,16 +455,68 @@ func hashAndSync(ctx context.Context, path string) ([32]byte, int64, error) {
 	return result, size, nil
 }
 
-func moveWithoutReplace(source, destination string) error {
+func quarantineWithoutReplace(ctx context.Context, source, destination string, expectedHash [32]byte, expectedSize int64) error {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
 	}
-	if _, err := os.Stat(destination); err == nil {
-		return errors.New("quarantine destination already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
+	sourceStat, sourceErr := os.Stat(source)
+	destinationStat, destinationErr := os.Stat(destination)
+	sourceExists := sourceErr == nil
+	destinationExists := destinationErr == nil
+	if sourceErr != nil && !errors.Is(sourceErr, os.ErrNotExist) {
+		return sourceErr
+	}
+	if destinationErr != nil && !errors.Is(destinationErr, os.ErrNotExist) {
+		return destinationErr
+	}
+	if !sourceExists && !destinationExists {
+		return errors.New("quarantine source and destination are both absent")
+	}
+	verifyDestination := func() error {
+		hash, size, err := hashAndSync(ctx, destination)
+		if err != nil {
+			return err
+		}
+		if size != expectedSize || !bytes.Equal(hash[:], expectedHash[:]) {
+			return errors.New("existing quarantine destination failed integrity verification")
+		}
+		return nil
+	}
+	if destinationExists {
+		if !destinationStat.Mode().IsRegular() {
+			return errors.New("quarantine destination is not a regular file")
+		}
+		if err := verifyDestination(); err != nil {
+			return err
+		}
+		if sourceExists {
+			if !sourceStat.Mode().IsRegular() {
+				return errors.New("quarantine source is not a regular file")
+			}
+			hash, size, err := hashAndSync(ctx, source)
+			if err != nil {
+				return err
+			}
+			if size != expectedSize || !bytes.Equal(hash[:], expectedHash[:]) {
+				return errors.New("quarantine source changed after intent")
+			}
+			if err := os.Remove(source); err != nil {
+				return err
+			}
+			return syncDirectory(filepath.Dir(source))
+		}
+		return nil
+	}
+	if !sourceStat.Mode().IsRegular() {
+		return errors.New("quarantine source is not a regular file")
+	}
+	if err := os.Rename(source, destination); err != nil {
 		return err
 	}
-	return os.Rename(source, destination)
+	if err := syncDirectory(filepath.Dir(destination)); err != nil {
+		return err
+	}
+	return verifyDestination()
 }
 
 func commitWithoutReplace(source, destination string, expectedHash [32]byte, expectedSize int64) error {

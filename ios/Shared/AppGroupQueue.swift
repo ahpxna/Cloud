@@ -1,6 +1,13 @@
 import Foundation
 import UniformTypeIdentifiers
 
+
+struct QuarantinedQueueRecord: Identifiable, Hashable, Sendable {
+    let id: String
+    let filename: String
+    let modifiedAt: Date?
+}
+
 enum AppGroupQueueError: LocalizedError {
     case appGroupUnavailable
     case unsupportedPayload
@@ -137,6 +144,100 @@ enum AppGroupQueue {
         let payload = try payloadURL(for: item, in: root)
         try removeIfPresent(payload)
         try removeIfPresent(recordURL(for: item.id, in: root))
+    }
+
+    static func quarantinedRecords() throws -> [QuarantinedQueueRecord] {
+        try quarantinedRecords(in: rootURL())
+    }
+
+    static func quarantinedRecords(in root: URL) throws -> [QuarantinedQueueRecord] {
+        let quarantine = root
+            .appending(path: "records", directoryHint: .isDirectory)
+            .appending(path: "quarantine", directoryHint: .isDirectory)
+        guard FileManager.default.fileExists(atPath: quarantine.path()) else { return [] }
+        return try FileManager.default.contentsOfDirectory(
+            at: quarantine,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        .filter { $0.lastPathComponent.hasSuffix(".json.corrupt") }
+        .map { url in
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            return QuarantinedQueueRecord(
+                id: url.lastPathComponent,
+                filename: url.lastPathComponent,
+                modifiedAt: values?.contentModificationDate
+            )
+        }
+        .sorted { ($0.modifiedAt ?? .distantPast) < ($1.modifiedAt ?? .distantPast) }
+    }
+
+    /// Rebuilds a corrupt queue record as a brand-new upload identity while
+    /// preserving the payload bytes. A fresh UUID avoids colliding with any
+    /// server session whose immutable metadata was lost with the corrupt JSON.
+    static func recoverQuarantinedRecord(_ record: QuarantinedQueueRecord) throws -> QueuedUpload {
+        try recoverQuarantinedRecord(record, in: rootURL())
+    }
+
+    static func recoverQuarantinedRecord(_ record: QuarantinedQueueRecord, in root: URL) throws -> QueuedUpload {
+        let quarantine = root
+            .appending(path: "records", directoryHint: .isDirectory)
+            .appending(path: "quarantine", directoryHint: .isDirectory)
+        let sourceRecord = quarantine.appending(path: record.filename)
+        guard FileManager.default.fileExists(atPath: sourceRecord.path()) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+
+        let originalIDText = record.filename.replacingOccurrences(of: ".json.corrupt", with: "")
+        guard let originalID = UUID(uuidString: originalIDText) else {
+            throw AppGroupQueueError.unsupportedPayload
+        }
+        let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
+        let candidates = try FileManager.default.contentsOfDirectory(
+            at: payloads,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).filter { $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(originalID.uuidString) == .orderedSame }
+        guard candidates.count == 1 else {
+            throw AppGroupQueueError.unsupportedPayload
+        }
+        let oldPayload = candidates[0]
+        let type = UTType(filenameExtension: oldPayload.pathExtension) ?? .data
+        guard type.conforms(to: .image) || type.conforms(to: .movie) else {
+            throw AppGroupQueueError.unsupportedPayload
+        }
+
+        let newID = UUID()
+        let newPayload = payloads.appending(path: "\(newID.uuidString).\(oldPayload.pathExtension.lowercased())")
+        try FileManager.default.moveItem(at: oldPayload, to: newPayload)
+        do {
+            let item = QueuedUpload(
+                id: newID,
+                payloadFilename: newPayload.lastPathComponent,
+                originalFilename: "Recovered-\(oldPayload.lastPathComponent)",
+                typeIdentifier: type.identifier,
+                createdAt: .now,
+                state: .queued,
+                byteCount: nil,
+                sha256: nil,
+                serverSessionID: nil,
+                tusUploadID: nil,
+                lastError: "Recovered from isolated corrupt queue metadata; upload will restart from byte zero."
+            )
+            let records = root.appending(path: "records", directoryHint: .isDirectory)
+            try save(item, in: records)
+            try FileManager.default.removeItem(at: sourceRecord)
+            return item
+        } catch {
+            try? FileManager.default.moveItem(at: newPayload, to: oldPayload)
+            throw error
+        }
+    }
+
+    static func diagnosticsDirectory() throws -> URL {
+        let directory = try rootURL().appending(path: "diagnostics", directoryHint: .isDirectory)
+        try createProtectedDirectory(directory)
+        return directory
     }
 
     static func tusStorageDirectory() throws -> URL {

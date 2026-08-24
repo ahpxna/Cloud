@@ -59,6 +59,29 @@ struct LibraryPage: Codable, Sendable {
     }
 }
 
+enum LoginResult: Sendable {
+    case authenticated(Credential)
+    case mfaRequired(challenge: String, expiresIn: Int)
+}
+
+struct MFAEnrollment: Codable, Sendable {
+    let secret: String
+    let otpauthURI: String
+
+    enum CodingKeys: String, CodingKey {
+        case secret
+        case otpauthURI = "otpauth_uri"
+    }
+}
+
+struct MFARecoveryCodes: Codable, Sendable {
+    let recoveryCodes: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case recoveryCodes = "recovery_codes"
+    }
+}
+
 struct APIProblem: Codable, Error, LocalizedError, Sendable {
     let status: Int
     let code: String
@@ -75,17 +98,96 @@ struct PhotoCloudAPI: Sendable {
         self.session = session
     }
 
-    func login(email: String, password: String, deviceName: String) async throws -> Credential {
+    func login(email: String, password: String, deviceName: String) async throws -> LoginResult {
         struct Request: Encodable { let email, password: String; let deviceName: String
             enum CodingKeys: String, CodingKey { case email, password; case deviceName = "device_name" }
         }
+        var request = URLRequest(url: try absoluteURL(for: "/v1/auth/login"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Request(email: email, password: password, deviceName: deviceName))
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        if http.statusCode == 202 {
+            let challenge = try JSONDecoder().decode(MFAChallengeResponse.self, from: data)
+            return .mfaRequired(challenge: challenge.challenge, expiresIn: challenge.expiresIn)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw (try? JSONDecoder().decode(APIProblem.self, from: data)) ?? URLError(.badServerResponse)
+        }
+        return .authenticated(try JSONDecoder().decode(CredentialResponse.self, from: data).credential)
+    }
+
+    func verifyMFA(challenge: String, totpCode: String?, recoveryCode: String?) async throws -> Credential {
+        struct Request: Encodable {
+            let challenge: String
+            let totpCode: String?
+            let recoveryCode: String?
+            enum CodingKeys: String, CodingKey {
+                case challenge
+                case totpCode = "totp_code"
+                case recoveryCode = "recovery_code"
+            }
+        }
         return try await request(
-            path: "/v1/auth/login",
+            path: "/v1/auth/mfa/verify",
             method: "POST",
-            body: Request(email: email, password: password, deviceName: deviceName),
+            body: Request(challenge: challenge, totpCode: totpCode, recoveryCode: recoveryCode),
             bearer: nil,
             response: CredentialResponse.self
         ).credential
+    }
+
+    func beginMFAEnrollment(accessToken: String) async throws -> MFAEnrollment {
+        try await request(
+            path: "/v1/auth/mfa/enroll",
+            method: "POST",
+            body: Optional<String>.none,
+            bearer: accessToken,
+            response: MFAEnrollment.self
+        )
+    }
+
+    func confirmMFAEnrollment(totpCode: String, accessToken: String) async throws -> MFARecoveryCodes {
+        struct Request: Encodable {
+            let totpCode: String
+            enum CodingKeys: String, CodingKey { case totpCode = "totp_code" }
+        }
+        return try await request(
+            path: "/v1/auth/mfa/confirm",
+            method: "POST",
+            body: Request(totpCode: totpCode),
+            bearer: accessToken,
+            response: MFARecoveryCodes.self
+        )
+    }
+
+    func rotateMFARecoveryCodes(totpCode: String, accessToken: String) async throws -> MFARecoveryCodes {
+        struct Request: Encodable {
+            let totpCode: String
+            enum CodingKeys: String, CodingKey { case totpCode = "totp_code" }
+        }
+        return try await request(
+            path: "/v1/auth/mfa/recovery",
+            method: "POST",
+            body: Request(totpCode: totpCode),
+            bearer: accessToken,
+            response: MFARecoveryCodes.self
+        )
+    }
+
+    func disableMFA(totpCode: String, accessToken: String) async throws {
+        struct Request: Encodable {
+            let totpCode: String
+            enum CodingKeys: String, CodingKey { case totpCode = "totp_code" }
+        }
+        try await requestNoContent(
+            path: "/v1/auth/mfa/disable",
+            method: "POST",
+            body: Request(totpCode: totpCode),
+            bearer: accessToken
+        )
     }
 
     func refresh(_ refreshToken: String) async throws -> Credential {
@@ -142,6 +244,22 @@ struct PhotoCloudAPI: Sendable {
         return url
     }
 
+    private func requestNoContent<Body: Encodable>(path: String, method: String, body: Body?, bearer: String?) async throws {
+        var request = URLRequest(url: try absoluteURL(for: path))
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let bearer { request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
+        if let body {
+            request.httpBody = try JSONEncoder().encode(body)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard (200..<300).contains(http.statusCode) else {
+            throw (try? JSONDecoder().decode(APIProblem.self, from: data)) ?? URLError(.badServerResponse)
+        }
+    }
+
     private func request<Body: Encodable, Response: Decodable>(path: String, method: String, queryItems: [URLQueryItem] = [], body: Body?, bearer: String?, response: Response.Type) async throws -> Response {
         var components = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
         components?.queryItems = queryItems.isEmpty ? nil : queryItems
@@ -181,6 +299,16 @@ struct CreateUploadRequest: Encodable, Sendable {
     }
 }
 
+private struct MFAChallengeResponse: Codable {
+    let challenge: String
+    let expiresIn: Int
+
+    enum CodingKeys: String, CodingKey {
+        case challenge
+        case expiresIn = "expires_in"
+    }
+}
+
 private struct CredentialResponse: Codable {
     let accessToken: String
     let expiresIn: Int
@@ -211,8 +339,17 @@ actor AuthenticationStore {
     private var credential: Credential?
     private var refreshTask: Task<Credential, Error>?
 
-    func login(email: String, password: String, deviceName: String, api: PhotoCloudAPI) async throws {
-        let newCredential = try await api.login(email: email, password: password, deviceName: deviceName)
+    func login(email: String, password: String, deviceName: String, api: PhotoCloudAPI) async throws -> LoginResult {
+        let result = try await api.login(email: email, password: password, deviceName: deviceName)
+        if case .authenticated(let newCredential) = result {
+            try KeychainStore.save(newCredential)
+            credential = newCredential
+        }
+        return result
+    }
+
+    func verifyMFA(challenge: String, totpCode: String?, recoveryCode: String?, api: PhotoCloudAPI) async throws {
+        let newCredential = try await api.verifyMFA(challenge: challenge, totpCode: totpCode, recoveryCode: recoveryCode)
         try KeychainStore.save(newCredential)
         credential = newCredential
     }

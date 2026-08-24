@@ -1,0 +1,13 @@
+[Unit]
+Description=Family Photo Cloud encrypted off-site backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/family-photo-cloud
+EnvironmentFile=/opt/family-photo-cloud/.env
+ExecStart=/usr/bin/make backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

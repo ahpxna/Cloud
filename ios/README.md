@@ -30,10 +30,17 @@ remain inside the App Group but can be read by a background URLSession after the
 owner has unlocked the phone once following a reboot. This is required for
 reliable resume and should be disclosed in the app's security documentation.
 
-The main app keeps refresh/access credentials in Keychain. It hashes the copied
-original before creating an upload session, then gives TUSKit only a capability
-JWT scoped to that one server upload session. TUSKit can persist that narrow
-capability to resume; it must never receive the general access JWT.
+The main app keeps refresh/access credentials in Keychain. A password login for
+an MFA-enabled account receives only a five-minute MFA challenge; access and
+refresh credentials are persisted only after TOTP or one-time recovery-code
+verification succeeds. The Security section can enrol TOTP, show recovery codes
+once, rotate them after a current TOTP check, and disable MFA after a current
+TOTP check.
+
+The app hashes the copied original before creating an upload session, then gives
+TUSKit only a capability JWT scoped to that one server upload session. TUSKit can
+persist that narrow capability to resume; it must never receive the general
+access JWT.
 
 Queue reconciliation distinguishes `created`/`uploading` from the server's
 `received`/`verifying`/`verified`/`committing` states. A local item becomes
@@ -58,6 +65,14 @@ The App Group payload and its queue record are removed only after the server
 reports `available`, which means verification and durable commit have finished.
 Failed, interrupted, and quarantined uploads retain their local payload. Cleanup
 is idempotent and retries on the next queue reload after an interrupted delete.
+Malformed queue-record JSON is isolated without deleting its payload. The app
+can explicitly recover an unambiguous image/video payload as a fresh upload UUID
+so lost immutable metadata can never accidentally resume an old server session.
+
+Upload diagnostics persist bounded, token-redacted JSONL events containing queue
+and server IDs, offsets, app state, timestamps, and errors. The app can export
+the current plus rotated diagnostics log for a device test; diagnostics are not
+an excuse to log bearer tokens, filenames, EXIF/GPS, or media bytes.
 
 The generated project still requires a physical-device acceptance test for
 Share Sheet import, background URLSession wakeup, app termination, airplane

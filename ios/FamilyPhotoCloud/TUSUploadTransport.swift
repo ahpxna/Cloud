@@ -70,19 +70,39 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
     }
 
     func registerBackgroundHandler(_ completion: @escaping () -> Void, identifier: String) {
+        Task { @MainActor in UploadDiagnostics.shared.record("background_handler_registered") }
         client.registerBackgroundHandler(completion, forSession: identifier)
     }
 
-    func didStartUpload(id: UUID, context: [String: String]?, client: TUSClient) {}
-    func fileError(error: TUSClientError, client: TUSClient) {}
+    func didStartUpload(id: UUID, context: [String: String]?, client: TUSClient) {
+        Task { @MainActor in UploadDiagnostics.shared.record("tus_started", context: context, tusUploadID: id) }
+    }
+
+    func fileError(error: TUSClientError, client: TUSClient) {
+        Task { @MainActor in UploadDiagnostics.shared.record("tus_file_error", error: error) }
+    }
+
     func totalProgress(bytesUploaded: Int, totalBytes: Int, client: TUSClient) {}
-    func progressFor(id: UUID, context: [String: String]?, bytesUploaded: Int, totalBytes: Int, client: TUSClient) {}
+
+    func progressFor(id: UUID, context: [String: String]?, bytesUploaded: Int, totalBytes: Int, client: TUSClient) {
+        Task { @MainActor in
+            UploadDiagnostics.shared.record(
+                "tus_progress",
+                context: context,
+                tusUploadID: id,
+                bytesUploaded: bytesUploaded,
+                totalBytes: totalBytes
+            )
+        }
+    }
 
     func didFinishUpload(id: UUID, url: URL, context: [String: String]?, client: TUSClient) {
+        Task { @MainActor in UploadDiagnostics.shared.record("tus_finished", context: context, tusUploadID: id) }
         uploadFinished?(id, context)
     }
 
     func uploadFailed(id: UUID, error: Error, context: [String: String]?, client: TUSClient) {
+        Task { @MainActor in UploadDiagnostics.shared.record("tus_failed", context: context, tusUploadID: id, error: error) }
         uploadFailed?(id, context, error)
     }
 

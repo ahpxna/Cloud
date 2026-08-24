@@ -12,17 +12,24 @@ import (
 // MemoryRepository is used by protocol and failure-path tests. Production uses
 // PostgresRepository so state survives process restarts.
 type MemoryRepository struct {
-	mu       sync.RWMutex
-	sessions map[string]Session
-	byClient map[string]string
-	assets   map[string]Asset
+	mu              sync.RWMutex
+	sessions        map[string]Session
+	byClient        map[string]string
+	assets          map[string]Asset
+	createThrottles map[string]createThrottle
+}
+
+type createThrottle struct {
+	windowStart time.Time
+	count       int
 }
 
 func NewMemoryRepository() *MemoryRepository {
 	return &MemoryRepository{
-		sessions: make(map[string]Session),
-		byClient: make(map[string]string),
-		assets:   make(map[string]Asset),
+		sessions:        make(map[string]Session),
+		byClient:        make(map[string]string),
+		assets:          make(map[string]Asset),
+		createThrottles: make(map[string]createThrottle),
 	}
 }
 
@@ -31,6 +38,7 @@ func (r *MemoryRepository) CreateSession(_ context.Context, input CreateSessionI
 	defer r.mu.Unlock()
 
 	clientKey := input.OwnerID + "\x00" + input.ClientAssetID
+	var expiredExisting *Session
 	if id, ok := r.byClient[clientKey]; ok {
 		existing := r.sessions[id]
 		if existing.OriginalFilename != input.OriginalFilename ||
@@ -39,28 +47,56 @@ func (r *MemoryRepository) CreateSession(_ context.Context, input CreateSessionI
 			subtle.ConstantTimeCompare(existing.ClientSHA256[:], input.ClientSHA256[:]) != 1 {
 			return Session{}, false, ErrConflict
 		}
-		if existing.State == StateExpired {
-			existing.State = StateCreated
-			existing.ReceivedSize = 0
-			existing.ServerSHA256 = nil
-			existing.TransportResource = ""
-			existing.FinalStorageKey = ""
-			existing.AssetID = ""
-			existing.ExpiresAt = input.ExpiresAt
-			r.sessions[id] = existing
+		if existing.State != StateExpired {
+			return existing, false, nil
 		}
-		return existing, false, nil
+		expiredExisting = &existing
 	}
+
+	var pendingThrottle *createThrottle
+	if input.MaxCreatesPerWindow > 0 && input.CreateWindow > 0 {
+		now := input.Now
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		entry := r.createThrottles[input.OwnerID]
+		if entry.windowStart.IsZero() || !now.Before(entry.windowStart.Add(input.CreateWindow)) {
+			entry = createThrottle{windowStart: now}
+		}
+		if entry.count >= input.MaxCreatesPerWindow {
+			return Session{}, false, ErrCreateRateLimit
+		}
+		entry.count++
+		pendingThrottle = &entry
+	}
+
 	if input.MaxActiveSessions > 0 {
 		active := 0
 		for _, existing := range r.sessions {
-			if existing.OwnerID == input.OwnerID && (existing.State == StateCreated || existing.State == StateUploading || existing.State == StateReceived || existing.State == StateVerifying || existing.State == StateVerified || existing.State == StateCommitting) {
+			if existing.OwnerID == input.OwnerID && (existing.State == StateCreated || existing.State == StateUploading || existing.State == StateReceived || existing.State == StateVerifying || existing.State == StateVerified || existing.State == StateCommitting || existing.State == StateQuarantining) {
 				active++
 			}
 		}
 		if active >= input.MaxActiveSessions {
 			return Session{}, false, ErrSessionLimit
 		}
+	}
+
+	if pendingThrottle != nil {
+		r.createThrottles[input.OwnerID] = *pendingThrottle
+	}
+
+	if expiredExisting != nil {
+		existing := *expiredExisting
+		existing.State = StateCreated
+		existing.ReceivedSize = 0
+		existing.ServerSHA256 = nil
+		existing.TransportResource = ""
+		existing.FinalStorageKey = ""
+		existing.AssetID = ""
+		existing.ExpiresAt = input.ExpiresAt
+		r.sessions[existing.ID] = existing
+		return existing, false, nil
 	}
 
 	id, err := NewID()
@@ -161,7 +197,7 @@ func (r *MemoryRepository) ClaimVerification(_ context.Context, _ string, _ time
 			session.VerificationClaim = claim
 			r.sessions[id] = session
 			result = append(result, session)
-		case StateVerifying, StateVerified, StateCommitting:
+		case StateVerifying, StateVerified, StateCommitting, StateQuarantining:
 			// Memory tests do not model time-based expiry; never hand an active
 			// claim to a second worker.
 		}
@@ -190,7 +226,7 @@ func (r *MemoryRepository) BeginVerification(ctx context.Context, id string) (Se
 	case StateReceived:
 		session.State = StateVerifying
 		r.sessions[id] = session
-	case StateVerifying, StateVerified, StateCommitting, StateAvailable:
+	case StateVerifying, StateVerified, StateCommitting, StateQuarantining, StateAvailable:
 	default:
 		return Session{}, ErrInvalidState
 	}
@@ -314,6 +350,22 @@ func assetBefore(asset Asset, cursor AssetCursor) bool {
 	return asset.CreatedAt.Equal(cursor.CreatedAt) && asset.ID < cursor.ID
 }
 
+func (r *MemoryRepository) MarkQuarantineIntent(ctx context.Context, id string, hash [32]byte, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.sessions[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if session.State != StateVerifying || !matchesFence(ctx, session) {
+		return ErrInvalidState
+	}
+	session.State = StateQuarantining
+	session.ServerSHA256 = &hash
+	r.sessions[id] = session
+	return nil
+}
+
 func (r *MemoryRepository) MarkQuarantined(ctx context.Context, id string, hash [32]byte, _ string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -321,7 +373,7 @@ func (r *MemoryRepository) MarkQuarantined(ctx context.Context, id string, hash 
 	if !ok {
 		return ErrNotFound
 	}
-	if !matchesFence(ctx, session) {
+	if session.State != StateQuarantining || !matchesFence(ctx, session) {
 		return ErrInvalidState
 	}
 	session.State = StateQuarantined
@@ -338,7 +390,7 @@ func (r *MemoryRepository) MarkFailed(ctx context.Context, id, _ string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if session.State == StateAvailable || session.State == StateQuarantined || !matchesFence(ctx, session) {
+	if session.State == StateAvailable || session.State == StateQuarantining || session.State == StateQuarantined || !matchesFence(ctx, session) {
 		return fmt.Errorf("terminal session: %w", ErrInvalidState)
 	}
 	session.State = StateFailed
@@ -358,7 +410,7 @@ func (r *MemoryRepository) PendingVerification(_ context.Context, limit int) ([]
 	result := make([]Session, 0, limit)
 	for _, session := range r.sessions {
 		switch session.State {
-		case StateReceived, StateVerifying, StateVerified, StateCommitting:
+		case StateReceived, StateVerifying, StateVerified, StateCommitting, StateQuarantining:
 			result = append(result, session)
 			if len(result) == limit {
 				return result, nil

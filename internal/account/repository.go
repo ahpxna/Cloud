@@ -2,6 +2,7 @@ package account
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"time"
 
@@ -36,6 +37,14 @@ type Repository interface {
 	RevokeRefreshSession(context.Context, [32]byte) error
 	ListDeviceSessions(context.Context, string) ([]DeviceSession, error)
 	RevokeDeviceSession(context.Context, string, string) error
+}
+
+// LoginThrottleRepository persists identity throttling independently of the
+// gateway process. identityHash must be an HMAC of the normalized login name;
+// attacker-controlled plaintext identities are never stored.
+type LoginThrottleRepository interface {
+	RecordLoginAttempt(context.Context, [32]byte, time.Time, time.Duration, int) (bool, time.Duration, error)
+	ClearLoginAttempts(context.Context, [32]byte) error
 }
 
 type PostgresRepository struct {
@@ -179,4 +188,448 @@ func (r *PostgresRepository) RevokeDeviceSession(ctx context.Context, userID, se
 		return ErrInvalidCredentials
 	}
 	return nil
+}
+
+func (r *PostgresRepository) RecordLoginAttempt(
+	ctx context.Context,
+	identityHash [32]byte,
+	now time.Time,
+	window time.Duration,
+	limit int,
+) (bool, time.Duration, error) {
+	if window <= 0 || limit < 2 {
+		return false, 0, errors.New("invalid login throttle configuration")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Serialize the first insert and all subsequent updates for one normalized
+	// identity. Without this lock, two simultaneous first attempts can both
+	// observe no row and race on the primary key, turning ordinary concurrency
+	// into a fail-closed 503 instead of a counted authentication attempt.
+	lockID := int64(binary.BigEndian.Uint64(identityHash[:8]))
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockID); err != nil {
+		return false, 0, err
+	}
+
+	// Keep attacker-controlled identity cardinality time-bounded. The process-wide
+	// token bucket limits insertion rate; this indexed cleanup bounds retention.
+	if _, err := tx.Exec(ctx, `
+        DELETE FROM login_throttles
+        WHERE updated_at < $1`, now.Add(-2*window)); err != nil {
+		return false, 0, err
+	}
+
+	var windowStarted time.Time
+	var count int
+	var blockedUntil *time.Time
+	err = tx.QueryRow(ctx, `
+        SELECT window_started_at, attempt_count, blocked_until
+        FROM login_throttles
+        WHERE identity_hash = $1
+        FOR UPDATE`, identityHash[:]).Scan(&windowStarted, &count, &blockedUntil)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx, `
+            INSERT INTO login_throttles (
+                identity_hash, window_started_at, attempt_count, blocked_until, updated_at
+            ) VALUES ($1, $2, 1, NULL, $2)`, identityHash[:], now)
+		if err != nil {
+			return false, 0, err
+		}
+		return true, 0, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if blockedUntil != nil && blockedUntil.After(now) {
+		return false, blockedUntil.Sub(now), tx.Commit(ctx)
+	}
+	if !now.Before(windowStarted.Add(window)) {
+		_, err = tx.Exec(ctx, `
+            UPDATE login_throttles
+            SET window_started_at = $2, attempt_count = 1,
+                blocked_until = NULL, updated_at = $2
+            WHERE identity_hash = $1`, identityHash[:], now)
+		if err != nil {
+			return false, 0, err
+		}
+		return true, 0, tx.Commit(ctx)
+	}
+
+	count++
+	var nextBlockedUntil *time.Time
+	if count >= limit {
+		until := windowStarted.Add(window)
+		nextBlockedUntil = &until
+	}
+	_, err = tx.Exec(ctx, `
+        UPDATE login_throttles
+        SET attempt_count = $2, blocked_until = $3, updated_at = $4
+        WHERE identity_hash = $1`, identityHash[:], count, nextBlockedUntil, now)
+	if err != nil {
+		return false, 0, err
+	}
+	return true, 0, tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) ClearLoginAttempts(ctx context.Context, identityHash [32]byte) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM login_throttles WHERE identity_hash = $1`, identityHash[:])
+	return err
+}
+
+func (r *PostgresRepository) MFAUserByID(ctx context.Context, userID string) (User, error) {
+	var user User
+	err := r.pool.QueryRow(ctx, `
+        SELECT id::text, email, password_hash, role
+        FROM users WHERE id = $1::uuid AND state = 'active' AND deleted_at IS NULL`, userID,
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, ErrInvalidCredentials
+	}
+	return user, err
+}
+
+func (r *PostgresRepository) TOTPForUser(ctx context.Context, userID string) (MFARecord, error) {
+	var record MFARecord
+	err := r.pool.QueryRow(ctx, `
+        SELECT encrypted_secret, nonce, confirmed_at, last_used_counter
+        FROM user_mfa_totp
+        WHERE user_id = $1::uuid`, userID,
+	).Scan(&record.EncryptedSecret, &record.Nonce, &record.ConfirmedAt, &record.LastUsedCounter)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MFARecord{}, ErrMFANotConfigured
+	}
+	return record, err
+}
+
+func (r *PostgresRepository) SavePendingTOTP(ctx context.Context, userID string, encryptedSecret, nonce []byte) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	command, err := tx.Exec(ctx, `
+        INSERT INTO user_mfa_totp (user_id, encrypted_secret, nonce, confirmed_at, last_used_counter, updated_at)
+        VALUES ($1::uuid, $2, $3, NULL, NULL, now())
+        ON CONFLICT (user_id) DO UPDATE
+        SET encrypted_secret = EXCLUDED.encrypted_secret,
+            nonce = EXCLUDED.nonce,
+            confirmed_at = NULL,
+            last_used_counter = NULL,
+            updated_at = now()
+        WHERE user_mfa_totp.confirmed_at IS NULL`, userID, encryptedSecret, nonce)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrMFAInvalid
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM user_mfa_recovery_codes WHERE user_id = $1::uuid`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = COALESCE(consumed_at, now()) WHERE user_id = $1::uuid AND consumed_at IS NULL`, userID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) ConfirmTOTP(ctx context.Context, userID string, counter int64, recoveryHashes [][32]byte) error {
+	if len(recoveryHashes) == 0 {
+		return ErrMFAInvalid
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var confirmedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT confirmed_at FROM user_mfa_totp WHERE user_id = $1::uuid FOR UPDATE`, userID).Scan(&confirmedAt); errors.Is(err, pgx.ErrNoRows) {
+		return ErrMFANotConfigured
+	} else if err != nil {
+		return err
+	}
+	if confirmedAt != nil {
+		return ErrMFAInvalid
+	}
+	if _, err := tx.Exec(ctx, `
+        UPDATE user_mfa_totp
+        SET confirmed_at = now(), last_used_counter = $2, updated_at = now()
+        WHERE user_id = $1::uuid`, userID, counter); err != nil {
+		return err
+	}
+	if err := replaceRecoveryCodesTx(ctx, tx, userID, recoveryHashes); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) CreateMFAChallenge(
+	ctx context.Context,
+	userID, deviceName string,
+	hash [32]byte,
+	now, expiresAt time.Time,
+	attempts int,
+) error {
+	if attempts <= 0 || deviceName == "" || !expiresAt.After(now) {
+		return ErrMFAChallenge
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Serialize challenge issuance for a user. This prevents concurrent successful
+	// password logins from racing past the durable per-user issuance bound.
+	var lockedUserID string
+	if err := tx.QueryRow(ctx, `
+        SELECT id::text FROM users WHERE id = $1::uuid FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrMFAChallenge
+		}
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
+        DELETE FROM mfa_challenges
+        WHERE created_at < $1`, now.Add(-mfaChallengeRetention)); err != nil {
+		return err
+	}
+
+	var recent int
+	if err := tx.QueryRow(ctx, `
+        SELECT count(*)
+        FROM mfa_challenges
+        WHERE user_id = $1::uuid AND created_at >= $2`,
+		userID, now.Add(-mfaChallengeIssueWindow),
+	).Scan(&recent); err != nil {
+		return err
+	}
+	if recent >= mfaChallengeIssueLimit {
+		return ErrMFARateLimited
+	}
+
+	if _, err := tx.Exec(ctx, `
+        INSERT INTO mfa_challenges (
+            challenge_hash, user_id, device_name, expires_at, attempts_remaining, created_at
+        ) VALUES ($1, $2::uuid, $3, $4, $5, $6)`,
+		hash[:], userID, deviceName, expiresAt, attempts, now,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) MFAChallengeByHash(ctx context.Context, hash [32]byte, now time.Time) (MFAChallenge, error) {
+	var challenge MFAChallenge
+	err := r.pool.QueryRow(ctx, `
+        SELECT account.id::text, account.email, account.password_hash, account.role,
+               challenge.device_name, mfa.encrypted_secret, mfa.nonce,
+               mfa.last_used_counter, challenge.expires_at, challenge.attempts_remaining
+        FROM mfa_challenges AS challenge
+        JOIN users AS account ON account.id = challenge.user_id
+        JOIN user_mfa_totp AS mfa ON mfa.user_id = challenge.user_id
+        WHERE challenge.challenge_hash = $1
+          AND challenge.consumed_at IS NULL
+          AND challenge.attempts_remaining > 0
+          AND challenge.expires_at > $2
+          AND mfa.confirmed_at IS NOT NULL
+          AND account.state = 'active' AND account.deleted_at IS NULL`, hash[:], now,
+	).Scan(
+		&challenge.User.ID, &challenge.User.Email, &challenge.User.PasswordHash, &challenge.User.Role,
+		&challenge.DeviceName, &challenge.EncryptedSecret, &challenge.Nonce,
+		&challenge.LastUsedCounter, &challenge.ExpiresAt, &challenge.Attempts,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MFAChallenge{}, ErrMFAChallenge
+	}
+	return challenge, err
+}
+
+func (r *PostgresRepository) FailMFAChallenge(ctx context.Context, hash [32]byte, now time.Time) (int, error) {
+	var remaining int
+	err := r.pool.QueryRow(ctx, `
+        UPDATE mfa_challenges
+        SET attempts_remaining = GREATEST(attempts_remaining - 1, 0),
+            consumed_at = CASE WHEN attempts_remaining <= 1 THEN $2 ELSE consumed_at END
+        WHERE challenge_hash = $1 AND consumed_at IS NULL AND expires_at > $2 AND attempts_remaining > 0
+        RETURNING attempts_remaining`, hash[:], now).Scan(&remaining)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrMFAChallenge
+	}
+	return remaining, err
+}
+
+func (r *PostgresRepository) CompleteMFATOTPChallenge(ctx context.Context, hash [32]byte, now time.Time, counter int64) (User, string, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return User{}, "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var user User
+	var deviceName string
+	var lastCounter *int64
+	err = tx.QueryRow(ctx, `
+        SELECT account.id::text, account.email, account.password_hash, account.role,
+               challenge.device_name, mfa.last_used_counter
+        FROM mfa_challenges AS challenge
+        JOIN users AS account ON account.id = challenge.user_id
+        JOIN user_mfa_totp AS mfa ON mfa.user_id = challenge.user_id
+        WHERE challenge.challenge_hash = $1
+          AND challenge.consumed_at IS NULL
+          AND challenge.attempts_remaining > 0
+          AND challenge.expires_at > $2
+          AND mfa.confirmed_at IS NOT NULL
+          AND account.state = 'active' AND account.deleted_at IS NULL
+        FOR UPDATE OF challenge, mfa`, hash[:], now,
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &lastCounter)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, "", ErrMFAChallenge
+	}
+	if err != nil {
+		return User{}, "", err
+	}
+	if lastCounter != nil && counter <= *lastCounter {
+		return User{}, "", ErrMFAReplay
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_mfa_totp SET last_used_counter = $2, updated_at = $3 WHERE user_id = $1::uuid`, user.ID, counter, now); err != nil {
+		return User{}, "", err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = $2 WHERE challenge_hash = $1`, hash[:], now); err != nil {
+		return User{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, "", err
+	}
+	return user, deviceName, nil
+}
+
+func (r *PostgresRepository) CompleteMFARecoveryChallenge(ctx context.Context, challengeHash, recoveryHash [32]byte, now time.Time) (User, string, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return User{}, "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var user User
+	var deviceName string
+	err = tx.QueryRow(ctx, `
+        SELECT account.id::text, account.email, account.password_hash, account.role, challenge.device_name
+        FROM mfa_challenges AS challenge
+        JOIN users AS account ON account.id = challenge.user_id
+        JOIN user_mfa_totp AS mfa ON mfa.user_id = challenge.user_id
+        WHERE challenge.challenge_hash = $1
+          AND challenge.consumed_at IS NULL
+          AND challenge.attempts_remaining > 0
+          AND challenge.expires_at > $2
+          AND mfa.confirmed_at IS NOT NULL
+          AND account.state = 'active' AND account.deleted_at IS NULL
+        FOR UPDATE OF challenge`, challengeHash[:], now,
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, "", ErrMFAChallenge
+	}
+	if err != nil {
+		return User{}, "", err
+	}
+	command, err := tx.Exec(ctx, `
+        UPDATE user_mfa_recovery_codes
+        SET used_at = $3
+        WHERE user_id = $1::uuid AND code_hash = $2 AND used_at IS NULL`, user.ID, recoveryHash[:], now)
+	if err != nil {
+		return User{}, "", err
+	}
+	if command.RowsAffected() != 1 {
+		return User{}, "", ErrMFAInvalid
+	}
+	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = $2 WHERE challenge_hash = $1`, challengeHash[:], now); err != nil {
+		return User{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, "", err
+	}
+	return user, deviceName, nil
+}
+
+func (r *PostgresRepository) AdvanceTOTPCounter(ctx context.Context, userID string, counter int64) error {
+	command, err := r.pool.Exec(ctx, `
+        UPDATE user_mfa_totp
+        SET last_used_counter = $2, updated_at = now()
+        WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL
+          AND (last_used_counter IS NULL OR last_used_counter < $2)`, userID, counter)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrMFAReplay
+	}
+	return nil
+}
+
+func (r *PostgresRepository) ReplaceRecoveryCodes(ctx context.Context, userID string, hashes [][32]byte) error {
+	if len(hashes) == 0 {
+		return ErrMFAInvalid
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := replaceRecoveryCodesTx(ctx, tx, userID, hashes); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func replaceRecoveryCodesTx(ctx context.Context, tx pgx.Tx, userID string, hashes [][32]byte) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM user_mfa_recovery_codes WHERE user_id = $1::uuid`, userID); err != nil {
+		return err
+	}
+	for _, hash := range hashes {
+		if _, err := tx.Exec(ctx, `INSERT INTO user_mfa_recovery_codes (user_id, code_hash) VALUES ($1::uuid, $2)`, userID, hash[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *PostgresRepository) DisableMFA(ctx context.Context, userID string, counter int64) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var lastUsed *int64
+	err = tx.QueryRow(ctx, `
+        SELECT last_used_counter
+        FROM user_mfa_totp
+        WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL
+        FOR UPDATE`, userID).Scan(&lastUsed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrMFANotConfigured
+	}
+	if err != nil {
+		return err
+	}
+	if lastUsed != nil && counter <= *lastUsed {
+		return ErrMFAReplay
+	}
+	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = COALESCE(consumed_at, now()) WHERE user_id = $1::uuid AND consumed_at IS NULL`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM user_mfa_recovery_codes WHERE user_id = $1::uuid`, userID); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `DELETE FROM user_mfa_totp WHERE user_id = $1::uuid`, userID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrMFANotConfigured
+	}
+	return tx.Commit(ctx)
 }

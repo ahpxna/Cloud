@@ -1,0 +1,104 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  gateway-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.7"
+          cache: true
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.74.0
+          cache: true
+      - name: Install cosign
+        run: |
+          go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.0
+          cosign version
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push immutable gateway image
+        id: image
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/${repo}/upload-gateway:${TAG}"
+          docker build --pull --target gateway \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --tag "$image" .
+          docker push "$image" | tee push.txt
+          digest="$(awk '/digest:/ {print $3}' push.txt | tail -n1)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s@%s\n' "$image" "$digest" >> "$GITHUB_OUTPUT"
+      - name: Generate CycloneDX SBOM
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: trivy image --format cyclonedx --output sbom.cdx.json "$IMAGE_REF"
+      - name: Generate build provenance predicate
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          predicate = {
+              "buildType": "https://github.com/Attestations/GitHubActionsWorkflow@v1",
+              "builder": {"id": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"},
+              "invocation": {
+                  "configSource": {
+                      "uri": f"git+{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}.git",
+                      "digest": {"sha1": os.environ["GITHUB_SHA"]},
+                      "entryPoint": ".github/workflows/release.yml"
+                  },
+                  "parameters": {"target": "gateway", "image": os.environ["IMAGE_REF"]},
+                  "environment": {"runner": "ubuntu-24.04"}
+              },
+              "metadata": {"reproducible": False},
+              "materials": [{
+                  "uri": f"git+{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}.git",
+                  "digest": {"sha1": os.environ["GITHUB_SHA"]}
+              }]
+          }
+          with open("provenance.json", "w", encoding="utf-8") as f:
+              json.dump(predicate, f, sort_keys=True, indent=2)
+              f.write("\n")
+          PY
+      - name: Keyless-sign image and attest SBOM/provenance
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE_REF"
+          cosign attest --yes --predicate sbom.cdx.json --type cyclonedx "$IMAGE_REF"
+          cosign attest --yes --predicate provenance.json --type slsaprovenance "$IMAGE_REF"
+          cosign verify "$IMAGE_REF" \
+            --certificate-identity-regexp "^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+      - name: Upload release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gateway-release-evidence-${{ github.ref_name }}
+          path: |
+            sbom.cdx.json
+            provenance.json
+          if-no-files-found: error
+          retention-days: 90

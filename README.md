@@ -7,9 +7,10 @@ background uploads, per-user libraries, and a self-hosted origin.
 
 This repository now contains the first backend vertical slice: invite-only
 accounts, Argon2id password verification, rotating refresh sessions, short-lived
-access tokens, an authenticated tus gateway, owner isolation, bounded upload
-concurrency, SHA-256 verification, quarantine, crash recovery, and durable
-no-overwrite commit. It now also has content-addressed per-owner deduplication,
+access tokens, TOTP MFA with one-time recovery codes, durable login throttling, an
+authenticated tus gateway, owner isolation, bounded upload concurrency and
+creation rates, SHA-256 verification, fenced quarantine, crash recovery, and
+durable no-overwrite commit. It now also has content-addressed per-owner deduplication,
 quota/free-space admission control, stale-upload expiry, periodic reconciliation,
 readiness checks, bounded password-hash concurrency, and refresh-token-family
 replay revocation. The standalone `tusd-lab` remains intentionally unsafe and
@@ -34,14 +35,39 @@ The accepted direction is:
 
 Read [the architecture](docs/architecture.md), [MVP API contract](docs/api.md),
 [integrity manifest format](docs/integrity-manifest-v1.md), [iOS scaffold
-notes](ios/README.md), and [upstream survey](docs/research/upstream-landscape.md)
-before implementing clients or more services.
+notes](ios/README.md), [operator runbooks](docs/runbooks/), and
+[upstream survey](docs/research/upstream-landscape.md) before implementing
+clients or more services.
 
 The backend is not the finished product yet. The iOS source includes a Share
-Extension queue, TUSKit-based upload transport, and private Library viewer, but
-it is unbuilt on this machine because full Xcode is absent. Thumbnails,
-scheduled manifest generation, backups, and physical-device background tests
-remain before an App Store release.
+Extension queue, TUSKit-based upload transport, private Library viewer, TOTP MFA
+enrolment/login/recovery controls, corrupt-queue recovery, and an exportable
+background-transfer diagnostic log, but full Xcode/physical-device acceptance
+is still external evidence. The operator
+plane now includes full-byte scrubs, scheduled signed-manifest cycles,
+append-only audit export, private Prometheus/Grafana/Alertmanager, synthetic
+upload/download integrity probes, restart/resume chaos testing, encrypted
+restic backup tooling, and an isolated restore drill. These are source-ready
+controls, not proof that a real off-site repository, alert receiver, or iPhone
+acceptance test has been completed.
+
+## Operator integrity and recovery
+
+After creating the manifest signing key and a real restic repository, the main
+operator entry points are:
+
+```bash
+make scrub
+make integrity-cycle
+make audit-export
+make observability-up
+make backup
+make restore-drill
+```
+
+Use a dedicated probe account for `make synthetic-probe` and local
+`make chaos-resume`. See the integrity, backup/restore, observability, synthetic
+probe, and supply-chain runbooks before scheduling these jobs.
 
 ## Budget-first order
 
@@ -70,17 +96,21 @@ make config
 make db-up
 ```
 
-Generate the gateway secret in the untracked `.env`, then start the gateway:
+Generate three independent gateway secrets in the untracked `.env`, then start
+the gateway. Never reuse a key across these purposes:
 
 ```bash
-openssl rand -base64 32
-# paste into ACCESS_TOKEN_HMAC_KEY_BASE64 in .env
+openssl rand -base64 32  # ACCESS_TOKEN_HMAC_KEY_BASE64
+openssl rand -base64 32  # LOGIN_THROTTLE_HMAC_KEY_BASE64
+openssl rand -base64 32  # MFA_ENCRYPTION_KEY_BASE64 (exactly 32 decoded bytes)
 make gateway-up
 make create-user EMAIL=parent@example.com
 ```
 
 After configuring a named Cloudflare Tunnel whose public hostname targets
-`http://upload-gateway:8080`, add its scoped token to `.env` and run:
+`http://upload-gateway:8080`, add its scoped token to `.env`. Review and apply
+the versioned defense-in-depth rules in `infra/cloudflare/` with a scoped Zone
+WAF token, then run:
 
 ```bash
 make edge-up
@@ -103,8 +133,10 @@ checksum mismatch. Take a verified backup before any upgrade.
 The only exception is a one-time upgrade from the old pre-ledger Compose
 deployment. After independently confirming which SQL files were already
 applied, set `PHOTO_MIGRATION_BASELINE_VERSION` to that exact version for one
-run, then remove it. This is explicit operator acknowledgement, not an
-automatic guess about a production schema.
+run, then remove it. The runner fingerprints expected column types/nullability,
+indexes, foreign keys and checks before recording a baseline; presence-only
+lookalike schemas are refused. This is explicit operator acknowledgement, not
+an automatic guess about a production schema.
 
 ## Project rules
 
@@ -114,6 +146,9 @@ automatic guess about a production schema.
 - User ownership comes from the authenticated server session, never arbitrary
   upload metadata.
 - No public route may bypass the authenticated gateway.
+- Only one writable upload gateway may own the media state machine at a time;
+  startup holds a session-level PostgreSQL advisory lock and a second gateway
+  fails closed.
 - A single storage disk is not a backup.
 - The gateway refuses new uploads when quota or the media free-space reserve
   would be exceeded; `507` is a safety result, not a transient client error.

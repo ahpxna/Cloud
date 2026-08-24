@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [gateway, admin, manifest, migrate]
+        target: [gateway, admin, manifest, scrub, metrics-exporter, synthetic-probe, audit-export, migrate]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Install Trivy
@@ -75,6 +75,15 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+      - name: Generate CycloneDX image SBOM
+        run: trivy image --format cyclonedx --output "sbom-${{ matrix.target }}.cdx.json" "family-photo-cloud:${{ matrix.target }}"
+      - name: Upload image SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ matrix.target }}
+          path: sbom-${{ matrix.target }}.cdx.json
+          if-no-files-found: error
+          retention-days: 30
 
   codeql-go:
     runs-on: ubuntu-24.04

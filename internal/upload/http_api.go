@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,28 +21,32 @@ import (
 )
 
 type API struct {
-	repository        Repository
-	maxBytes          int64
-	chunkBytes        int64
-	tokens            *auth.AccessTokenManager
-	now               func() time.Time
-	availableBytes    func() (int64, error)
-	minimumFreeBytes  int64
-	maxActiveSessions int
-	restart           func(context.Context, string, string) (Session, error)
+	repository          Repository
+	maxBytes            int64
+	chunkBytes          int64
+	tokens              *auth.AccessTokenManager
+	now                 func() time.Time
+	availableBytes      func() (int64, error)
+	minimumFreeBytes    int64
+	maxActiveSessions   int
+	createWindow        time.Duration
+	maxCreatesPerWindow int
+	restart             func(context.Context, string, string) (Session, error)
 }
 
-func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64, maxActiveSessions int, restart func(context.Context, string, string) (Session, error)) *API {
+func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64, maxActiveSessions int, createWindow time.Duration, maxCreatesPerWindow int, restart func(context.Context, string, string) (Session, error)) *API {
 	return &API{
-		repository:        repository,
-		maxBytes:          maxBytes,
-		chunkBytes:        chunkBytes,
-		tokens:            tokens,
-		now:               time.Now,
-		availableBytes:    availableBytes,
-		minimumFreeBytes:  minimumFreeBytes,
-		maxActiveSessions: maxActiveSessions,
-		restart:           restart,
+		repository:          repository,
+		maxBytes:            maxBytes,
+		chunkBytes:          chunkBytes,
+		tokens:              tokens,
+		now:                 time.Now,
+		availableBytes:      availableBytes,
+		minimumFreeBytes:    minimumFreeBytes,
+		maxActiveSessions:   maxActiveSessions,
+		createWindow:        createWindow,
+		maxCreatesPerWindow: maxCreatesPerWindow,
+		restart:             restart,
 	}
 }
 
@@ -100,6 +105,10 @@ func (api *API) restartSession(w http.ResponseWriter, r *http.Request, principal
 		writeProblem(w, http.StatusConflict, "upload_session_not_restartable", "only an incomplete upload with lost local resume state can be restarted")
 		return
 	}
+	if errors.Is(err, ErrUploadResourceInconsistent) {
+		writeProblem(w, http.StatusConflict, "upload_resource_inconsistent", "server upload bytes and TUS metadata disagree; data was preserved for recovery")
+		return
+	}
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "upload_restart_failed", "could not reset the server upload resource")
 		return
@@ -145,17 +154,21 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		writeProblem(w, http.StatusServiceUnavailable, "storage_unavailable", "storage capacity cannot be checked")
 		return
 	}
+	now := api.now().UTC()
 	session, created, err := api.repository.CreateSession(r.Context(), CreateSessionInput{
-		OwnerID:           principal.UserID,
-		ClientAssetID:     request.ClientAssetID,
-		OriginalFilename:  request.OriginalFilename,
-		MediaType:         request.MediaType,
-		ExpectedSize:      request.ExpectedSize,
-		ClientSHA256:      hash,
-		ExpiresAt:         api.now().UTC().Add(7 * 24 * time.Hour),
-		AvailableBytes:    availableBytes,
-		MinimumFreeBytes:  api.minimumFreeBytes,
-		MaxActiveSessions: api.maxActiveSessions,
+		OwnerID:             principal.UserID,
+		ClientAssetID:       request.ClientAssetID,
+		OriginalFilename:    request.OriginalFilename,
+		MediaType:           request.MediaType,
+		ExpectedSize:        request.ExpectedSize,
+		ClientSHA256:        hash,
+		ExpiresAt:           now.Add(7 * 24 * time.Hour),
+		Now:                 now,
+		AvailableBytes:      availableBytes,
+		MinimumFreeBytes:    api.minimumFreeBytes,
+		MaxActiveSessions:   api.maxActiveSessions,
+		CreateWindow:        api.createWindow,
+		MaxCreatesPerWindow: api.maxCreatesPerWindow,
 	})
 	if errors.Is(err, ErrConflict) {
 		writeProblem(w, http.StatusConflict, "idempotency_conflict", "client_asset_id already has different immutable metadata")
@@ -169,6 +182,15 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		writeProblem(w, http.StatusTooManyRequests, "active_upload_limit", "too many incomplete uploads; resume or allow stale sessions to expire")
 		return
 	}
+	if errors.Is(err, ErrCreateRateLimit) {
+		retrySeconds := int64(api.createWindow.Round(time.Second).Seconds())
+		if retrySeconds < 1 {
+			retrySeconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
+		writeProblem(w, http.StatusTooManyRequests, "upload_create_rate_limited", "too many new upload sessions; retry later")
+		return
+	}
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "session_create_failed", "could not create upload session")
 		return
@@ -178,8 +200,8 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 	if created {
 		status = http.StatusCreated
 	}
-	now := api.now().UTC()
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, uploadCapabilityTTL(session.ExpiresAt.Sub(now)))
+	tokenNow := api.now().UTC()
+	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, tokenNow, uploadCapabilityTTL(session.ExpiresAt.Sub(tokenNow)))
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "upload_token_failed", "could not issue upload capability")
 		return

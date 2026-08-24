@@ -24,20 +24,26 @@ import (
 const tusBasePath = "/v1/uploads/"
 
 type Config struct {
-	Repository              upload.Repository
-	Accounts                account.Repository
-	Tokens                  *auth.AccessTokenManager
-	MediaRoot               string
-	MaxUploadBytes          int64
-	ChunkBytes              int64
-	VerificationJobs        int
-	MaxConcurrentPatches    int
-	MaxPatchesPerUser       int
-	MinimumFreeBytes        int64
-	ReconcileInterval       time.Duration
-	VerificationLease       time.Duration
-	MaxActiveUploadSessions int
-	Logger                  *slog.Logger
+	Repository                upload.Repository
+	Accounts                  account.Repository
+	Tokens                    *auth.AccessTokenManager
+	MediaRoot                 string
+	MaxUploadBytes            int64
+	ChunkBytes                int64
+	VerificationJobs          int
+	MaxConcurrentPatches      int
+	MaxPatchesPerUser         int
+	MinimumFreeBytes          int64
+	ReconcileInterval         time.Duration
+	VerificationLease         time.Duration
+	MaxActiveUploadSessions   int
+	UploadSessionCreateWindow time.Duration
+	MaxUploadCreatesPerWindow int
+	LoginThrottleHMACKey      []byte
+	GlobalLoginRatePerSecond  float64
+	GlobalLoginBurst          int
+	MFAEncryptionKey          []byte
+	Logger                    *slog.Logger
 }
 
 type Server struct {
@@ -76,6 +82,12 @@ func New(config Config) (*Server, error) {
 	}
 	if config.MaxActiveUploadSessions <= 0 {
 		config.MaxActiveUploadSessions = 200
+	}
+	if config.UploadSessionCreateWindow <= 0 {
+		config.UploadSessionCreateWindow = time.Minute
+	}
+	if config.MaxUploadCreatesPerWindow <= 0 {
+		config.MaxUploadCreatesPerWindow = 30
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -313,13 +325,21 @@ func New(config Config) (*Server, error) {
 	// Compatibility alias for local probes; readiness is deliberately stricter
 	// than liveness and is the endpoint used by Compose.
 	mux.Handle("GET /healthz", readyHandler)
-	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, config.MaxActiveUploadSessions, func(requestContext context.Context, id, ownerID string) (upload.Session, error) {
+	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, config.MaxActiveUploadSessions, config.UploadSessionCreateWindow, config.MaxUploadCreatesPerWindow, func(requestContext context.Context, id, ownerID string) (upload.Session, error) {
 		unlock := resourceLocks.lock(id)
 		defer unlock()
 		return processor.ResetForRetry(requestContext, id, ownerID)
 	})
 	if config.Accounts != nil {
-		accountAPI := account.NewAPI(config.Accounts, config.Tokens, config.Logger)
+		accountAPI, err := account.NewSecureAPI(config.Accounts, config.Tokens, config.Logger, account.SecurityConfig{
+			LoginThrottleHMACKey: config.LoginThrottleHMACKey,
+			GlobalLoginRate:      config.GlobalLoginRatePerSecond,
+			GlobalLoginBurst:     config.GlobalLoginBurst,
+			MFAEncryptionKey:     config.MFAEncryptionKey,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("configure account security: %w", err)
+		}
 		mux.Handle("/v1/auth/", accountAPI)
 	}
 	assetRepository, ok := config.Repository.(upload.AssetRepository)

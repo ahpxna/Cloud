@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Family Photo Cloud encrypted off-site backup
+
+[Timer]
+OnCalendar=*-*-* 02:10:00
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

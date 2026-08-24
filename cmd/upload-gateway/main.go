@@ -30,7 +30,15 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
-	key, err := decodeSecret(os.Getenv("ACCESS_TOKEN_HMAC_KEY_BASE64"))
+	key, err := decodeSecretEnv("ACCESS_TOKEN_HMAC_KEY_BASE64")
+	if err != nil {
+		return err
+	}
+	loginThrottleKey, err := decodeSecretEnv("LOGIN_THROTTLE_HMAC_KEY_BASE64")
+	if err != nil {
+		return err
+	}
+	mfaEncryptionKey, err := decodeSecretEnvExact("MFA_ENCRYPTION_KEY_BASE64", 32)
 	if err != nil {
 		return err
 	}
@@ -50,6 +58,11 @@ func run(logger *slog.Logger) error {
 	if err := pool.Ping(startupContext); err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
+	gatewayLease, err := acquireSingleGatewayLease(startupContext, pool)
+	if err != nil {
+		return err
+	}
+	defer gatewayLease.Release()
 
 	maxUploadBytes, err := envInt64("TUS_MAX_UPLOAD_BYTES", 20<<30)
 	if err != nil {
@@ -87,22 +100,44 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	uploadCreateWindow, err := envDurationStrict("UPLOAD_SESSION_CREATE_WINDOW", time.Minute)
+	if err != nil {
+		return err
+	}
+	maxUploadCreatesPerWindow, err := envInt("MAX_UPLOAD_SESSION_CREATES_PER_WINDOW", 30)
+	if err != nil {
+		return err
+	}
+	globalLoginRate, err := envFloat("GLOBAL_LOGIN_RATE_PER_SECOND", 1)
+	if err != nil {
+		return err
+	}
+	globalLoginBurst, err := envInt("GLOBAL_LOGIN_BURST", 20)
+	if err != nil {
+		return err
+	}
 	repository := upload.NewPostgresRepository(pool)
 	application, err := gateway.New(gateway.Config{
-		Repository:              repository,
-		Accounts:                account.NewPostgresRepository(pool),
-		Tokens:                  tokens,
-		MediaRoot:               envString("PHOTO_MEDIA_ROOT", "/srv/media"),
-		MaxUploadBytes:          maxUploadBytes,
-		ChunkBytes:              chunkBytes,
-		VerificationJobs:        verificationJobs,
-		MaxConcurrentPatches:    maxConcurrentPatches,
-		MaxPatchesPerUser:       maxPatchesPerUser,
-		MinimumFreeBytes:        minimumFreeBytes,
-		ReconcileInterval:       reconcileInterval,
-		VerificationLease:       verificationLease,
-		MaxActiveUploadSessions: maxActiveUploadSessions,
-		Logger:                  logger,
+		Repository:                repository,
+		Accounts:                  account.NewPostgresRepository(pool),
+		Tokens:                    tokens,
+		MediaRoot:                 envString("PHOTO_MEDIA_ROOT", "/srv/media"),
+		MaxUploadBytes:            maxUploadBytes,
+		ChunkBytes:                chunkBytes,
+		VerificationJobs:          verificationJobs,
+		MaxConcurrentPatches:      maxConcurrentPatches,
+		MaxPatchesPerUser:         maxPatchesPerUser,
+		MinimumFreeBytes:          minimumFreeBytes,
+		ReconcileInterval:         reconcileInterval,
+		VerificationLease:         verificationLease,
+		MaxActiveUploadSessions:   maxActiveUploadSessions,
+		UploadSessionCreateWindow: uploadCreateWindow,
+		MaxUploadCreatesPerWindow: maxUploadCreatesPerWindow,
+		LoginThrottleHMACKey:      loginThrottleKey,
+		GlobalLoginRatePerSecond:  globalLoginRate,
+		GlobalLoginBurst:          globalLoginBurst,
+		MFAEncryptionKey:          mfaEncryptionKey,
+		Logger:                    logger,
 	})
 	if err != nil {
 		return err
@@ -154,16 +189,51 @@ func run(logger *slog.Logger) error {
 	}
 }
 
-func decodeSecret(raw string) ([]byte, error) {
+const singleGatewayAdvisoryLock int64 = 7042026082401
+
+func acquireSingleGatewayLease(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reserve gateway database connection: %w", err)
+	}
+	var acquired bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, singleGatewayAdvisoryLock).Scan(&acquired); err != nil {
+		conn.Release()
+		return nil, fmt.Errorf("acquire single-gateway writer lock: %w", err)
+	}
+	if !acquired {
+		conn.Release()
+		return nil, errors.New("another upload gateway already holds the writable-media lease")
+	}
+	return conn, nil
+}
+
+func decodeSecretEnv(name string) ([]byte, error) {
+	raw := os.Getenv(name)
 	if raw == "" {
-		return nil, errors.New("ACCESS_TOKEN_HMAC_KEY_BASE64 is required")
+		return nil, fmt.Errorf("%s is required", name)
 	}
 	key, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return nil, errors.New("ACCESS_TOKEN_HMAC_KEY_BASE64 must be standard base64")
+		return nil, fmt.Errorf("%s must be standard base64", name)
 	}
 	if len(key) < 32 {
-		return nil, errors.New("decoded access-token key must contain at least 32 bytes")
+		return nil, fmt.Errorf("decoded %s must contain at least 32 bytes", name)
+	}
+	return key, nil
+}
+
+func decodeSecretEnvExact(name string, size int) ([]byte, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return nil, fmt.Errorf("%s is required", name)
+	}
+	key, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be standard base64", name)
+	}
+	if len(key) != size {
+		return nil, fmt.Errorf("decoded %s must contain exactly %d bytes", name, size)
 	}
 	return key, nil
 }
@@ -190,6 +260,18 @@ func envInt64(name string, fallback int64) (int64, error) {
 func envInt(name string, fallback int) (int, error) {
 	value, err := envInt64(name, int64(fallback))
 	return int(value), err
+}
+
+func envFloat(name string, fallback float64) (float64, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive number", name)
+	}
+	return parsed, nil
 }
 
 func envDurationStrict(name string, fallback time.Duration) (time.Duration, error) {

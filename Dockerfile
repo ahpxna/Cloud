@@ -10,6 +10,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/upload-gateway ./cmd/upload-gateway \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/admin ./cmd/admin \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/manifest ./cmd/manifest \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scrub ./cmd/scrub \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/metrics-exporter ./cmd/metrics-exporter \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/synthetic-probe ./cmd/synthetic-probe \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/audit-export ./cmd/audit-export \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
 FROM alpine:3.23 AS runtime-base
@@ -30,6 +34,22 @@ ENTRYPOINT ["/usr/local/bin/admin"]
 FROM runtime-base AS manifest
 COPY --from=build /out/manifest /usr/local/bin/manifest
 ENTRYPOINT ["/usr/local/bin/manifest"]
+
+FROM runtime-base AS scrub
+COPY --from=build /out/scrub /usr/local/bin/scrub
+ENTRYPOINT ["/usr/local/bin/scrub"]
+
+FROM runtime-base AS metrics-exporter
+COPY --from=build /out/metrics-exporter /usr/local/bin/metrics-exporter
+ENTRYPOINT ["/usr/local/bin/metrics-exporter"]
+
+FROM runtime-base AS synthetic-probe
+COPY --from=build /out/synthetic-probe /usr/local/bin/synthetic-probe
+ENTRYPOINT ["/usr/local/bin/synthetic-probe"]
+
+FROM runtime-base AS audit-export
+COPY --from=build /out/audit-export /usr/local/bin/audit-export
+ENTRYPOINT ["/usr/local/bin/audit-export"]
 
 FROM runtime-base AS migrate
 COPY --from=build /out/migrate /usr/local/bin/migrate

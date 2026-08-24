@@ -1,0 +1,13 @@
+[Unit]
+Description=Family Photo Cloud integrity scrub and signed manifest cycle
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/family-photo-cloud
+EnvironmentFile=/opt/family-photo-cloud/.env
+ExecStart=/usr/bin/make integrity-cycle
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

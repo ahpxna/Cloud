@@ -2,11 +2,13 @@ package account
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -25,32 +27,89 @@ const (
 )
 
 type API struct {
-	repository   Repository
-	tokens       *auth.AccessTokenManager
-	logger       *slog.Logger
-	now          func() time.Time
-	limiter      *loginLimiter
-	passwordGate chan struct{}
-	dummyHash    string
+	repository     Repository
+	tokens         *auth.AccessTokenManager
+	logger         *slog.Logger
+	now            func() time.Time
+	limiter        *loginLimiter
+	durableLimiter LoginThrottleRepository
+	throttleKey    []byte
+	globalLimiter  *tokenBucket
+	passwordGate   chan struct{}
+	dummyHash      string
+	mfaRepo        MFARepository
+	mfaCipher      *mfaCipher
+}
+
+type SecurityConfig struct {
+	LoginThrottleHMACKey []byte
+	GlobalLoginRate      float64
+	GlobalLoginBurst     int
+	MFAEncryptionKey     []byte
 }
 
 func NewAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog.Logger) *API {
+	api, err := newAPI(repository, tokens, logger, SecurityConfig{})
+	if err != nil {
+		panic(err)
+	}
+	return api
+}
+
+// NewSecureAPI is the production constructor. Unlike NewAPI (kept for small
+// unit fakes), it refuses to start unless the repository can persist login
+// throttles and an independent HMAC key is configured.
+func NewSecureAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog.Logger, config SecurityConfig) (*API, error) {
+	if len(config.LoginThrottleHMACKey) < 32 {
+		return nil, errors.New("login throttle HMAC key must contain at least 32 bytes")
+	}
+	if _, ok := repository.(LoginThrottleRepository); !ok {
+		return nil, errors.New("production account repository must persist login throttles")
+	}
+	mfaRepo, ok := repository.(MFARepository)
+	if !ok {
+		return nil, errors.New("production account repository must persist MFA state")
+	}
+	mfaCipher, err := newMFACipher(config.MFAEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	api, err := newAPI(repository, tokens, logger, config)
+	if err != nil {
+		return nil, err
+	}
+	api.mfaRepo = mfaRepo
+	api.mfaCipher = mfaCipher
+	return api, nil
+}
+
+func newAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog.Logger, config SecurityConfig) (*API, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	dummyHash, err := HashPassword("dummy password used only for timing equalization")
 	if err != nil {
-		panic("construct fixed-valid dummy password: " + err.Error())
+		return nil, fmt.Errorf("construct fixed-valid dummy password: %w", err)
 	}
-	return &API{
-		repository:   repository,
-		tokens:       tokens,
-		logger:       logger,
-		now:          time.Now,
-		limiter:      newLoginLimiter(5, 10*time.Minute, 10_000),
-		passwordGate: make(chan struct{}, 4),
-		dummyHash:    dummyHash,
+	if config.GlobalLoginRate <= 0 {
+		config.GlobalLoginRate = 1
 	}
+	if config.GlobalLoginBurst <= 0 {
+		config.GlobalLoginBurst = 20
+	}
+	api := &API{
+		repository:    repository,
+		tokens:        tokens,
+		logger:        logger,
+		now:           time.Now,
+		limiter:       newLoginLimiter(5, 10*time.Minute, 10_000),
+		throttleKey:   append([]byte(nil), config.LoginThrottleHMACKey...),
+		globalLimiter: newTokenBucket(config.GlobalLoginRate, config.GlobalLoginBurst),
+		passwordGate:  make(chan struct{}, 4),
+		dummyHash:     dummyHash,
+	}
+	api.durableLimiter, _ = repository.(LoginThrottleRepository)
+	return api, nil
 }
 
 type loginRequest struct {
@@ -80,6 +139,16 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.refresh(w, r)
 	case r.URL.Path == "/v1/auth/logout" && r.Method == http.MethodPost:
 		api.logout(w, r)
+	case r.URL.Path == "/v1/auth/mfa/enroll" && r.Method == http.MethodPost:
+		api.mfaEnroll(w, r)
+	case r.URL.Path == "/v1/auth/mfa/confirm" && r.Method == http.MethodPost:
+		api.mfaConfirm(w, r)
+	case r.URL.Path == "/v1/auth/mfa/verify" && r.Method == http.MethodPost:
+		api.mfaVerify(w, r)
+	case r.URL.Path == "/v1/auth/mfa/recovery" && r.Method == http.MethodPost:
+		api.mfaRecovery(w, r)
+	case r.URL.Path == "/v1/auth/mfa/disable" && r.Method == http.MethodPost:
+		api.mfaDisable(w, r)
 	case r.URL.Path == "/v1/auth/sessions" && r.Method == http.MethodGet:
 		api.listSessions(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/auth/sessions/") && r.Method == http.MethodDelete:
@@ -146,7 +215,30 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
 		return
 	}
-	if !api.limiter.Allow(email, api.now()) {
+	now := api.now().UTC()
+	if !api.globalLimiter.Allow(now) {
+		w.Header().Set("Retry-After", "1")
+		accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
+		return
+	}
+	identityHash := api.loginIdentityHash(email)
+	if api.durableLimiter != nil && len(api.throttleKey) >= 32 {
+		allowed, retryAfter, err := api.durableLimiter.RecordLoginAttempt(r.Context(), identityHash, now, 10*time.Minute, 5)
+		if err != nil {
+			api.logger.Error("record login throttle", "error", err)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+			return
+		}
+		if !allowed {
+			seconds := int64(retryAfter.Round(time.Second).Seconds())
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprint(seconds))
+			accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
+			return
+		}
+	} else if !api.limiter.Allow(email, now) {
 		w.Header().Set("Retry-After", "600")
 		accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
 		return
@@ -181,7 +273,27 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
 		return
 	}
-	api.limiter.Reset(email)
+	if api.durableLimiter != nil && len(api.throttleKey) >= 32 {
+		if err := api.durableLimiter.ClearLoginAttempts(r.Context(), identityHash); err != nil {
+			api.logger.Error("clear login throttle", "user_id", user.ID, "error", err)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+			return
+		}
+	} else {
+		api.limiter.Reset(email)
+	}
+	if api.mfaRepo != nil {
+		record, err := api.mfaRepo.TOTPForUser(r.Context(), user.ID)
+		if err == nil && record.ConfirmedAt != nil {
+			api.issueMFAChallenge(w, r.Context(), user, request.DeviceName)
+			return
+		}
+		if err != nil && !errors.Is(err, ErrMFANotConfigured) {
+			api.logger.Error("load MFA state", "user_id", user.ID, "error", err)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+			return
+		}
+	}
 	api.createTokenPair(w, r.Context(), user, request.DeviceName)
 }
 
@@ -326,6 +438,45 @@ func accountProblem(w http.ResponseWriter, status int, code, detail string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": status, "code": code, "detail": detail})
 }
 
+func (api *API) loginIdentityHash(email string) [32]byte {
+	mac := hmac.New(sha256.New, api.throttleKey)
+	_, _ = mac.Write([]byte(email))
+	var result [32]byte
+	copy(result[:], mac.Sum(nil))
+	return result
+}
+
+type tokenBucket struct {
+	mu       sync.Mutex
+	rate     float64
+	burst    float64
+	tokens   float64
+	lastFill time.Time
+}
+
+func newTokenBucket(rate float64, burst int) *tokenBucket {
+	return &tokenBucket{rate: rate, burst: float64(burst), tokens: float64(burst)}
+}
+
+func (bucket *tokenBucket) Allow(now time.Time) bool {
+	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+	if bucket.lastFill.IsZero() {
+		bucket.lastFill = now
+	} else if now.After(bucket.lastFill) {
+		bucket.tokens += now.Sub(bucket.lastFill).Seconds() * bucket.rate
+		if bucket.tokens > bucket.burst {
+			bucket.tokens = bucket.burst
+		}
+		bucket.lastFill = now
+	}
+	if bucket.tokens < 1 {
+		return false
+	}
+	bucket.tokens--
+	return true
+}
+
 type loginAttempt struct {
 	count       int
 	windowStart time.Time
@@ -352,23 +503,13 @@ func (limiter *loginLimiter) Allow(key string, now time.Time) bool {
 		known = false
 	}
 	if !known && len(limiter.entries) >= limiter.capacity {
-		// A bounded cache must not become an attacker-controlled deny-list.
-		// Sweep only when saturated, then evict the oldest window if every
-		// entry is still active. This keeps the mutex path O(1) normally and
-		// lets a legitimate previously unseen account reach the worker gate.
-		var oldestKey string
-		var oldest time.Time
 		for existingKey, existing := range limiter.entries {
 			if now.Sub(existing.windowStart) >= limiter.window {
 				delete(limiter.entries, existingKey)
-				continue
-			}
-			if oldestKey == "" || existing.windowStart.Before(oldest) {
-				oldestKey, oldest = existingKey, existing.windowStart
 			}
 		}
-		if len(limiter.entries) >= limiter.capacity && oldestKey != "" {
-			delete(limiter.entries, oldestKey)
+		if len(limiter.entries) >= limiter.capacity {
+			return false
 		}
 	}
 	if !known {

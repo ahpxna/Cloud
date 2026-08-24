@@ -192,9 +192,17 @@ func TestProcessorExpiresIncompleteSessionAndPermitsSameClientRetry(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), []byte("partial"), 0o600); err != nil {
+	if err := repository.ClaimTusCreation(context.Background(), session.ID, session.OwnerID, session.ExpectedSize); err != nil {
 		t.Fatal(err)
 	}
+	partial := []byte("partial")
+	if err := repository.RecordProgress(context.Background(), session.ID, int64(len(partial))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), partial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, int64(len(partial)))
 	expired, err := repository.ExpiredSessions(context.Background(), time.Now(), 10)
 	if err != nil || len(expired) != 1 {
 		t.Fatalf("expired sessions=%#v err=%v", expired, err)
@@ -284,9 +292,11 @@ func TestResetForRetryRemovesOnlyIncompleteTusResource(t *testing.T) {
 	if err := repository.RecordProgress(context.Background(), session.ID, 25); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), []byte("partial"), 0o600); err != nil {
+	partial := make([]byte, 25)
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), partial, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, 25)
 	if _, err := processor.ResetForRetry(context.Background(), session.ID, testOwnerID); err != nil {
 		t.Fatal(err)
 	}
@@ -316,6 +326,208 @@ func TestVerificationFenceRejectsStaleWorkerTransition(t *testing.T) {
 	repository.mu.Unlock()
 	if err := processor.Process(stale, session.ID); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("stale verifier transition err=%v, want invalid state", err)
+	}
+}
+
+func TestExpireReconcilesDurablyCompleteTusResource(t *testing.T) {
+	t.Parallel()
+	repository := NewMemoryRepository()
+	processor, err := NewProcessor(repository, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("complete bytes persisted by the final PATCH")
+	hash := sha256.Sum256(content)
+	session, _, err := repository.CreateSession(context.Background(), CreateSessionInput{
+		OwnerID: testOwnerID, ClientAssetID: "expiry-final-patch", OriginalFilename: "final.mov",
+		MediaType: "video/quicktime", ExpectedSize: int64(len(content)), ClientSHA256: hash,
+		ExpiresAt: time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ClaimTusCreation(context.Background(), session.ID, session.OwnerID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RecordProgress(context.Background(), session.ID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, session.ExpectedSize)
+
+	stale, err := repository.SessionByID(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := processor.Expire(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.SessionByID(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateReceived {
+		t.Fatalf("state=%s want received", got.State)
+	}
+	if _, err := os.Stat(filepath.Join(processor.StagingDirectory(), session.ID)); err != nil {
+		t.Fatalf("complete payload was deleted: %v", err)
+	}
+}
+
+func TestResetForRetryReconcilesDurablyCompleteTusResource(t *testing.T) {
+	t.Parallel()
+	repository := NewMemoryRepository()
+	processor, err := NewProcessor(repository, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("complete retry bytes")
+	hash := sha256.Sum256(content)
+	session, _, err := repository.CreateSession(context.Background(), CreateSessionInput{
+		OwnerID: testOwnerID, ClientAssetID: "restart-final-patch", OriginalFilename: "final.jpg",
+		MediaType: "image/jpeg", ExpectedSize: int64(len(content)), ClientSHA256: hash,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ClaimTusCreation(context.Background(), session.ID, session.OwnerID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RecordProgress(context.Background(), session.ID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, session.ExpectedSize)
+
+	got, err := processor.ResetForRetry(context.Background(), session.ID, testOwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateReceived {
+		t.Fatalf("state=%s want received", got.State)
+	}
+	if _, err := os.Stat(filepath.Join(processor.StagingDirectory(), session.ID)); err != nil {
+		t.Fatalf("complete payload was deleted: %v", err)
+	}
+}
+
+func TestExpirePreservesInconsistentTusResource(t *testing.T) {
+	t.Parallel()
+	repository := NewMemoryRepository()
+	processor, err := NewProcessor(repository, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("expected"))
+	session, _, err := repository.CreateSession(context.Background(), CreateSessionInput{
+		OwnerID: testOwnerID, ClientAssetID: "bad-sidecar", OriginalFilename: "bad.jpg",
+		MediaType: "image/jpeg", ExpectedSize: 8, ClientSHA256: hash, ExpiresAt: time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ClaimTusCreation(context.Background(), session.ID, session.OwnerID, session.ExpectedSize); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(processor.StagingDirectory(), session.ID)
+	if err := os.WriteFile(payload, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(payload+".info", []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = processor.Expire(context.Background(), session)
+	if !errors.Is(err, ErrUploadResourceInconsistent) {
+		t.Fatalf("err=%v want inconsistent", err)
+	}
+	if _, statErr := os.Stat(payload); statErr != nil {
+		t.Fatalf("inconsistent payload was deleted: %v", statErr)
+	}
+}
+
+func writeTusSidecar(t *testing.T, processor *Processor, id string, size, offset int64) {
+	t.Helper()
+	sidecar := []byte(fmt.Sprintf(`{"ID":%q,"Size":%d,"Offset":%d}`, id, size, offset))
+	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), id+".info"), sidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateSessionThrottleCountsOnlyNewOrRestartedIdentities(t *testing.T) {
+	repository := NewMemoryRepository()
+	now := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
+	makeInput := func(clientID string) CreateSessionInput {
+		return CreateSessionInput{
+			OwnerID:             testOwnerID,
+			ClientAssetID:       clientID,
+			OriginalFilename:    clientID + ".jpg",
+			MediaType:           "image/jpeg",
+			ExpectedSize:        10,
+			ClientSHA256:        sha256.Sum256([]byte(clientID)),
+			ExpiresAt:           now.Add(time.Hour),
+			Now:                 now,
+			AvailableBytes:      1 << 30,
+			MinimumFreeBytes:    0,
+			MaxActiveSessions:   100,
+			CreateWindow:        time.Minute,
+			MaxCreatesPerWindow: 2,
+		}
+	}
+
+	first, created, err := repository.CreateSession(context.Background(), makeInput("first"))
+	if err != nil || !created {
+		t.Fatalf("first creation: created=%v err=%v", created, err)
+	}
+	if retried, created, err := repository.CreateSession(context.Background(), makeInput("first")); err != nil || created || retried.ID != first.ID {
+		t.Fatalf("idempotent retry consumed admission: created=%v session=%s err=%v", created, retried.ID, err)
+	}
+	if _, created, err := repository.CreateSession(context.Background(), makeInput("second")); err != nil || !created {
+		t.Fatalf("second creation: created=%v err=%v", created, err)
+	}
+	if _, _, err := repository.CreateSession(context.Background(), makeInput("third")); !errors.Is(err, ErrCreateRateLimit) {
+		t.Fatalf("third creation err=%v, want create rate limit", err)
+	}
+	if err := repository.MarkExpired(context.Background(), first.ID); err != nil {
+		t.Fatalf("expire first session: %v", err)
+	}
+	if _, _, err := repository.CreateSession(context.Background(), makeInput("first")); !errors.Is(err, ErrCreateRateLimit) {
+		t.Fatalf("expired identity restart err=%v, want create rate limit", err)
+	}
+
+	afterWindow := makeInput("third")
+	afterWindow.Now = now.Add(time.Minute)
+	if _, created, err := repository.CreateSession(context.Background(), afterWindow); err != nil || !created {
+		t.Fatalf("creation after window: created=%v err=%v", created, err)
+	}
+
+	activeRepository := NewMemoryRepository()
+	expiredInput := makeInput("expired")
+	expiredInput.MaxCreatesPerWindow = 0
+	expiredInput.MaxActiveSessions = 10
+	expired, _, err := activeRepository.CreateSession(context.Background(), expiredInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activeRepository.MarkExpired(context.Background(), expired.ID); err != nil {
+		t.Fatal(err)
+	}
+	blockerInput := makeInput("blocker")
+	blockerInput.MaxCreatesPerWindow = 0
+	blockerInput.MaxActiveSessions = 10
+	if _, _, err := activeRepository.CreateSession(context.Background(), blockerInput); err != nil {
+		t.Fatal(err)
+	}
+	restartInput := makeInput("expired")
+	restartInput.MaxCreatesPerWindow = 0
+	restartInput.MaxActiveSessions = 1
+	if _, _, err := activeRepository.CreateSession(context.Background(), restartInput); !errors.Is(err, ErrSessionLimit) {
+		t.Fatalf("expired identity restart active-cap err=%v, want session limit", err)
 	}
 }
 
@@ -349,9 +561,7 @@ func prepareReceivedSession(
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID+".info"), []byte("test sidecar"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, session.ExpectedSize)
 	if err := repository.MarkReceived(context.Background(), session.ID, session.ExpectedSize); err != nil {
 		t.Fatal(err)
 	}

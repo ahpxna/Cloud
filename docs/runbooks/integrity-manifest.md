@@ -1,6 +1,6 @@
 # Signed Integrity Manifest Runbook
 
-Status: tool implemented; scheduling and full-byte scrub still pending.
+Status: tool, full-byte scrub, and scheduling source implemented; first host cycle remains deployment evidence.
 
 Run this after the immutable-original backup succeeds, using a private key that
 is not stored in the media mount or Docker environment of `upload-gateway`.
@@ -27,6 +27,7 @@ database recording fails after file creation, the file is a valid but
 unregistered orphan: do not silently delete it; investigate and either record
 it through a reconciliation tool or archive it as evidence.
 
-This command signs metadata only. A scheduled scrubber must separately open
-each original, re-hash bytes, and report `match`, `mismatch`, `missing`, or
-`io_error` to `asset_integrity_checks`.
+This command signs metadata only. `cmd/scrub` separately opens each original,
+re-hashes bytes, and appends `match`, `mismatch`, `missing`, or `io_error` to
+`asset_integrity_checks`. Use `make integrity-cycle` so signing is refused when
+the full-byte scrub fails; see `docs/runbooks/integrity-cycle.md`.

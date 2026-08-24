@@ -5,9 +5,14 @@ artifacts/
 work/
 .cache/
 coverage.out
-manifest
-admin
-upload-gateway
+/manifest
+/admin
+/upload-gateway
+/scrub
+/metrics-exporter
+/synthetic-probe
+/audit-export
+/migrate
 *.log
 *.pem
 *.key
@@ -19,3 +24,11 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 /ios/FamilyPhotoCloud.xcodeproj/
+
+# Terraform local/provider state and deployment inputs may contain account or
+# infrastructure identifiers. Commit only versioned .tf source.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json

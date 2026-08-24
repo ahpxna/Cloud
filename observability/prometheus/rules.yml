@@ -1,0 +1,35 @@
+groups:
+  - name: family-photo-cloud
+    rules:
+      - alert: PhotoCloudMetricsDown
+        expr: up{job="family-photo-cloud"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Family Photo Cloud metrics exporter is unavailable"
+
+      - alert: PhotoCloudIntegrityFailureRecorded
+        expr: sum(photo_cloud_integrity_latest_assets{result=~"mismatch|missing|io_error"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "At least one original has failed an integrity scrub"
+          description: "Inspect the latest scrub report and do not repair in place before preserving evidence."
+
+      - alert: PhotoCloudVerificationBacklogStale
+        expr: photo_cloud_verification_oldest_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Verification or commit backlog is older than 15 minutes"
+
+      - alert: PhotoCloudStorageReserveLow
+        expr: photo_cloud_storage_available_bytes < 214748364800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Media filesystem has less than 200 GiB available"

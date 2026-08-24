@@ -30,11 +30,16 @@ authenticated download paths.
 2. Create a named Tunnel in Cloudflare Zero Trust and set its public-hostname
    service to `http://upload-gateway:8080`.
 3. Store the scoped connector token only as `CLOUDFLARE_TUNNEL_TOKEN` in the
-   ignored `.env` file. Generate `ACCESS_TOKEN_HMAC_KEY_BASE64` separately with
-   `openssl rand -base64 32`.
-4. Run `make edge-up`. The Compose topology lets cloudflared reach the gateway
+   ignored `.env` file. Generate `ACCESS_TOKEN_HMAC_KEY_BASE64`,
+   `LOGIN_THROTTLE_HMAC_KEY_BASE64`, and `MFA_ENCRYPTION_KEY_BASE64` as three
+   independent 32-byte secrets. Never reuse one key for another purpose.
+4. Review `infra/cloudflare/`, create an ignored `.tfvars`, import any existing
+   zone entry-point rulesets, then run `terraform init`, `terraform plan`, and
+   only after review `terraform apply`. The rate-limit rules intentionally do
+   **not** rate-limit TUS PATCH requests.
+5. Run `make edge-up`. The Compose topology lets cloudflared reach the gateway
    but not the PostgreSQL network.
-5. Do not create a route to `tusd-lab`, PostgreSQL, Grafana, SSH, or a Docker
+6. Do not create a route to `tusd-lab`, PostgreSQL, Grafana, SSH, or a Docker
    socket. Disable caching for `/v1/*`.
 
 Avoid interactive browser challenges on the mobile API hostname. Authentication
@@ -51,6 +56,9 @@ readable and retry behavior must distinguish `401/403`, `429`, and transient
 - Confirm the final client and server SHA-256 values match.
 - Confirm staging objects cannot be downloaded or listed.
 - Attempt cross-user HEAD, PATCH, DELETE, and download requests.
+- Exceed the login/MFA/refresh/session-create edge thresholds and confirm a
+  machine-readable `429`/block response without affecting healthy TUS PATCH
+  resume traffic.
 - Verify Cloudflare and origin logs contain no token, filename, EXIF, or body.
 - Capture whether a synthetic HTTP 104 response survives the real Tunnel path;
   this is research evidence, not permission to exceed the 100 MB request cap.

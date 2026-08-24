@@ -1,0 +1,51 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Visible assets",
+      "targets": [{"expr": "photo_cloud_assets_total", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Verification backlog",
+      "targets": [{"expr": "photo_cloud_verification_backlog", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Oldest backlog age (s)",
+      "targets": [{"expr": "photo_cloud_verification_oldest_age_seconds", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Storage available (bytes)",
+      "targets": [{"expr": "photo_cloud_storage_available_bytes", "refId": "A"}],
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}
+    },
+    {
+      "type": "timeseries",
+      "title": "Upload sessions by state",
+      "targets": [{"expr": "photo_cloud_upload_sessions", "legendFormat": "{{state}}", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+    },
+    {
+      "type": "timeseries",
+      "title": "Integrity check evidence",
+      "targets": [{"expr": "photo_cloud_integrity_latest_assets", "legendFormat": "{{result}}", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+    }
+  ],
+  "schemaVersion": 41,
+  "tags": ["family-photo-cloud", "integrity"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now"},
+  "timezone": "browser",
+  "title": "Family Photo Cloud Operations",
+  "uid": "family-photo-cloud-ops",
+  "version": 1
+}

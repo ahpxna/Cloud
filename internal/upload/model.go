@@ -12,26 +12,29 @@ import (
 type State string
 
 const (
-	StateCreated     State = "created"
-	StateUploading   State = "uploading"
-	StateReceived    State = "received"
-	StateVerifying   State = "verifying"
-	StateVerified    State = "verified"
-	StateCommitting  State = "committing"
-	StateAvailable   State = "available"
-	StateFailed      State = "failed"
-	StateExpired     State = "expired"
-	StateQuarantined State = "quarantined"
+	StateCreated      State = "created"
+	StateUploading    State = "uploading"
+	StateReceived     State = "received"
+	StateVerifying    State = "verifying"
+	StateVerified     State = "verified"
+	StateCommitting   State = "committing"
+	StateAvailable    State = "available"
+	StateFailed       State = "failed"
+	StateExpired      State = "expired"
+	StateQuarantining State = "quarantining"
+	StateQuarantined  State = "quarantined"
 )
 
 var (
-	ErrNotFound            = errors.New("upload session not found")
-	ErrConflict            = errors.New("upload session conflict")
-	ErrInvalidState        = errors.New("invalid upload state transition")
-	ErrOwnerMismatch       = errors.New("upload owner mismatch")
-	ErrChecksumMismatch    = errors.New("uploaded content checksum mismatch")
-	ErrInsufficientStorage = errors.New("insufficient storage capacity")
-	ErrSessionLimit        = errors.New("too many active upload sessions")
+	ErrNotFound                   = errors.New("upload session not found")
+	ErrConflict                   = errors.New("upload session conflict")
+	ErrInvalidState               = errors.New("invalid upload state transition")
+	ErrOwnerMismatch              = errors.New("upload owner mismatch")
+	ErrChecksumMismatch           = errors.New("uploaded content checksum mismatch")
+	ErrInsufficientStorage        = errors.New("insufficient storage capacity")
+	ErrSessionLimit               = errors.New("too many active upload sessions")
+	ErrCreateRateLimit            = errors.New("upload session creation rate limited")
+	ErrUploadResourceInconsistent = errors.New("upload resource metadata is inconsistent")
 )
 
 type Session struct {
@@ -66,16 +69,19 @@ func VerificationFence(ctx context.Context) string {
 }
 
 type CreateSessionInput struct {
-	OwnerID           string
-	ClientAssetID     string
-	OriginalFilename  string
-	MediaType         string
-	ExpectedSize      int64
-	ClientSHA256      [32]byte
-	ExpiresAt         time.Time
-	AvailableBytes    int64
-	MinimumFreeBytes  int64
-	MaxActiveSessions int
+	OwnerID             string
+	ClientAssetID       string
+	OriginalFilename    string
+	MediaType           string
+	ExpectedSize        int64
+	ClientSHA256        [32]byte
+	ExpiresAt           time.Time
+	Now                 time.Time
+	AvailableBytes      int64
+	MinimumFreeBytes    int64
+	MaxActiveSessions   int
+	CreateWindow        time.Duration
+	MaxCreatesPerWindow int
 }
 
 type Repository interface {
@@ -93,6 +99,7 @@ type Repository interface {
 	MarkVerified(context.Context, string, [32]byte) error
 	MarkCommitting(context.Context, string, string) error
 	MarkAvailable(context.Context, string, string, [32]byte) error
+	MarkQuarantineIntent(context.Context, string, [32]byte, string) error
 	MarkQuarantined(context.Context, string, [32]byte, string) error
 	MarkFailed(context.Context, string, string) error
 	PendingVerification(context.Context, int) ([]Session, error)

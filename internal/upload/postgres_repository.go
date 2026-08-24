@@ -63,6 +63,9 @@ func scanSession(row rowScanner) (Session, error) {
 }
 
 func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSessionInput) (Session, bool, error) {
+	if input.Now.IsZero() {
+		input.Now = time.Now().UTC()
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return Session{}, false, err
@@ -78,6 +81,7 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 	session, lookupErr := scanSession(tx.QueryRow(ctx, `
         SELECT `+sessionColumns+` FROM upload_sessions
         WHERE owner_id = $1::uuid AND client_asset_id = $2`, input.OwnerID, input.ClientAssetID))
+	var restartingExpired bool
 	if lookupErr == nil {
 		if session.OriginalFilename != input.OriginalFilename ||
 			session.MediaType != input.MediaType ||
@@ -85,33 +89,22 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 			!bytes.Equal(session.ClientSHA256[:], input.ClientSHA256[:]) {
 			return Session{}, false, ErrConflict
 		}
-		if session.State == StateExpired {
-			if _, err := tx.Exec(ctx, `
-                UPDATE upload_sessions
-                SET state = 'created', received_size = 0, server_sha256 = NULL,
-                    transport_resource_id = NULL, final_storage_key = NULL,
-                    asset_id = NULL, last_error_code = NULL, expires_at = $2,
-                    updated_at = now()
-                WHERE id = $1::uuid`, session.ID, input.ExpiresAt); err != nil {
+		if session.State != StateExpired {
+			if err := tx.Commit(ctx); err != nil {
 				return Session{}, false, err
 			}
-			if _, err := tx.Exec(ctx, `
-                INSERT INTO upload_events (upload_session_id, owner_id, event_type)
-                VALUES ($1::uuid, $2::uuid, 'resumed')`, session.ID, session.OwnerID); err != nil {
-				return Session{}, false, err
-			}
-			session, err = scanSession(tx.QueryRow(ctx, `SELECT `+sessionColumns+` FROM upload_sessions WHERE id = $1::uuid`, session.ID))
-			if err != nil {
-				return Session{}, false, err
-			}
+			return session, false, nil
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return Session{}, false, err
-		}
-		return session, false, nil
-	}
-	if !errors.Is(lookupErr, ErrNotFound) {
+		restartingExpired = true
+	} else if !errors.Is(lookupErr, ErrNotFound) {
 		return Session{}, false, lookupErr
+	}
+
+	// A non-expired idempotent retry returned above. A brand-new identity or an
+	// expired identity being restarted is a new transfer admission and must pass
+	// the same durable rate, active-session, quota and free-space checks.
+	if err := consumeCreateAdmission(ctx, tx, input); err != nil {
+		return Session{}, false, err
 	}
 
 	var quotaBytes *int64
@@ -120,7 +113,7 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 	}
 	if input.MaxActiveSessions > 0 {
 		var activeCount int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM upload_sessions WHERE owner_id = $1::uuid AND state IN ('created','uploading','received','verifying','verified','committing')`, input.OwnerID).Scan(&activeCount); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM upload_sessions WHERE owner_id = $1::uuid AND state IN ('created','uploading','received','verifying','verified','committing','quarantining')`, input.OwnerID).Scan(&activeCount); err != nil {
 			return Session{}, false, err
 		}
 		if activeCount >= input.MaxActiveSessions {
@@ -144,7 +137,7 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 				SELECT MAX(session.expected_size) AS reserved_size
 				FROM upload_sessions AS session
 				WHERE session.owner_id = $1::uuid
-				  AND session.state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing')
+				  AND session.state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing', 'quarantining')
 				  AND NOT EXISTS (
 					SELECT 1 FROM assets AS asset
 					WHERE asset.owner_id = session.owner_id
@@ -163,7 +156,7 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 			UNION ALL
 			SELECT 1 FROM upload_sessions
 			WHERE owner_id = $1::uuid AND client_sha256 = $2
-			  AND state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing')
+			  AND state IN ('created', 'uploading', 'received', 'verifying', 'verified', 'committing', 'quarantining')
 		)`, input.OwnerID, input.ClientSHA256[:]).Scan(&inputAlreadyReserved); err != nil {
 		return Session{}, false, err
 	}
@@ -190,6 +183,33 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 		return Session{}, false, ErrInsufficientStorage
 	}
 
+	if restartingExpired {
+		if _, err := tx.Exec(ctx, `
+            UPDATE upload_sessions
+            SET state = 'created', received_size = 0, server_sha256 = NULL,
+                transport_resource_id = NULL, final_storage_key = NULL,
+                asset_id = NULL, last_error_code = NULL, expires_at = $2,
+                verification_worker_id = NULL, verification_claim_token = NULL,
+                verification_claimed_at = NULL, verification_lease_until = NULL,
+                updated_at = $3
+            WHERE id = $1::uuid AND state = 'expired'`, session.ID, input.ExpiresAt, input.Now); err != nil {
+			return Session{}, false, err
+		}
+		if _, err := tx.Exec(ctx, `
+            INSERT INTO upload_events (upload_session_id, owner_id, event_type)
+            VALUES ($1::uuid, $2::uuid, 'resumed')`, session.ID, session.OwnerID); err != nil {
+			return Session{}, false, err
+		}
+		session, err = scanSession(tx.QueryRow(ctx, `SELECT `+sessionColumns+` FROM upload_sessions WHERE id = $1::uuid`, session.ID))
+		if err != nil {
+			return Session{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Session{}, false, err
+		}
+		return session, false, nil
+	}
+
 	session, err = scanSession(tx.QueryRow(ctx, `
         INSERT INTO upload_sessions (
             owner_id, client_asset_id, original_filename, media_type,
@@ -212,6 +232,38 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 		return Session{}, false, err
 	}
 	return session, true, nil
+}
+
+func consumeCreateAdmission(ctx context.Context, tx pgx.Tx, input CreateSessionInput) error {
+	if input.MaxCreatesPerWindow <= 0 || input.CreateWindow <= 0 {
+		return nil
+	}
+	now := input.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var count int
+	err := tx.QueryRow(ctx, `
+        INSERT INTO upload_session_throttles (owner_id, window_started_at, create_count, updated_at)
+        VALUES ($1::uuid, $2, 1, $2)
+        ON CONFLICT (owner_id) DO UPDATE
+        SET window_started_at = CASE
+                WHEN $2 >= upload_session_throttles.window_started_at + $3::bigint * interval '1 microsecond' THEN $2
+                ELSE upload_session_throttles.window_started_at
+            END,
+            create_count = CASE
+                WHEN $2 >= upload_session_throttles.window_started_at + $3::bigint * interval '1 microsecond' THEN 1
+                ELSE upload_session_throttles.create_count + 1
+            END,
+            updated_at = $2
+        RETURNING create_count`, input.OwnerID, now, input.CreateWindow.Microseconds()).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count > input.MaxCreatesPerWindow {
+		return ErrCreateRateLimit
+	}
+	return nil
 }
 
 func (r *PostgresRepository) SessionByID(ctx context.Context, id string) (Session, error) {
@@ -309,7 +361,7 @@ func (r *PostgresRepository) ClaimVerification(ctx context.Context, workerID str
 		WITH candidates AS (
 			SELECT id, state AS previous_state
 			FROM upload_sessions
-			WHERE state IN ('received', 'verifying', 'verified', 'committing')
+			WHERE state IN ('received', 'verifying', 'verified', 'committing', 'quarantining')
 			  AND (verification_lease_until IS NULL OR verification_lease_until <= now())
 			ORDER BY updated_at, id
 			FOR UPDATE SKIP LOCKED
@@ -355,7 +407,7 @@ func (r *PostgresRepository) RenewVerificationLease(ctx context.Context, id, wor
 		UPDATE upload_sessions
 		SET verification_lease_until = now() + $3::bigint * interval '1 microsecond', updated_at = now()
 		WHERE id = $1::uuid AND verification_worker_id = $2 AND verification_claim_token::text = $4
-		  AND state IN ('verifying', 'verified', 'committing')`, id, workerID, lease.Microseconds(), claim)
+		  AND state IN ('verifying', 'verified', 'committing', 'quarantining')`, id, workerID, lease.Microseconds(), claim)
 	if err != nil {
 		return err
 	}
@@ -394,7 +446,7 @@ func (r *PostgresRepository) BeginVerification(ctx context.Context, id string) (
 		session.State = StateVerifying
 	}
 	switch session.State {
-	case StateVerifying, StateVerified, StateCommitting, StateAvailable:
+	case StateVerifying, StateVerified, StateCommitting, StateQuarantining, StateAvailable:
 	default:
 		return Session{}, ErrInvalidState
 	}
@@ -513,6 +565,27 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 	return tx.Commit(ctx)
 }
 
+func (r *PostgresRepository) MarkQuarantineIntent(ctx context.Context, id string, hash [32]byte, errorCode string) error {
+	fence := VerificationFence(ctx)
+	command, err := r.pool.Exec(ctx, `
+        WITH changed AS (
+            UPDATE upload_sessions
+            SET state = 'quarantining', server_sha256 = $2, last_error_code = $3, updated_at = now()
+            WHERE id = $1::uuid AND state = 'verifying'
+              AND ($4 = '' OR verification_claim_token::text = $4)
+            RETURNING id, owner_id
+        )
+        INSERT INTO upload_events (upload_session_id, owner_id, event_type, error_code)
+        SELECT id, owner_id, 'quarantine_started', $3 FROM changed`, id, hash[:], errorCode, fence)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	return nil
+}
+
 func (r *PostgresRepository) MarkQuarantined(ctx context.Context, id string, hash [32]byte, errorCode string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -525,7 +598,7 @@ func (r *PostgresRepository) MarkQuarantined(ctx context.Context, id string, has
         SET state = 'quarantined', server_sha256 = $2, last_error_code = $3,
             verification_worker_id = NULL, verification_claimed_at = NULL,
             verification_claim_token = NULL, verification_lease_until = NULL, updated_at = now()
-        WHERE id = $1::uuid AND state NOT IN ('available', 'quarantined')
+        WHERE id = $1::uuid AND state = 'quarantining'
           AND ($4 = '' OR verification_claim_token::text = $4)
         RETURNING owner_id::text`, id, hash[:], errorCode, VerificationFence(ctx)).Scan(&ownerID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -552,7 +625,7 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, id, errorCode strin
         SET state = 'failed', last_error_code = $2, verification_worker_id = NULL,
             verification_claimed_at = NULL, verification_claim_token = NULL,
             verification_lease_until = NULL, updated_at = now()
-            WHERE id = $1::uuid AND state NOT IN ('available', 'quarantined')
+            WHERE id = $1::uuid AND state NOT IN ('available', 'quarantining', 'quarantined')
               AND ($3 = '' OR verification_claim_token::text = $3)
             RETURNING id, owner_id
         )
@@ -570,7 +643,7 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, id, errorCode strin
 func (r *PostgresRepository) PendingVerification(ctx context.Context, limit int) ([]Session, error) {
 	rows, err := r.pool.Query(ctx, `
         SELECT `+sessionColumns+` FROM upload_sessions
-        WHERE state IN ('received', 'verifying', 'verified', 'committing')
+        WHERE state IN ('received', 'verifying', 'verified', 'committing', 'quarantining')
         ORDER BY updated_at, id
         LIMIT $1`, limit)
 	if err != nil {

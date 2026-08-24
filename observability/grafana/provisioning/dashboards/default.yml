@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Family Photo Cloud
+    orgId: 1
+    folder: Family Photo Cloud
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards

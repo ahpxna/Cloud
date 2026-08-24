@@ -1,6 +1,6 @@
 # Verification Status
 
-Date: 2026-08-23
+Date: 2026-08-24
 
 ## Passed
 
@@ -38,15 +38,50 @@ Date: 2026-08-23
 - `go test -tags=integration -count=1 ./internal/upload` passes after applying
   both PostgreSQL migrations.
 
+## Added in the 2026-08-24 proposal bundle
+
+The repository now contains source for full-byte integrity scrubs, scheduled
+signed-manifest cycles, append-only audit export, a low-cardinality metrics
+exporter, loopback Prometheus/Grafana/Alertmanager, synthetic end-to-end upload
+and download integrity probes, a local restart/resume chaos harness, restic
+backup/isolated restore-drill tooling, CycloneDX SBOM generation, and keyless
+release image signing/provenance.
+
+Validation executed while producing this bundle:
+
+- `gofmt -l cmd internal`: clean.
+- `bash -n` over every repository shell script: pass.
+- YAML parse for Compose, iOS XcodeGen, GitHub Actions, Prometheus,
+  Alertmanager, and Grafana provisioning: pass.
+- Grafana dashboard JSON parse: pass.
+- `swiftc -parse` over the iOS/Share Extension source: pass.
+- A fresh test-only copy/slice was pinned to the sandbox Go 1.23.2 toolchain;
+  production `go.mod` was not changed. `go test` passes for the upload
+  crash/retry/quarantine processor slice, MFA core, integrity manifest package,
+  and synthetic probe.
+- The account HTTP/MFA handlers were also compiled and their HTTP/core tests run
+  in a Go 1.23.2 test-only slice with minimal stubs replacing unavailable
+  PostgreSQL/JWT/Argon2 dependencies. This validates source/API wiring but is not
+  a substitute for production dependency integration.
+
+The sandbox Go runtime is 1.23.2 while `go.mod` requires Go 1.26.7. Full
+`go test ./...`/`go vet ./...` cannot execute because automatic 1.26.7 toolchain
+download is network-blocked. Docker is also unavailable in this sandbox, so
+Compose runtime, image build, restic/restore integration, Prometheus startup,
+and restart-chaos execution remain Pending rather than being reported as
+passes. Real backup/provider/public-path/alert and physical-device evidence also
+remains Pending below.
+
 ## Pending
 
 - Docker-image build and Compose runtime startup on this Mac.
 - Physical-device TUSKit background test.
 - Cloudflare Tunnel end-to-end test, including request limits and HTTP 104.
 - Full Xcode iOS SDK/package build and physical-device security acceptance test.
-- All P0 rows in `docs/security/control-matrix.md`: operator MFA, host/disk
-  encryption, hardened host/VPN/firewall evidence, off-host audit export,
-  encrypted 3-2-1 backup, restore drill, alert test, and incident tabletop.
+- All P0 deployment/evidence gaps in `docs/security/control-matrix.md`: operator
+  MFA, host/disk encryption, hardened host/VPN/firewall evidence, a genuinely
+  off-site/immutable repository, successful timed restore drill, external alert
+  delivery test, access review, and incident tabletop.
 
 ## Important scope boundary
 

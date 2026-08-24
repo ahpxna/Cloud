@@ -1,0 +1,11 @@
+route:
+  receiver: local-only
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+# Deliberately has no external notification integration. This preserves alerts
+# locally until a real family-owned receiver is configured and tested.
+receivers:
+  - name: local-only

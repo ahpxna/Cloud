@@ -21,13 +21,41 @@ make create-user EMAIL=parent@example.com ROLE=member
 }
 ```
 
-The response contains a 15-minute HS256 access token and a 30-day opaque
-refresh token. Store the refresh token in iOS Keychain, never UserDefaults or
-the photo queue database. `POST /v1/auth/refresh` rotates the refresh token;
+When MFA is not enabled, the response contains a 15-minute HS256 access token
+and a 30-day opaque refresh token. When confirmed MFA is enabled, a correct
+password returns `202` with a one-time 5-minute `challenge` and **no access or
+refresh token**. Complete `/v1/auth/mfa/verify` with either a current TOTP code
+or one unused recovery code before tokens are issued. Store the refresh token
+in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token;
 replaying the old token returns `401`. Refresh sessions are token families:
 reuse of a revoked token revokes every live descendant and emits a security
 warning without revealing the account to the caller. `POST /v1/auth/logout`
 revokes its token and is idempotent.
+
+
+### MFA lifecycle
+
+All MFA state is server-side. TOTP secrets are encrypted with the independent
+`MFA_ENCRYPTION_KEY_BASE64`; recovery codes are displayed once and persisted
+only as SHA-256 hashes. TOTP verification accepts the adjacent ±1 30-second
+window and stores the last accepted counter to reject replay.
+
+- `POST /v1/auth/mfa/enroll` requires an access token and returns a new base32
+  secret plus `otpauth_uri`. It invalidates any unconfirmed previous enrollment.
+- `POST /v1/auth/mfa/confirm` requires an access token and the current
+  `totp_code`; on success it returns the one-time recovery-code set.
+- `POST /v1/auth/mfa/verify` is the only unauthenticated MFA route. Send the
+  password-login `challenge` plus exactly one of `totp_code` or `recovery_code`.
+  A challenge has five attempts and is consumed on success. Challenge issuance
+  is durably capped per user (12 per hour) so repeated correct-password logins
+  cannot reset MFA brute-force budget indefinitely.
+- `POST /v1/auth/mfa/recovery` requires an access token plus current TOTP and
+  rotates every recovery code, showing the replacement set once.
+- `POST /v1/auth/mfa/disable` requires an access token plus current TOTP and
+  deletes TOTP/recovery state while consuming outstanding challenges.
+
+Recovery codes are high-entropy, single-use credentials. Store them offline;
+do not screenshot them into the same photo library being protected.
 
 `GET /v1/auth/sessions` requires an access token and lists active device
 sessions. `DELETE /v1/auth/sessions/{session_id}` revokes only a session owned
@@ -55,8 +83,11 @@ that upload session. Session creation is admission-controlled: it returns `507
 Insufficient Storage` if either the owner's quota or the filesystem safety
 reserve (including active-upload reservations) would be exceeded.
 It returns `429 active_upload_limit` once the configured per-user count of
-incomplete sessions is reached; this bounds database/event growth from a
-compromised authenticated account.
+incomplete sessions is reached. New session identities are also protected by a
+durable PostgreSQL per-user creation window (`upload_create_rate_limited`); an
+idempotent retry of an existing non-expired identity does not consume that
+window. These controls bound database/event growth from a compromised
+authenticated account.
 
 ## TUS upload
 
@@ -107,8 +138,12 @@ storage path is never exposed in the API.
 
 ## Current omissions
 
-MFA, thumbnails, EXIF extraction, deletion, scheduled manifest generation,
-encrypted off-site backup/restore, audit export, alert delivery, and
-physical-device iOS acceptance are not yet implemented. They remain public
-launch blockers. The administrative signed-manifest CLI is documented separately
-in `docs/runbooks/integrity-manifest.md`.
+Thumbnails, EXIF extraction, destructive deletion/retention semantics, external
+alert delivery, and physical-device iOS acceptance remain unimplemented or
+unproven. MFA source and iOS flows are implemented, but a real enrollment,
+recovery-code custody test, and access-review record remain deployment evidence. They remain public launch blockers where marked P0. Scheduled
+full-byte scrubs/signed manifests, encrypted-restic backup tooling, isolated
+restore verification, audit export, private metrics/alerts, and synthetic probes
+now exist as operator source, but they do not count as deployed evidence until
+run against the real host/provider/public path. See `docs/runbooks/` and
+`docs/audits/2026-08-24-proposal-implementation.md`.

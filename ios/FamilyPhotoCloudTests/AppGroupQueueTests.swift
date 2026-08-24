@@ -41,6 +41,51 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL(for: available, in: root).path()))
     }
 
+
+    func testCorruptRecordIsIsolatedAndCanBeRecoveredAsFreshIdentity() throws {
+        let root = temporaryQueueRoot()
+        let original = queuedUpload(id: UUID(), state: .queued)
+        try write(original, in: root)
+        try Data("{not-json".utf8).write(to: recordURL(for: original, in: root), options: .atomic)
+
+        XCTAssertTrue(try AppGroupQueue.all(in: root).isEmpty)
+        let quarantined = try AppGroupQueue.quarantinedRecords(in: root)
+        XCTAssertEqual(quarantined.count, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
+
+        let recovered = try AppGroupQueue.recoverQuarantinedRecord(quarantined[0], in: root)
+
+        XCTAssertNotEqual(recovered.id, original.id)
+        XCTAssertNil(recovered.serverSessionID)
+        XCTAssertNil(recovered.tusUploadID)
+        XCTAssertEqual(recovered.state, .queued)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: recovered, in: root).path()))
+        XCTAssertTrue(try AppGroupQueue.quarantinedRecords(in: root).isEmpty)
+        XCTAssertEqual(try AppGroupQueue.all(in: root).map(\.id), [recovered.id])
+    }
+
+    func testRecoverQuarantinedRecordRefusesAmbiguousPayloadsWithoutDeletingBytes() throws {
+        let root = temporaryQueueRoot()
+        let original = queuedUpload(id: UUID(), state: .queued)
+        try write(original, in: root)
+        let records = root.appending(path: "records", directoryHint: .isDirectory)
+        let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: quarantine, withIntermediateDirectories: true)
+        let corrupt = quarantine.appending(path: "\(original.id.uuidString).json.corrupt")
+        try Data("broken".utf8).write(to: corrupt)
+        try FileManager.default.removeItem(at: recordURL(for: original, in: root))
+        let duplicate = root.appending(path: "payloads", directoryHint: .isDirectory)
+            .appending(path: "\(original.id.uuidString).jpg")
+        try Data("duplicate".utf8).write(to: duplicate)
+        let record = QuarantinedQueueRecord(id: corrupt.lastPathComponent, filename: corrupt.lastPathComponent, modifiedAt: nil)
+
+        XCTAssertThrowsError(try AppGroupQueue.recoverQuarantinedRecord(record, in: root))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: duplicate.path()))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corrupt.path()))
+    }
+
     private func temporaryQueueRoot() -> URL {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "FamilyPhotoCloudTests-\(UUID().uuidString)", directoryHint: .isDirectory)

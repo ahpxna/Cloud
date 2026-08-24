@@ -1,5 +1,6 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
+ALL_PROFILES := --profile gateway --profile edge --profile protocol-lab --profile integrity --profile observability --profile audit
 
 .PHONY: help
 help: ## Show available commands
@@ -11,7 +12,7 @@ env: ## Create .env from the safe example when absent
 
 .PHONY: config
 config: env ## Validate the Compose model without starting containers
-	docker compose config --quiet
+	docker compose $(ALL_PROFILES) config --quiet
 
 .PHONY: db-up
 db-up: env ## Start PostgreSQL for local development
@@ -30,25 +31,70 @@ edge-up: env ## Start gateway plus Cloudflare Tunnel after configuring its token
 	@test -n "$$(sed -n 's/^CLOUDFLARE_TUNNEL_TOKEN=//p' .env)" || (echo "set CLOUDFLARE_TUNNEL_TOKEN in .env"; exit 1)
 	docker compose --profile gateway --profile edge up -d --build --wait postgres upload-gateway cloudflared
 
+.PHONY: observability-up
+observability-up: env ## Start private metrics, Prometheus, Alertmanager, and Grafana
+	docker compose --profile observability up -d --build --wait postgres metrics-exporter prometheus alertmanager grafana
+
 .PHONY: create-user
-create-user: ## Create an invite-only family user in the running gateway stack
+create-user: ## Create an invite-only family user in the running stack
 	@test -n "$(EMAIL)" || (echo "usage: make create-user EMAIL=name@example.com [ROLE=member]"; exit 1)
 	docker compose --profile admin run --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
 
+.PHONY: scrub
+scrub: env ## Re-read and SHA-256 every committed original
+	docker compose --profile integrity run --rm scrub $(SCRUB_ARGS)
+
+.PHONY: integrity-cycle
+integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
+	bash scripts/integrity-cycle.sh
+
+.PHONY: audit-export
+audit-export: env ## Export append-only upload events to JSONL + SHA-256
+	bash scripts/export-audit.sh
+
+.PHONY: backup
+backup: env ## Create a quiescent encrypted restic backup
+	bash scripts/backup-restic.sh
+
+.PHONY: restore-drill
+restore-drill: env ## Restore a snapshot into isolation and re-hash all originals
+	bash scripts/restore-drill.sh $(RESTORE_ARGS)
+
+.PHONY: synthetic-probe
+synthetic-probe: ## Exercise login -> resumable upload -> verify -> download SHA-256
+	@test -n "$(BASE_URL)" -a -n "$(EMAIL)" -a -n "$(PASSWORD_FILE)" || (echo "usage: make synthetic-probe BASE_URL=https://... EMAIL=probe@example.com PASSWORD_FILE=/path/to/password [PROBE_ARGS=...]"; exit 1)
+	go run ./cmd/synthetic-probe -base-url "$(BASE_URL)" -email "$(EMAIL)" -password-file "$(PASSWORD_FILE)" $(PROBE_ARGS)
+
+.PHONY: chaos-resume
+chaos-resume: env ## Restart the local gateway during a slow resumable upload
+	bash scripts/chaos-resume.sh
+
+.PHONY: install-systemd
+install-systemd: ## Install backup/integrity timers on a Linux host
+	@test "$$(id -u)" -eq 0 || (echo "run with sudo: sudo make install-systemd"; exit 1)
+	install -m 0644 deploy/systemd/family-photo-cloud-integrity.service /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-integrity.timer /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-backup.service /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-backup.timer /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "Review unit paths/environment, then enable explicitly: systemctl enable --now family-photo-cloud-{integrity,backup}.timer"
+
 .PHONY: status
-status: ## Show local container state
-	docker compose --profile protocol-lab ps --all
+status: ## Show local container state across all profiles
+	docker compose $(ALL_PROFILES) ps --all
 
 .PHONY: logs
-logs: ## Tail local service logs
-	docker compose --profile protocol-lab logs -f --tail=100
+logs: ## Tail local service logs across all profiles
+	docker compose $(ALL_PROFILES) logs -f --tail=100
 
 .PHONY: down
 down: ## Stop local services without deleting data
-	docker compose --profile protocol-lab down --remove-orphans
+	docker compose $(ALL_PROFILES) down --remove-orphans
 
 .PHONY: test
-test: config ## Run Go tests, vet, and repository contract checks
+test: config ## Run Go tests, vet, formatting, shell, and repository contract checks
+	@test -z "$$(gofmt -l cmd internal)" || (echo "gofmt required:"; gofmt -l cmd internal; exit 1)
+	find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go go test ./...
 	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go go vet ./...
 	@for sql in db/migrations/*.sql; do test -s "$$sql" || exit 1; done

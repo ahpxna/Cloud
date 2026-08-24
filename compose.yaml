@@ -13,6 +13,11 @@ networks:
     name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-protocol-lab
     internal: true
 
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
@@ -73,6 +78,12 @@ services:
       PGUSER: ${POSTGRES_USER:-photo_cloud}
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       ACCESS_TOKEN_HMAC_KEY_BASE64: ${ACCESS_TOKEN_HMAC_KEY_BASE64:-}
+      LOGIN_THROTTLE_HMAC_KEY_BASE64: ${LOGIN_THROTTLE_HMAC_KEY_BASE64:-}
+      MFA_ENCRYPTION_KEY_BASE64: ${MFA_ENCRYPTION_KEY_BASE64:-}
+      GLOBAL_LOGIN_RATE_PER_SECOND: ${GLOBAL_LOGIN_RATE_PER_SECOND:-1}
+      GLOBAL_LOGIN_BURST: ${GLOBAL_LOGIN_BURST:-20}
+      UPLOAD_SESSION_CREATE_WINDOW: ${UPLOAD_SESSION_CREATE_WINDOW:-1m}
+      MAX_UPLOAD_SESSION_CREATES_PER_WINDOW: ${MAX_UPLOAD_SESSION_CREATES_PER_WINDOW:-30}
       PHOTO_MEDIA_ROOT: /srv/media
       TUS_MAX_UPLOAD_BYTES: ${TUS_MAX_UPLOAD_BYTES:-21474836480}
       TUS_MVP_CHUNK_BYTES: ${TUS_MVP_CHUNK_BYTES:-33554432}
@@ -142,13 +153,190 @@ services:
     cap_drop: ["ALL"]
 
   # The signing key is mounted only for this explicitly invoked job, never in
-  # the gateway runtime. Production deployment must add a read-only key mount.
+  # the gateway runtime. Historical manifests are written to a dedicated mount.
   manifest:
     build:
       context: .
       dockerfile: Dockerfile
       target: manifest
-    profiles: ["manifest"]
+    profiles: ["integrity"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: ${POSTGRES_USER:-photo_cloud}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      MANIFEST_SIGNING_KEY_ID: ${MANIFEST_SIGNING_KEY_ID:-}
+      MANIFEST_ED25519_PRIVATE_KEY_FILE: /run/secrets/manifest-ed25519.pem
+    networks: [database]
+    volumes:
+      - ${MANIFEST_OUTPUT_DIR:-./.data/manifests}:/manifests
+      - ${MANIFEST_KEY_HOST_PATH:-./.data/secrets/manifest-ed25519.pem}:/run/secrets/manifest-ed25519.pem:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  # Full-byte integrity checking is separate from signing: a successful signed
+  # inventory is never allowed to hide a failed disk read or hash mismatch.
+  scrub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: scrub
+    profiles: ["integrity"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: ${POSTGRES_USER:-photo_cloud}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PHOTO_MEDIA_ROOT: /srv/media
+    networks: [database]
+    volumes:
+      - ./.data/media:/srv/media:ro
+      - ${INTEGRITY_REPORT_DIR:-./.data/integrity-reports}:/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  # Metrics are deliberately isolated from the ingress network and published
+  # on loopback only. Cloudflared cannot route to this service.
+  metrics-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: metrics-exporter
+    profiles: ["observability"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: ${POSTGRES_USER:-photo_cloud}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PHOTO_MEDIA_ROOT: /srv/media
+      METRICS_ADDR: :9090
+    ports:
+      - "127.0.0.1:${METRICS_DEV_PORT:-9091}:9090"
+    networks: [database]
+    volumes:
+      - ./.data/media:/srv/media:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/readyz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:${PROMETHEUS_DEV_PORT:-9092}:9090"
+    networks: [database]
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      metrics-exporter:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_DEV_PORT:-9093}:9093"
+    networks: [database]
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.1.0}
+    profiles: ["observability"]
+    environment:
+      GF_SERVER_HTTP_ADDR: 0.0.0.0
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin-password
+    ports:
+      - "127.0.0.1:${GRAFANA_DEV_PORT:-3000}:3000"
+    networks: [database]
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+      - ${GRAFANA_ADMIN_PASSWORD_FILE:-./.data/secrets/grafana-admin-password}:/run/secrets/grafana-admin-password:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+  audit-export:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: audit-export
+    profiles: ["audit"]
     user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
     environment:
       PGHOST: postgres
@@ -157,6 +345,8 @@ services:
       PGUSER: ${POSTGRES_USER:-photo_cloud}
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     networks: [database]
+    volumes:
+      - ${AUDIT_EXPORT_DIR:-./.data/audit}:/audit
     depends_on:
       postgres:
         condition: service_healthy
