@@ -11,7 +11,11 @@ permissions:
   id-token: write
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
   signed-images:
+    needs: validate
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

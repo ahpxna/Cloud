@@ -48,6 +48,11 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	preMFARefresh := sha256.Sum256([]byte("pre-mfa-refresh-token"))
+	preMFASessionID, err := repository.CreateRefreshSession(ctx, userID, "Pre-MFA iPhone", preMFARefresh, now.Add(30*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := repository.SavePendingTOTP(ctx, userID, []byte("encrypted-test-secret"), make([]byte, 12)); err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +61,21 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 		sha256.Sum256([]byte("initial-recovery-2")),
 	}
 	if err := repository.ConfirmTOTP(ctx, userID, 100, initialRecovery); err != nil {
+		t.Fatal(err)
+	}
+	active, err := repository.SessionActive(ctx, userID, preMFASessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("confirming MFA left a pre-MFA refresh session active")
+	}
+
+	allowed, _, err := repository.RecordMFAActionAttempt(ctx, userID, "enroll", now, mfaActionWindow, mfaActionAttempts)
+	if err != nil || !allowed {
+		t.Fatalf("MFA enroll throttle: allowed=%v err=%v", allowed, err)
+	}
+	if err := repository.ClearMFAActionAttempts(ctx, userID, "enroll"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -135,6 +155,105 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 	}
 	if _, err := repository.TOTPForUser(ctx, userID); !errors.Is(err, ErrMFANotConfigured) {
 		t.Fatalf("disabled MFA lookup error=%v want %v", err, ErrMFANotConfigured)
+	}
+}
+
+func TestPostgresRefreshRotationRetryGraceIsBoundToRequestID(t *testing.T) {
+	pool, ctx := accountIntegrationPool(t)
+	repository := NewPostgresRepository(pool)
+
+	var userID string
+	if err := pool.QueryRow(ctx, `
+        INSERT INTO users (email, password_hash, state)
+        VALUES ('refresh-retry@example.com', 'test-only-password-hash', 'active')
+        RETURNING id::text`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	oldHash := sha256.Sum256([]byte("refresh-old"))
+	newHash := sha256.Sum256([]byte("refresh-new"))
+	requestA := sha256.Sum256([]byte("rotation-request-a"))
+	requestB := sha256.Sum256([]byte("rotation-request-b"))
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Retry iPhone", oldHash, now.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := []byte("authenticated-ciphertext")
+	nonce := []byte("123456789012")
+	first, err := repository.RotateRefreshSession(ctx, oldHash, newHash, requestA, now.Add(30*24*time.Hour), ciphertext, nonce, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Retried || first.SessionID == "" {
+		t.Fatalf("first rotation = %#v", first)
+	}
+
+	retryCandidate := sha256.Sum256([]byte("ignored-retry-candidate"))
+	retried, err := repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestA, now.Add(30*24*time.Hour), []byte("ignored"), nonce, now.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retried.Retried || retried.SessionID != first.SessionID {
+		t.Fatalf("retry rotation = %#v, first=%#v", retried, first)
+	}
+	if string(retried.RetryTokenCiphertext) != string(ciphertext) || string(retried.RetryTokenNonce) != string(nonce) {
+		t.Fatal("retry did not return the stored successor token ciphertext")
+	}
+	active, err := repository.SessionActive(ctx, userID, first.SessionID)
+	if err != nil || !active {
+		t.Fatalf("successor after idempotent retry: active=%v err=%v", active, err)
+	}
+
+	// Possession of the old token alone is not a grace-period bypass. A retry
+	// with a different request ID is a real replay and revokes the live family.
+	_, err = repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestB, now.Add(30*24*time.Hour), []byte("ignored"), nonce, now.Add(6*time.Second))
+	if !errors.Is(err, ErrRefreshReplay) {
+		t.Fatalf("mismatched retry request error=%v want %v", err, ErrRefreshReplay)
+	}
+	active, err = repository.SessionActive(ctx, userID, first.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("mismatched retry request did not revoke the live refresh family")
+	}
+}
+
+func TestPostgresRefreshRotationRetryGraceExpires(t *testing.T) {
+	pool, ctx := accountIntegrationPool(t)
+	repository := NewPostgresRepository(pool)
+
+	var userID string
+	if err := pool.QueryRow(ctx, `
+        INSERT INTO users (email, password_hash, state)
+        VALUES ('refresh-expiry@example.com', 'test-only-password-hash', 'active')
+        RETURNING id::text`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	oldHash := sha256.Sum256([]byte("refresh-expiry-old"))
+	newHash := sha256.Sum256([]byte("refresh-expiry-new"))
+	requestID := sha256.Sum256([]byte("rotation-request-expiry"))
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Expiry iPhone", oldHash, now.Add(30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := repository.RotateRefreshSession(ctx, oldHash, newHash, requestID, now.Add(30*24*time.Hour), []byte("authenticated-ciphertext"), []byte("123456789012"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retryCandidate := sha256.Sum256([]byte("ignored-after-expiry"))
+	_, err = repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestID, now.Add(30*24*time.Hour), []byte("ignored"), []byte("123456789012"), now.Add(refreshRetryGrace+time.Second))
+	if !errors.Is(err, ErrRefreshReplay) {
+		t.Fatalf("expired retry grace error=%v want %v", err, ErrRefreshReplay)
+	}
+	active, err := repository.SessionActive(ctx, userID, first.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("expired retry grace did not revoke the live refresh family")
 	}
 }
 

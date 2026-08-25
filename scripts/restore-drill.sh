@@ -81,8 +81,32 @@ fi
 
 manifests_verified=0
 if [[ "$manifest_count" != "0" ]]; then
-  keyring_path="${MANIFEST_PUBLIC_KEYRING_HOST_PATH:-$repo_root/.data/secrets/manifest-public-keyring}"
-  [[ -d "$keyring_path" ]] || { echo "manifest public keyring is required for restore drill: $keyring_path" >&2; exit 2; }
+  # A disaster drill must not silently depend on the live host's trust directory.
+  # Restore the backed-up public keyring, then authenticate it against a small
+  # operator-held fingerprint file that is deliberately kept outside restic.
+  : "${MANIFEST_TRUST_FINGERPRINTS_FILE:?set MANIFEST_TRUST_FINGERPRINTS_FILE to an independent sha256sum file}"
+  [[ -r "$MANIFEST_TRUST_FINGERPRINTS_FILE" ]] || { echo "manifest trust fingerprints are not readable: $MANIFEST_TRUST_FINGERPRINTS_FILE" >&2; exit 2; }
+  trust_fingerprints="$(realpath "$MANIFEST_TRUST_FINGERPRINTS_FILE")"
+  case "$trust_fingerprints" in
+    "$(realpath "$target")"/*) echo "trust fingerprints must be independent of the restored snapshot" >&2; exit 2 ;;
+  esac
+
+  mapfile -t restored_keyrings < <(find "$target" -type d -name manifest-public-keyring -print)
+  if [[ ${#restored_keyrings[@]} -ne 1 ]]; then
+    echo "expected exactly one restored manifest public keyring, found ${#restored_keyrings[@]}" >&2
+    exit 1
+  fi
+  keyring_path="${restored_keyrings[0]}"
+  # sha256sum -c validates listed files but ignores unexpected extras. Require
+  # the restored keyring to contain exactly the independently-approved set so a
+  # tampered snapshot cannot smuggle in an untrusted signing key ID.
+  if ! diff -u \
+      <(awk '{name=$2; sub(/^\*/, "", name); print name}' "$trust_fingerprints" | LC_ALL=C sort -u) \
+      <(find "$keyring_path" -maxdepth 1 -type f -name '*.pem' -printf '%f\n' | LC_ALL=C sort -u); then
+    echo "restored manifest keyring differs from independent trust-anchor set" >&2
+    exit 1
+  fi
+  (cd "$keyring_path" && sha256sum --strict --check "$trust_fingerprints")
 
   mapfile -t restored_manifest_dirs < <(find "$target" -type d -name manifests -print)
   if [[ ${#restored_manifest_dirs[@]} -ne 1 ]]; then
@@ -98,7 +122,7 @@ if [[ "$manifest_count" != "0" ]]; then
 
   # Build once, then run the public-key-only verifier without starting live DB
   # dependencies. Each DB row is asserted against the exact signed file.
-  docker compose --profile integrity build manifest-verify >/dev/null
+  MANIFEST_PUBLIC_KEYRING_HOST_PATH="$keyring_path" docker compose --profile integrity build manifest-verify >/dev/null
   while IFS=$'\t' read -r version object_key db_asset_count payload_hex key_id signature_hex; do
     [[ "$object_key" == manifests/* ]] || { echo "unexpected manifest object key: $object_key" >&2; exit 1; }
     relative="${object_key#manifests/}"
@@ -109,7 +133,7 @@ if [[ "$manifest_count" != "0" ]]; then
     manifest_file="$restored_manifest_root/$relative"
     [[ -f "$manifest_file" ]] || { echo "restored manifest missing for DB row: $object_key" >&2; exit 1; }
 
-    docker compose --profile integrity run --rm --no-deps \
+    MANIFEST_PUBLIC_KEYRING_HOST_PATH="$keyring_path" docker compose --profile integrity run --rm --no-deps \
       -v "$manifest_file:/verify/manifest.json:ro" \
       manifest-verify \
       -mode verify \

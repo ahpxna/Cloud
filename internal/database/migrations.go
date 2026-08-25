@@ -116,8 +116,8 @@ func Apply(ctx context.Context, conn *pgx.Conn, migrations []Migration, baseline
 }
 
 func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) error {
-	if version < 1 || version > 8 {
-		return fmt.Errorf("refusing baseline %d: schema fingerprint is defined only for versions 1 through 8", version)
+	if version < 1 || version > 9 {
+		return fmt.Errorf("refusing baseline %d: schema fingerprint is defined only for versions 1 through 9", version)
 	}
 
 	columns := []baselineColumn{
@@ -198,6 +198,14 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 			baselineColumn{"mfa_action_throttles", "updated_at", "timestamp with time zone", false},
 		)
 	}
+	if version >= 9 {
+		columns = append(columns,
+			baselineColumn{"user_sessions", "refresh_retry_request_sha256", "bytea", true},
+			baselineColumn{"user_sessions", "refresh_retry_ciphertext", "bytea", true},
+			baselineColumn{"user_sessions", "refresh_retry_nonce", "bytea", true},
+			baselineColumn{"user_sessions", "refresh_retry_until", "timestamp with time zone", true},
+		)
+	}
 	for _, expected := range columns {
 		if err := verifyBaselineColumn(ctx, conn, expected); err != nil {
 			return fmt.Errorf("refusing baseline %d: %w", version, err)
@@ -255,6 +263,11 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 	if version >= 8 {
 		indexes = append(indexes,
 			baselineIndex{"mfa_action_throttles_cleanup", "mfa_action_throttles", []string{"updated_at"}},
+		)
+	}
+	if version >= 9 {
+		indexes = append(indexes,
+			baselineIndex{"user_sessions_refresh_retry_cleanup", "user_sessions", []string{"refresh_retry_until", "is not null"}},
 		)
 	}
 	for _, expected := range indexes {
@@ -317,6 +330,11 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 			baselineConstraint{"mfa_action_throttles_user_id_fkey", "mfa_action_throttles", "f", []string{"foreign key (user_id)", "references users(id)", "on delete cascade"}},
 		)
 	}
+	if version >= 9 {
+		constraints = append(constraints,
+			baselineConstraint{"user_sessions_refresh_retry_shape", "user_sessions", "c", []string{"refresh_retry_request_sha256", "refresh_retry_ciphertext", "refresh_retry_nonce", "refresh_retry_until", "octet_length(refresh_retry_request_sha256)", "32", "octet_length(refresh_retry_nonce)", "12"}},
+		)
+	}
 	for _, expected := range constraints {
 		if err := verifyBaselineConstraint(ctx, conn, expected); err != nil {
 			return fmt.Errorf("refusing baseline %d: %w", version, err)
@@ -357,8 +375,12 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 		)
 	}
 	if version >= 8 {
+		actions := []string{"confirm", "recovery", "disable"}
+		if version >= 9 {
+			actions = append(actions, "enroll")
+		}
 		checks = append(checks,
-			baselineCheck{"mfa_action_throttles", "action domain", []string{"confirm", "recovery", "disable"}},
+			baselineCheck{"mfa_action_throttles", "action domain", actions},
 			baselineCheck{"mfa_action_throttles", "attempts nonnegative", []string{"attempt_count", ">= 0"}},
 		)
 	}

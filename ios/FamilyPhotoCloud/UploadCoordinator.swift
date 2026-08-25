@@ -137,10 +137,13 @@ final class UploadCoordinator: ObservableObject {
         }
     }
 
-    func beginMFAEnrollment() async {
+    func beginMFAEnrollment(password: String) async {
         do {
             let accessToken = try await auth.accessToken(api: api)
-            mfaEnrollment = try await api.beginMFAEnrollment(accessToken: accessToken)
+            mfaEnrollment = try await api.beginMFAEnrollment(
+                password: password,
+                accessToken: accessToken
+            )
             mfaRecoveryCodes = []
             lastError = nil
         } catch {
@@ -157,7 +160,11 @@ final class UploadCoordinator: ObservableObject {
             )
             mfaEnrollment = nil
             mfaRecoveryCodes = response.recoveryCodes
-            lastError = nil
+            // Confirming MFA revokes every pre-MFA refresh family, including
+            // this device. Drop cached credentials immediately so the next
+            // authentication is guaranteed to pass through the new factor.
+            try await auth.invalidateCredential()
+            lastError = "MFA enabled. Save the recovery codes, then sign in again."
         } catch {
             lastError = error.localizedDescription
         }
@@ -186,7 +193,10 @@ final class UploadCoordinator: ObservableObject {
             )
             mfaEnrollment = nil
             mfaRecoveryCodes = []
-            lastError = nil
+            // The backend revokes every session when MFA is disabled. Avoid
+            // leaving dead access/refresh tokens in memory or the Keychain.
+            try await auth.invalidateCredential()
+            lastError = "MFA disabled. Sign in again to continue."
         } catch {
             lastError = error.localizedDescription
         }

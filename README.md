@@ -136,7 +136,7 @@ The only exception is a one-time upgrade from the old pre-ledger Compose
 deployment. After independently confirming which SQL files were already
 applied, set `PHOTO_MIGRATION_BASELINE_VERSION` to that exact version for one
 run, then remove it. The runner fingerprints expected column types/nullability,
-indexes, foreign keys and checks through schema v8 before recording a baseline; presence-only
+indexes, foreign keys and checks through schema v9 before recording a baseline; presence-only
 lookalike schemas are refused. This is explicit operator acknowledgement, not
 an automatic guess about a production schema.
 

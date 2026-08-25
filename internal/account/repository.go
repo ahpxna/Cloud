@@ -2,6 +2,7 @@ package account
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"time"
@@ -30,10 +31,18 @@ type DeviceSession struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 }
 
+type RefreshRotation struct {
+	User                 User
+	SessionID            string
+	RetryTokenCiphertext []byte
+	RetryTokenNonce      []byte
+	Retried              bool
+}
+
 type Repository interface {
 	ActiveUserByEmail(context.Context, string) (User, error)
 	CreateRefreshSession(context.Context, string, string, [32]byte, time.Time) (string, error)
-	RotateRefreshSession(context.Context, [32]byte, [32]byte, time.Time) (User, string, error)
+	RotateRefreshSession(context.Context, [32]byte, [32]byte, [32]byte, time.Time, []byte, []byte, time.Time) (RefreshRotation, error)
 	RevokeRefreshSession(context.Context, [32]byte) error
 	ListDeviceSessions(context.Context, string) ([]DeviceSession, error)
 	RevokeDeviceSession(context.Context, string, string) error
@@ -95,52 +104,109 @@ func (r *PostgresRepository) CreateRefreshSession(
 
 func (r *PostgresRepository) RotateRefreshSession(
 	ctx context.Context,
-	oldHash, newHash [32]byte,
+	oldHash, newHash, retryRequestHash [32]byte,
 	newExpiresAt time.Time,
-) (User, string, error) {
+	retryCiphertext, retryNonce []byte,
+	now time.Time,
+) (RefreshRotation, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return User{}, "", err
+		return RefreshRotation{}, err
 	}
 	defer tx.Rollback(ctx)
 
+	// Expired retry ciphertext is useless and should not become a long-lived
+	// encrypted archive of refresh secrets. Bound its database lifetime even on
+	// active installations without a separate cleanup daemon.
+	if _, err := tx.Exec(ctx, `
+        UPDATE user_sessions
+        SET refresh_retry_request_sha256 = NULL, refresh_retry_ciphertext = NULL,
+            refresh_retry_nonce = NULL, refresh_retry_until = NULL
+        WHERE refresh_retry_until IS NOT NULL AND refresh_retry_until <= $1`, now); err != nil {
+		return RefreshRotation{}, err
+	}
+
 	var user User
 	var deviceName, sessionID, familyID string
-	var revokedAt *time.Time
+	var revokedAt, retryUntil *time.Time
 	var expiresAt time.Time
+	var storedRetryRequestHash, storedRetryCiphertext, storedRetryNonce []byte
 	err = tx.QueryRow(ctx, `
         SELECT account.id::text, account.email, account.password_hash,
                account.role, session.device_name, session.id::text,
-               session.session_family_id::text, session.revoked_at, session.expires_at
+               session.session_family_id::text, session.revoked_at, session.expires_at,
+               session.refresh_retry_request_sha256, session.refresh_retry_ciphertext,
+               session.refresh_retry_nonce, session.refresh_retry_until
         FROM user_sessions AS session
         JOIN users AS account ON account.id = session.user_id
         WHERE session.refresh_token_sha256 = $1
           AND account.state = 'active' AND account.deleted_at IS NULL
         FOR UPDATE`, oldHash[:],
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &sessionID, &familyID, &revokedAt, &expiresAt)
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &sessionID, &familyID, &revokedAt, &expiresAt, &storedRetryRequestHash, &storedRetryCiphertext, &storedRetryNonce, &retryUntil)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return User{}, "", ErrInvalidCredentials
+		return RefreshRotation{}, ErrInvalidCredentials
 	}
 	if err != nil {
-		return User{}, "", err
+		return RefreshRotation{}, err
 	}
-	if revokedAt != nil || !expiresAt.After(time.Now()) {
+	if revokedAt != nil || !expiresAt.After(now) {
+		// A transport failure may hide the successful rotation response from the
+		// client. During a very short grace window, return the exact successor
+		// token rather than treating the retry as theft. The successor secret is
+		// stored only as authenticated ciphertext on the revoked parent row.
+		requestIDMatches := len(storedRetryRequestHash) == 32 && subtle.ConstantTimeCompare(storedRetryRequestHash, retryRequestHash[:]) == 1
+		if revokedAt != nil && retryUntil != nil && retryUntil.After(now) && requestIDMatches && len(storedRetryCiphertext) != 0 && len(storedRetryNonce) != 0 {
+			var nextSessionID string
+			err := tx.QueryRow(ctx, `
+                SELECT id::text
+                FROM user_sessions
+                WHERE parent_session_id = $1::uuid
+                  AND revoked_at IS NULL AND expires_at > $2
+                ORDER BY created_at DESC
+                LIMIT 1`, sessionID, now).Scan(&nextSessionID)
+			if err == nil {
+				if _, err := tx.Exec(ctx, `UPDATE user_sessions SET last_used_at = $2 WHERE id = $1::uuid`, sessionID, now); err != nil {
+					return RefreshRotation{}, err
+				}
+				if err := tx.Commit(ctx); err != nil {
+					return RefreshRotation{}, err
+				}
+				return RefreshRotation{User: user, SessionID: nextSessionID, RetryTokenCiphertext: storedRetryCiphertext, RetryTokenNonce: storedRetryNonce, Retried: true}, nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return RefreshRotation{}, err
+			}
+		}
 		if _, err := tx.Exec(ctx, `
             UPDATE user_sessions
-            SET revoked_at = COALESCE(revoked_at, now()), reused_at = now(), last_used_at = now()
-            WHERE session_family_id = $1::uuid AND revoked_at IS NULL`, familyID); err != nil {
-			return User{}, "", err
+            SET revoked_at = COALESCE(revoked_at, $2), reused_at = $2, last_used_at = $2
+            WHERE session_family_id = $1::uuid AND revoked_at IS NULL`, familyID, now); err != nil {
+			return RefreshRotation{}, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE user_sessions SET reused_at = now(), last_used_at = now() WHERE id = $1::uuid`, sessionID); err != nil {
-			return User{}, "", err
+		if _, err := tx.Exec(ctx, `UPDATE user_sessions SET reused_at = $2, last_used_at = $2 WHERE id = $1::uuid`, sessionID, now); err != nil {
+			return RefreshRotation{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return User{}, "", err
+			return RefreshRotation{}, err
 		}
-		return User{}, "", ErrRefreshReplay
+		return RefreshRotation{}, ErrRefreshReplay
 	}
-	if _, err := tx.Exec(ctx, `UPDATE user_sessions SET revoked_at = now(), last_used_at = now() WHERE id = $1::uuid`, sessionID); err != nil {
-		return User{}, "", err
+	hasRetryRequest := retryRequestHash != ([32]byte{})
+	if hasRetryRequest != (len(retryCiphertext) != 0 && len(retryNonce) != 0) {
+		return RefreshRotation{}, errors.New("refresh retry request and ciphertext must be provided together")
+	}
+	if hasRetryRequest {
+		if _, err := tx.Exec(ctx, `
+            UPDATE user_sessions
+            SET revoked_at = $2, last_used_at = $2,
+                refresh_retry_request_sha256 = $3, refresh_retry_ciphertext = $4,
+                refresh_retry_nonce = $5, refresh_retry_until = $6
+            WHERE id = $1::uuid`, sessionID, now, retryRequestHash[:], retryCiphertext, retryNonce, now.Add(refreshRetryGrace)); err != nil {
+			return RefreshRotation{}, err
+		}
+	} else if _, err := tx.Exec(ctx, `
+        UPDATE user_sessions SET revoked_at = $2, last_used_at = $2 WHERE id = $1::uuid`, sessionID, now); err != nil {
+		return RefreshRotation{}, err
 	}
 	var nextSessionID string
 	err = tx.QueryRow(ctx, `
@@ -151,12 +217,12 @@ func (r *PostgresRepository) RotateRefreshSession(
         RETURNING id::text`, user.ID, deviceName, newHash[:], newExpiresAt, familyID, sessionID,
 	).Scan(&nextSessionID)
 	if err != nil {
-		return User{}, "", err
+		return RefreshRotation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return User{}, "", err
+		return RefreshRotation{}, err
 	}
-	return user, nextSessionID, nil
+	return RefreshRotation{User: user, SessionID: nextSessionID}, nil
 }
 
 func (r *PostgresRepository) RevokeRefreshSession(ctx context.Context, tokenHash [32]byte) error {
@@ -374,6 +440,15 @@ func (r *PostgresRepository) ConfirmTOTP(ctx context.Context, userID string, cou
 	if err := replaceRecoveryCodesTx(ctx, tx, userID, recoveryHashes); err != nil {
 		return err
 	}
+	// Enabling MFA changes the account authentication assurance level. Revoke
+	// every refresh family issued before the second factor existed so a stolen
+	// pre-MFA refresh token cannot keep minting access tokens indefinitely.
+	if _, err := tx.Exec(ctx, `
+        UPDATE user_sessions
+        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
+        WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -573,7 +648,7 @@ func (r *PostgresRepository) RecordMFAActionAttempt(
 	window time.Duration,
 	limit int,
 ) (bool, time.Duration, error) {
-	if window <= 0 || limit < 1 || (action != "confirm" && action != "recovery" && action != "disable") {
+	if window <= 0 || limit < 1 || (action != "enroll" && action != "confirm" && action != "recovery" && action != "disable") {
 		return false, 0, ErrMFAInvalid
 	}
 	tx, err := r.pool.Begin(ctx)

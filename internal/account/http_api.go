@@ -39,6 +39,7 @@ type API struct {
 	dummyHash      string
 	mfaRepo        MFARepository
 	mfaCipher      *mfaCipher
+	refreshCipher  *mfaCipher
 }
 
 type SecurityConfig struct {
@@ -97,6 +98,21 @@ func newAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog
 	if config.GlobalLoginBurst <= 0 {
 		config.GlobalLoginBurst = 20
 	}
+	// Refresh retry ciphertext only needs to survive a brief lost-response
+	// window. Keep its key process-local instead of coupling recoverable refresh
+	// secrets to any long-lived operator key. A restart intentionally invalidates
+	// the retry cache while leaving normal hashed refresh sessions intact.
+	refreshKey := make([]byte, 32)
+	if _, err := rand.Read(refreshKey); err != nil {
+		return nil, fmt.Errorf("construct refresh retry cipher: %w", err)
+	}
+	refreshCipher, err := newMFACipher(refreshKey)
+	for index := range refreshKey {
+		refreshKey[index] = 0
+	}
+	if err != nil {
+		return nil, fmt.Errorf("construct refresh retry cipher: %w", err)
+	}
 	api := &API{
 		repository:    repository,
 		tokens:        tokens,
@@ -107,6 +123,7 @@ func newAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog
 		globalLimiter: newTokenBucket(config.GlobalLoginRate, config.GlobalLoginBurst),
 		passwordGate:  make(chan struct{}, 4),
 		dummyHash:     dummyHash,
+		refreshCipher: refreshCipher,
 	}
 	api.durableLimiter, _ = repository.(LoginThrottleRepository)
 	return api, nil
@@ -119,7 +136,27 @@ type loginRequest struct {
 }
 
 type refreshRequest struct {
-	RefreshToken string `json:"refresh_token"`
+	RefreshToken      string `json:"refresh_token"`
+	RotationRequestID string `json:"rotation_request_id,omitempty"`
+}
+
+func validRotationRequestID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			if value[index] != '-' {
+				return false
+			}
+			continue
+		}
+		ch := value[index]
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 type tokenResponse struct {
@@ -316,8 +353,24 @@ func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusInternalServerError, "token_issue_failed", "could not issue token")
 		return
 	}
+	var retryRequestHash [32]byte
+	var retryCiphertext, retryNonce []byte
+	if request.RotationRequestID != "" {
+		if !validRotationRequestID(request.RotationRequestID) {
+			accountProblem(w, http.StatusBadRequest, "invalid_rotation_request_id", "rotation_request_id must be a UUID")
+			return
+		}
+		retryRequestHash = sha256.Sum256([]byte(request.RotationRequestID))
+		retryCiphertext, retryNonce, err = api.refreshCipher.encrypt(request.RotationRequestID, []byte(newRaw))
+		if err != nil {
+			accountProblem(w, http.StatusInternalServerError, "token_issue_failed", "could not issue token")
+			return
+		}
+	}
 	now := api.now().UTC()
-	user, sessionID, err := api.repository.RotateRefreshSession(r.Context(), oldHash, newHash, now.Add(refreshTokenTTL))
+	rotation, err := api.repository.RotateRefreshSession(
+		r.Context(), oldHash, newHash, retryRequestHash, now.Add(refreshTokenTTL), retryCiphertext, retryNonce, now,
+	)
 	if err != nil {
 		if errors.Is(err, ErrRefreshReplay) {
 			api.logger.Warn("refresh token replay; revoked token family")
@@ -325,7 +378,24 @@ func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid or expired")
 		return
 	}
-	accessToken, err := api.tokens.Issue(auth.Principal{UserID: user.ID, SessionID: sessionID}, now, accessTokenTTL)
+	refreshRaw := newRaw
+	if rotation.Retried {
+		if request.RotationRequestID == "" {
+			accountProblem(w, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid or expired")
+			return
+		}
+		decrypted, decryptErr := api.refreshCipher.decrypt(request.RotationRequestID, rotation.RetryTokenCiphertext, rotation.RetryTokenNonce)
+		if decryptErr != nil {
+			api.logger.Error("decrypt refresh retry token", "user_id", rotation.User.ID, "error", decryptErr)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+			return
+		}
+		refreshRaw = string(decrypted)
+		for index := range decrypted {
+			decrypted[index] = 0
+		}
+	}
+	accessToken, err := api.tokens.Issue(auth.Principal{UserID: rotation.User.ID, SessionID: rotation.SessionID}, now, accessTokenTTL)
 	if err != nil {
 		accountProblem(w, http.StatusInternalServerError, "token_issue_failed", "could not issue token")
 		return
@@ -334,9 +404,9 @@ func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
 		AccessToken:      accessToken,
 		TokenType:        "Bearer",
 		ExpiresIn:        int64(accessTokenTTL.Seconds()),
-		RefreshToken:     newRaw,
+		RefreshToken:     refreshRaw,
 		RefreshExpiresIn: int64(refreshTokenTTL.Seconds()),
-		UserID:           user.ID,
+		UserID:           rotation.User.ID,
 	})
 }
 

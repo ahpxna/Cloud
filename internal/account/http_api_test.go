@@ -62,18 +62,18 @@ func (repository *memoryAccountRepository) CreateRefreshSession(
 }
 
 func (repository *memoryAccountRepository) RotateRefreshSession(
-	_ context.Context, oldHash, newHash [32]byte, _ time.Time,
-) (User, string, error) {
+	_ context.Context, oldHash, newHash, _ [32]byte, _ time.Time, _ []byte, _ []byte, _ time.Time,
+) (RefreshRotation, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	if _, ok := repository.sessions[oldHash]; !ok {
-		return User{}, "", ErrInvalidCredentials
+		return RefreshRotation{}, ErrInvalidCredentials
 	}
 	delete(repository.sessions, oldHash)
 	repository.nextID++
 	id := "90000000-0000-4000-8000-00000000000" + string(rune('0'+repository.nextID))
 	repository.sessions[newHash] = id
-	return repository.user, id, nil
+	return RefreshRotation{User: repository.user, SessionID: id}, nil
 }
 
 func (repository *memoryAccountRepository) RevokeRefreshSession(_ context.Context, hash [32]byte) error {
@@ -124,7 +124,7 @@ func TestLoginRefreshRotationAndLogout(t *testing.T) {
 		t.Fatal("refresh token was not stored by digest")
 	}
 
-	refreshBody, _ := json.Marshal(refreshRequest{RefreshToken: first.RefreshToken})
+	refreshBody, _ := json.Marshal(refreshRequest{RefreshToken: first.RefreshToken, RotationRequestID: "11111111-2222-4333-8444-555555555555"})
 	refresh := postAccountJSON(t, server, "/v1/auth/refresh", string(refreshBody))
 	if refresh.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(refresh.Body)

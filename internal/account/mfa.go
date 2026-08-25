@@ -29,6 +29,7 @@ const (
 	mfaActionWindow         = 5 * time.Minute
 	mfaActionAttempts       = 5
 	mfaActionRetention      = 24 * time.Hour
+	refreshRetryGrace       = 30 * time.Second
 	totpPeriodSeconds       = int64(30)
 	totpDigits              = 6
 	recoveryCodeCount       = 10

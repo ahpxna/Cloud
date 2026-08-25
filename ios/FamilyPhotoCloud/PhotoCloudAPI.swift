@@ -6,6 +6,9 @@ struct Credential: Codable, Sendable {
     var refreshToken: String
     var refreshExpiresAt: Date
     var userID: String
+    // Persisted before a refresh request is sent so a lost HTTP response or app
+    // restart retries the same rotation request ID instead of looking like token theft.
+    var pendingRefreshRequestID: String? = nil
 }
 
 struct UploadSession: Codable, Sendable {
@@ -139,11 +142,12 @@ struct PhotoCloudAPI: Sendable {
         ).credential
     }
 
-    func beginMFAEnrollment(accessToken: String) async throws -> MFAEnrollment {
-        try await request(
+    func beginMFAEnrollment(password: String, accessToken: String) async throws -> MFAEnrollment {
+        struct Request: Encodable { let password: String }
+        return try await request(
             path: "/v1/auth/mfa/enroll",
             method: "POST",
-            body: Optional<String>.none,
+            body: Request(password: password),
             bearer: accessToken,
             response: MFAEnrollment.self
         )
@@ -190,11 +194,22 @@ struct PhotoCloudAPI: Sendable {
         )
     }
 
-    func refresh(_ refreshToken: String) async throws -> Credential {
-        struct Request: Encodable { let refreshToken: String
-            enum CodingKeys: String, CodingKey { case refreshToken = "refresh_token" }
+    func refresh(_ refreshToken: String, rotationRequestID: String) async throws -> Credential {
+        struct Request: Encodable {
+            let refreshToken: String
+            let rotationRequestID: String
+            enum CodingKeys: String, CodingKey {
+                case refreshToken = "refresh_token"
+                case rotationRequestID = "rotation_request_id"
+            }
         }
-        return try await request(path: "/v1/auth/refresh", method: "POST", body: Request(refreshToken: refreshToken), bearer: nil, response: CredentialResponse.self).credential
+        return try await request(
+            path: "/v1/auth/refresh",
+            method: "POST",
+            body: Request(refreshToken: refreshToken, rotationRequestID: rotationRequestID),
+            bearer: nil,
+            response: CredentialResponse.self
+        ).credential
     }
 
     func createUploadSession(_ request: CreateUploadRequest, accessToken: String) async throws -> UploadSession {
@@ -354,6 +369,14 @@ actor AuthenticationStore {
         credential = newCredential
     }
 
+
+    func invalidateCredential() throws {
+        refreshTask?.cancel()
+        refreshTask = nil
+        credential = nil
+        try KeychainStore.deleteCredential()
+    }
+
     func accessToken(api: PhotoCloudAPI) async throws -> String {
         var current = try credential ?? KeychainStore.loadCredential()
         guard var current else { throw APIProblem(status: 401, code: "not_signed_in", detail: "Sign in before uploading.") }
@@ -366,7 +389,16 @@ actor AuthenticationStore {
         if let refreshTask {
             current = try await refreshTask.value
         } else {
-            let task = Task { try await api.refresh(current.refreshToken) }
+            // Persist the idempotency key before the network request. If the
+            // response is lost (or the app is killed after the server commits),
+            // the next attempt reuses the same ID with the same old token.
+            let rotationRequestID = current.pendingRefreshRequestID ?? UUID().uuidString
+            current.pendingRefreshRequestID = rotationRequestID
+            try KeychainStore.save(current)
+            credential = current
+
+            let refreshToken = current.refreshToken
+            let task = Task { try await api.refresh(refreshToken, rotationRequestID: rotationRequestID) }
             refreshTask = task
             do {
                 current = try await task.value
@@ -376,6 +408,7 @@ actor AuthenticationStore {
             }
             refreshTask = nil
         }
+        current.pendingRefreshRequestID = nil
         try KeychainStore.save(current)
         credential = current
         return current.accessToken

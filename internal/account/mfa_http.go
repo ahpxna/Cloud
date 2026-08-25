@@ -81,6 +81,17 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
+	if !api.allowSensitiveMFAAction(w, r, principal.UserID, "enroll") {
+		return
+	}
+	select {
+	case api.passwordGate <- struct{}{}:
+		defer func() { <-api.passwordGate }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		accountProblem(w, http.StatusTooManyRequests, "mfa_enroll_busy", "try again shortly")
+		return
+	}
 	valid, err := VerifyPassword(user.PasswordHash, request.Password)
 	if err != nil || !valid {
 		accountProblem(w, http.StatusUnauthorized, "recent_auth_required", "password re-authentication is required to enroll MFA")
@@ -108,6 +119,7 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusInternalServerError, "mfa_enroll_failed", "could not begin MFA enrollment")
 		return
 	}
+	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "enroll")
 	accountJSON(w, http.StatusOK, map[string]any{
 		"secret":      encoded,
 		"otpauth_uri": totpURI(user.Email, encoded),

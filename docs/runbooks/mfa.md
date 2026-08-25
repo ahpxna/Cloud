@@ -15,11 +15,11 @@ The decoded value must be exactly 32 bytes. Store it with the host's protected s
 ## Enroll
 
 1. Sign in normally on a trusted device while MFA is not yet enabled.
-2. In the iOS Uploads tab, choose **Begin authenticator enrollment**.
+2. In the iOS Uploads tab, enter the current password and choose **Begin authenticator enrollment**.
 3. Add the displayed secret/`otpauth://` URI to a separate authenticator.
 4. Enter the current 6-digit code and confirm enrollment.
 5. Save every displayed recovery code to protected offline recovery material. The server stores only hashes and the iOS app intentionally does not persist the displayed set.
-6. Sign out/revoke the test session, sign in again, and prove that password login returns an MFA challenge with no refresh token before successful second-factor verification.
+6. Confirmation revokes every session issued before MFA existed, including the current device. The iOS app deletes its cached credentials; sign in again and prove that password login returns an MFA challenge with no refresh token before successful second-factor verification.
 
 ## Recovery test
 
@@ -34,16 +34,18 @@ Do not consume the operator's only offline copy during a drill; maintain at leas
 
 ## Disable
 
-Disabling MFA requires a valid current TOTP and an explicit destructive confirmation in the iOS UI. After disabling, test a fresh sign-in and record the reason/date in the access review. If MFA is disabled because the authenticator is lost, treat that as a recovery/security event and rotate affected session credentials as appropriate.
+Disabling MFA requires a valid current TOTP and an explicit destructive confirmation in the iOS UI. The backend revokes every active session and the app clears its cached Keychain credential, so a fresh sign-in is required. Record the reason/date in the access review. If MFA is disabled because the authenticator is lost, treat that as a recovery/security event.
 
 ## Abuse-control verification
 
-The server durably limits authenticated MFA `confirm`, `recovery`, and `disable`
-mutations to five attempts per user/action in a five-minute window. A sixth
-request must return `429` with `Retry-After`; a successful protected mutation
-clears only that action's budget. The Cloudflare ruleset adds a broader per-IP
-edge bound but is not the security boundary. PostgreSQL integration tests cover
-this durable state and the atomic recovery-code rotation rollback path.
+The server durably limits authenticated MFA `enroll`, `confirm`, `recovery`, and
+`disable` mutations to five attempts per user/action in a five-minute window.
+Enrollment password verification also shares the bounded Argon2 worker gate used
+by login. A sixth request must return `429` with `Retry-After`; a successful
+protected mutation clears only that action's budget. The Cloudflare ruleset adds
+a broader per-IP edge bound but is not the security boundary. PostgreSQL
+integration tests cover this durable state, pre-MFA session revocation, and the
+atomic recovery-code rotation rollback path.
 
 ## Evidence to retain
 

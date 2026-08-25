@@ -241,6 +241,9 @@ func CheckWritable(mediaRoot string) error {
 		return err
 	}
 	path := file.Name()
+	// Always attempt sentinel cleanup, including Sync/Close failure paths. A
+	// degraded filesystem should not accumulate .ready-* files from probes.
+	defer func() { _ = os.Remove(path) }()
 	if err := file.Sync(); err != nil {
 		file.Close()
 		return err

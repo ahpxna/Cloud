@@ -26,11 +26,7 @@ and a 30-day opaque refresh token. When confirmed MFA is enabled, a correct
 password returns `202` with a one-time 5-minute `challenge` and **no access or
 refresh token**. Complete `/v1/auth/mfa/verify` with either a current TOTP code
 or one unused recovery code before tokens are issued. Store the refresh token
-in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token;
-replaying the old token returns `401`. Refresh sessions are token families:
-reuse of a revoked token revokes every live descendant and emits a security
-warning without revealing the account to the caller. `POST /v1/auth/logout`
-revokes its token and is idempotent.
+in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 30 seconds the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes its token and is idempotent.
 
 
 ### MFA lifecycle
@@ -44,20 +40,25 @@ window and stores the last accepted counter to reject replay.
   current password** (`password`), then returns a new base32 secret plus
   `otpauth_uri`. It invalidates any unconfirmed previous enrollment.
 - `POST /v1/auth/mfa/confirm` requires an access token and the current
-  `totp_code`; on success it returns the one-time recovery-code set.
+  `totp_code`; on success it returns the one-time recovery-code set **and
+  revokes every pre-MFA session family**, including the current device. The
+  client must discard cached credentials and sign in again through MFA.
 - `POST /v1/auth/mfa/verify` is the only unauthenticated MFA route. Send the
   password-login `challenge` plus exactly one of `totp_code` or `recovery_code`.
   A challenge has five attempts and is consumed on success. Challenge issuance
   is durably capped per user (12 per hour) so repeated correct-password logins
   cannot reset MFA brute-force budget indefinitely.
-  Authenticated `confirm`, `recovery`, and `disable` mutations additionally use
-  a durable per-user five-attempt/five-minute action budget; successful actions
-  clear their own budget. Edge rate limits are defense in depth only.
+  Authenticated `enroll`, `confirm`, `recovery`, and `disable` mutations additionally use
+  a durable per-user five-attempt/five-minute action budget; enrollment password
+  checks also share the global Argon2 worker gate. Successful actions clear only
+  their own budget. Edge rate limits are defense in depth only.
 - `POST /v1/auth/mfa/recovery` requires an access token plus current TOTP and
   rotates every recovery code, showing the replacement set once. The accepted
   TOTP counter and replacement recovery-code set commit atomically.
-- `POST /v1/auth/mfa/disable` requires an access token plus current TOTP and
-  deletes TOTP/recovery state while consuming outstanding challenges.
+- `POST /v1/auth/mfa/disable` requires an access token plus current TOTP,
+  deletes TOTP/recovery state, consumes outstanding challenges, and revokes all
+  sessions. Clients must delete cached access/refresh credentials and sign in
+  again.
 
 Recovery codes are high-entropy, single-use credentials. Store them offline;
 do not screenshot them into the same photo library being protected.

@@ -32,8 +32,8 @@ resource "cloudflare_ruleset" "api_rate_limits" {
     },
     {
       ref         = "family_photo_cloud_mfa_sensitive_ip"
-      description = "Bound authenticated MFA confirm/recovery/disable attempts by IP in addition to durable per-user limits"
-      expression  = "http.host eq \"${var.api_hostname}\" and http.request.method eq \"POST\" and http.request.uri.path in {\"/v1/auth/mfa/confirm\" \"/v1/auth/mfa/recovery\" \"/v1/auth/mfa/disable\"}"
+      description = "Bound authenticated MFA enroll/confirm/recovery/disable attempts by IP in addition to durable per-user limits"
+      expression  = "http.host eq \"${var.api_hostname}\" and http.request.method eq \"POST\" and http.request.uri.path in {\"/v1/auth/mfa/enroll\" \"/v1/auth/mfa/confirm\" \"/v1/auth/mfa/recovery\" \"/v1/auth/mfa/disable\"}"
       action      = "block"
       ratelimit = {
         characteristics     = ["cf.colo.id", "ip.src"]

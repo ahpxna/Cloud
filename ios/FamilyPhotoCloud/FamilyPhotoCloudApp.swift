@@ -91,6 +91,7 @@ private struct UploadQueueView: View {
     @Binding var password: String
     @State private var mfaCode = ""
     @State private var recoveryCode = ""
+    @State private var enrollmentPassword = ""
     @State private var enrollmentCode = ""
     @State private var securityCode = ""
     @State private var showDisableMFAConfirmation = false
@@ -137,9 +138,14 @@ private struct UploadQueueView: View {
                 }
 
                 Section("MFA security") {
+                    SecureField("Current password for MFA enrollment", text: $enrollmentPassword)
+                        .textContentType(.password)
                     Button("Begin authenticator enrollment") {
-                        Task { await coordinator.beginMFAEnrollment() }
+                        let currentPassword = enrollmentPassword
+                        enrollmentPassword = ""
+                        Task { await coordinator.beginMFAEnrollment(password: currentPassword) }
                     }
+                    .disabled(enrollmentPassword.isEmpty)
 
                     if let enrollment = coordinator.mfaEnrollment {
                         Text("Add this secret to an authenticator, then confirm with the current 6-digit code.")

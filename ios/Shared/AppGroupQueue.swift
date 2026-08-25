@@ -8,6 +8,23 @@ struct QuarantinedQueueRecord: Identifiable, Hashable, Sendable {
     let modifiedAt: Date?
 }
 
+
+struct QueueRecoveryHooks {
+    let afterPayloadMove: () throws -> Void
+    let afterRecordWrite: () throws -> Void
+    let beforeSourceRecordRemoval: () throws -> Void
+
+    init(
+        afterPayloadMove: @escaping () throws -> Void = {},
+        afterRecordWrite: @escaping () throws -> Void = {},
+        beforeSourceRecordRemoval: @escaping () throws -> Void = {}
+    ) {
+        self.afterPayloadMove = afterPayloadMove
+        self.afterRecordWrite = afterRecordWrite
+        self.beforeSourceRecordRemoval = beforeSourceRecordRemoval
+    }
+}
+
 enum AppGroupQueueError: LocalizedError {
     case appGroupUnavailable
     case unsupportedPayload
@@ -180,6 +197,14 @@ enum AppGroupQueue {
     }
 
     static func recoverQuarantinedRecord(_ record: QuarantinedQueueRecord, in root: URL) throws -> QueuedUpload {
+        try recoverQuarantinedRecord(record, in: root, hooks: QueueRecoveryHooks())
+    }
+
+    static func recoverQuarantinedRecord(
+        _ record: QuarantinedQueueRecord,
+        in root: URL,
+        hooks: QueueRecoveryHooks
+    ) throws -> QueuedUpload {
         let quarantine = root
             .appending(path: "records", directoryHint: .isDirectory)
             .appending(path: "quarantine", directoryHint: .isDirectory)
@@ -209,8 +234,10 @@ enum AppGroupQueue {
 
         let newID = UUID()
         let newPayload = payloads.appending(path: "\(newID.uuidString).\(oldPayload.pathExtension.lowercased())")
+        let newRecord = recordURL(for: newID, in: root)
         try FileManager.default.moveItem(at: oldPayload, to: newPayload)
         do {
+            try hooks.afterPayloadMove()
             let item = QueuedUpload(
                 id: newID,
                 payloadFilename: newPayload.lastPathComponent,
@@ -225,11 +252,21 @@ enum AppGroupQueue {
                 lastError: "Recovered from isolated corrupt queue metadata; upload will restart from byte zero."
             )
             let records = root.appending(path: "records", directoryHint: .isDirectory)
-            try save(item, in: records)
+            try save(item, in: records, afterWrite: hooks.afterRecordWrite)
+            try hooks.beforeSourceRecordRemoval()
             try FileManager.default.removeItem(at: sourceRecord)
             return item
         } catch {
-            try? FileManager.default.moveItem(at: newPayload, to: oldPayload)
+            // save() writes JSON atomically before applying file protection, so
+            // it may throw after the new record already exists. Always remove
+            // the destination record rather than relying on a "save returned"
+            // flag, then restore the payload only when doing so cannot overwrite
+            // another file.
+            try? removeIfPresent(newRecord)
+            if FileManager.default.fileExists(atPath: newPayload.path())
+                && !FileManager.default.fileExists(atPath: oldPayload.path()) {
+                try? FileManager.default.moveItem(at: newPayload, to: oldPayload)
+            }
             throw error
         }
     }
@@ -253,9 +290,14 @@ enum AppGroupQueue {
         return container.appending(path: "UploadQueue", directoryHint: .isDirectory)
     }
 
-    private static func save(_ item: QueuedUpload, in records: URL) throws {
+    private static func save(
+        _ item: QueuedUpload,
+        in records: URL,
+        afterWrite: () throws -> Void = {}
+    ) throws {
         let destination = records.appending(path: "\(item.id.uuidString).json")
         try JSONEncoder.photoCloud.encode(item).write(to: destination, options: [.atomic])
+        try afterWrite()
         try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: destination.path())
     }
 
