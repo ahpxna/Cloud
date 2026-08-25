@@ -26,7 +26,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.phanan.FamilyPhotoCloud
-        PRODUCT_NAME: Family Photo Cloud
+        PRODUCT_NAME: FamilyPhotoCloud
+        INFOPLIST_KEY_CFBundleDisplayName: Family Photo Cloud
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ""
         GENERATE_INFOPLIST_FILE: YES
