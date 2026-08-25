@@ -555,22 +555,94 @@ func (r *PostgresRepository) CompleteMFARecoveryChallenge(ctx context.Context, c
 	return user, deviceName, nil
 }
 
-func (r *PostgresRepository) AdvanceTOTPCounter(ctx context.Context, userID string, counter int64) error {
-	command, err := r.pool.Exec(ctx, `
-        UPDATE user_mfa_totp
-        SET last_used_counter = $2, updated_at = now()
-        WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL
-          AND (last_used_counter IS NULL OR last_used_counter < $2)`, userID, counter)
+func (r *PostgresRepository) RecordMFAActionAttempt(
+	ctx context.Context,
+	userID, action string,
+	now time.Time,
+	window time.Duration,
+	limit int,
+) (bool, time.Duration, error) {
+	if window <= 0 || limit < 1 || (action != "confirm" && action != "recovery" && action != "disable") {
+		return false, 0, ErrMFAInvalid
+	}
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return false, 0, err
 	}
-	if command.RowsAffected() != 1 {
-		return ErrMFAReplay
+	defer tx.Rollback(ctx)
+
+	// Serialize first insertion and subsequent mutations by user so parallel
+	// requests cannot race around the durable attempt budget.
+	var lockedUserID string
+	if err := tx.QueryRow(ctx, `
+        SELECT id::text FROM users WHERE id = $1::uuid FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, 0, ErrInvalidCredentials
+		}
+		return false, 0, err
 	}
-	return nil
+
+	if _, err := tx.Exec(ctx, `
+        DELETE FROM mfa_action_throttles
+        WHERE updated_at < $1`, now.Add(-mfaActionRetention)); err != nil {
+		return false, 0, err
+	}
+
+	var windowStarted time.Time
+	var count int
+	var blockedUntil *time.Time
+	err = tx.QueryRow(ctx, `
+        SELECT window_started_at, attempt_count, blocked_until
+        FROM mfa_action_throttles
+        WHERE user_id = $1::uuid AND action = $2
+        FOR UPDATE`, userID, action).Scan(&windowStarted, &count, &blockedUntil)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err := tx.Exec(ctx, `
+            INSERT INTO mfa_action_throttles (
+                user_id, action, window_started_at, attempt_count, blocked_until, updated_at
+            ) VALUES ($1::uuid, $2, $3, 1, NULL, $3)`, userID, action, now); err != nil {
+			return false, 0, err
+		}
+		return true, 0, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if blockedUntil != nil && blockedUntil.After(now) {
+		return false, blockedUntil.Sub(now), tx.Commit(ctx)
+	}
+	if !now.Before(windowStarted.Add(window)) {
+		if _, err := tx.Exec(ctx, `
+            UPDATE mfa_action_throttles
+            SET window_started_at = $3, attempt_count = 1,
+                blocked_until = NULL, updated_at = $3
+            WHERE user_id = $1::uuid AND action = $2`, userID, action, now); err != nil {
+			return false, 0, err
+		}
+		return true, 0, tx.Commit(ctx)
+	}
+
+	count++
+	var nextBlockedUntil *time.Time
+	if count >= limit {
+		until := windowStarted.Add(window)
+		nextBlockedUntil = &until
+	}
+	if _, err := tx.Exec(ctx, `
+        UPDATE mfa_action_throttles
+        SET attempt_count = $3, blocked_until = $4, updated_at = $5
+        WHERE user_id = $1::uuid AND action = $2`, userID, action, count, nextBlockedUntil, now); err != nil {
+		return false, 0, err
+	}
+	return true, 0, tx.Commit(ctx)
 }
 
-func (r *PostgresRepository) ReplaceRecoveryCodes(ctx context.Context, userID string, hashes [][32]byte) error {
+func (r *PostgresRepository) ClearMFAActionAttempts(ctx context.Context, userID, action string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM mfa_action_throttles WHERE user_id = $1::uuid AND action = $2`, userID, action)
+	return err
+}
+
+func (r *PostgresRepository) RotateRecoveryCodes(ctx context.Context, userID string, counter int64, hashes [][32]byte) error {
 	if len(hashes) == 0 {
 		return ErrMFAInvalid
 	}
@@ -579,6 +651,28 @@ func (r *PostgresRepository) ReplaceRecoveryCodes(ctx context.Context, userID st
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	var lastUsed *int64
+	err = tx.QueryRow(ctx, `
+        SELECT last_used_counter
+        FROM user_mfa_totp
+        WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL
+        FOR UPDATE`, userID).Scan(&lastUsed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrMFANotConfigured
+	}
+	if err != nil {
+		return err
+	}
+	if lastUsed != nil && counter <= *lastUsed {
+		return ErrMFAReplay
+	}
+	if _, err := tx.Exec(ctx, `
+        UPDATE user_mfa_totp
+        SET last_used_counter = $2, updated_at = now()
+        WHERE user_id = $1::uuid`, userID, counter); err != nil {
+		return err
+	}
 	if err := replaceRecoveryCodesTx(ctx, tx, userID, hashes); err != nil {
 		return err
 	}

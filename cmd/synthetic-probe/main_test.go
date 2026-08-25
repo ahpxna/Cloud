@@ -29,3 +29,20 @@ func TestLoopbackOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPHostAuthorizationIsExact(t *testing.T) {
+	if !httpHostAllowed("localhost", true, "") {
+		t.Fatal("loopback development mode should allow localhost")
+	}
+	if httpHostAllowed("upload-gateway", true, "") {
+		t.Fatal("loopback mode must not authorize Docker DNS names")
+	}
+	if !httpHostAllowed("upload-gateway", false, "upload-gateway") {
+		t.Fatal("explicit Docker test hostname should be authorized")
+	}
+	for _, host := range []string{"upload-gateway.evil", "10.0.0.2", "example.com"} {
+		if httpHostAllowed(host, false, "upload-gateway") {
+			t.Fatalf("exact test hostname must not authorize %q", host)
+		}
+	}
+}

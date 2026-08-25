@@ -31,6 +31,18 @@ resource "cloudflare_ruleset" "api_rate_limits" {
       }
     },
     {
+      ref         = "family_photo_cloud_mfa_sensitive_ip"
+      description = "Bound authenticated MFA confirm/recovery/disable attempts by IP in addition to durable per-user limits"
+      expression  = "http.host eq \"${var.api_hostname}\" and http.request.method eq \"POST\" and http.request.uri.path in {\"/v1/auth/mfa/confirm\" \"/v1/auth/mfa/recovery\" \"/v1/auth/mfa/disable\"}"
+      action      = "block"
+      ratelimit = {
+        characteristics     = ["cf.colo.id", "ip.src"]
+        period              = 60
+        requests_per_period = 20
+        mitigation_timeout  = 300
+      }
+    },
+    {
       ref         = "family_photo_cloud_refresh_ip"
       description = "Bound refresh-token endpoint abuse"
       expression  = "http.host eq \"${var.api_hostname}\" and http.request.method eq \"POST\" and http.request.uri.path eq \"/v1/auth/refresh\""

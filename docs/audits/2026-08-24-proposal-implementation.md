@@ -18,8 +18,8 @@ iPhone has actually been configured or tested.
 | Durable login throttling | Per-normalized-identity HMAC state in PostgreSQL, process-wide token bucket/Argon2 gate, fail-closed in-memory fallback for unit fakes, indexed stale-row cleanup. Plain login identities are not persisted in throttle state. | Implemented |
 | Upload-session creation throttling | Durable per-user PostgreSQL create window in the same transaction as admission; idempotent retries do not consume a new slot. | Implemented with regression test |
 | Single writable gateway | Session-level PostgreSQL advisory lock is held on a dedicated pooled connection for process lifetime; a second writable gateway fails startup. | Implemented |
-| Safe migration baseline | Pre-ledger baseline now fingerprints required column type/nullability, named indexes, foreign keys, and check constraints through schema v7; mismatches are refused. | Implemented |
-| TOTP MFA | AES-256-GCM encrypted TOTP secret with separate key, five-minute one-time login challenge, ±1 TOTP window, replay counter, one-time hash-only recovery codes, durable per-user challenge issuance cap, and no refresh token before MFA. | Implemented backend + iOS UI; real enrolment/recovery evidence pending |
+| Safe migration baseline | Pre-ledger baseline now fingerprints required column type/nullability, named indexes, foreign keys, and check constraints through schema v8; mismatches are refused. | Implemented |
+| TOTP MFA | AES-256-GCM encrypted TOTP secret with separate key, five-minute one-time login challenge, ±1 TOTP window, replay counter, one-time hash-only recovery codes, durable per-user challenge issuance cap, durable sensitive-action throttles, atomic recovery-code rotation, and no refresh token before MFA. | Implemented backend + iOS UI; real enrolment/recovery evidence pending |
 | Cloudflare edge rules | Terraform zone rulesets rate-limit login/MFA/refresh/session creation and enforce API/TUS method policy. TUS PATCH is deliberately not request-rate-limited at the edge. | Source ready; provider apply/public acceptance pending |
 | iOS corrupt queue recovery | Malformed record metadata is isolated without deleting payload; an unambiguous image/video can be rebuilt under a **fresh UUID**, forcing byte-zero restart rather than unsafe resume. | Implemented with Swift regression tests |
 | iOS background diagnostics | Bounded, rotated, token-redacted JSONL records queue/session/TUS IDs, offsets, app state, timestamps and failures; export UI is included. | Implemented; physical-device matrix pending |
@@ -36,11 +36,11 @@ iPhone has actually been configured or tested.
 | Prometheus/Grafana/Alertmanager | Loopback-only Compose profile, provisioned dashboard and alert rules | Source ready; external alert receiver/test pending |
 | Protected audit export | `cmd/audit-export` creates immutable JSONL export + SHA-256 sidecar; backup includes exports | Source ready; off-host retention pending |
 | Encrypted off-site backup | `scripts/backup-restic.sh` creates quiescent DB/media/evidence restic snapshot | Source ready; repository/provider not configured by code |
-| Isolated restore verification | `scripts/restore-drill.sh` restores DB/media outside production and re-hashes every live asset | Source ready; successful dated drill pending |
+| Isolated restore verification | `scripts/restore-drill.sh` restores DB/media outside production, re-hashes every live asset, and verifies every signed manifest plus exact DB linkage using the public Ed25519 trust key | Source ready; successful dated drill pending |
 | Scheduled backups | systemd daily backup timer | Source ready; do not enable before repository configuration |
 | CI security matrix | Image/build/security jobs extended for the new commands and operational files | Source ready; GitHub execution pending |
 | SBOM | Trivy CycloneDX artifact for every image target | Source ready; CI execution pending |
-| Release image signing/provenance | Tag workflow pushes gateway digest, keyless-signs it with cosign, and attaches SBOM/provenance attestations | Source ready; first signed release pending |
+| Release image signing/provenance | Tag workflow builds all eight deployable targets and keyless-signs/attests each immutable pushed digest with its CycloneDX SBOM and provenance | Source ready; first signed release pending |
 | Private operator interface | Make targets for scrub, integrity, backup, restore, audit, observability and probes | Implemented |
 | Kubernetes migration | Intentionally not added; unnecessary for the single-host family deployment | Deferred roadmap |
 | Vault/Wazuh/OPA | Intentionally optional; no operational need demonstrated in this baseline | Optional |

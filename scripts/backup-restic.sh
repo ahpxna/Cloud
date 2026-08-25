@@ -9,6 +9,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 # shellcheck source=scripts/lib/load-env.sh
 source "$repo_root/scripts/lib/load-env.sh"
+# shellcheck source=scripts/lib/operator-lock.sh
+source "$repo_root/scripts/lib/operator-lock.sh"
 load_dotenv "$repo_root/.env"
 
 : "${RESTIC_REPOSITORY:?set RESTIC_REPOSITORY to an encrypted off-site repository}"
@@ -30,11 +32,13 @@ mkdir -p "$work" "$manifest_root" "$audit_root"
 chmod 700 "$backup_root" "$work" 2>/dev/null || true
 
 started_gateway=0
+operator_lock_acquire
 cleanup() {
   status=$?
   if [[ $started_gateway -eq 1 ]]; then
     docker compose --profile gateway up -d --no-deps upload-gateway >/dev/null 2>&1 || true
   fi
+  operator_lock_release
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -81,4 +85,5 @@ trap - EXIT INT TERM
 if [[ $started_gateway -eq 1 ]]; then
   docker compose --profile gateway up -d --no-deps upload-gateway
 fi
+operator_lock_release
 printf 'Backup completed: %s\n' "$stamp"

@@ -26,17 +26,21 @@ const (
 	mfaChallengeIssueWindow = time.Hour
 	mfaChallengeIssueLimit  = 12
 	mfaChallengeRetention   = 24 * time.Hour
+	mfaActionWindow         = 5 * time.Minute
+	mfaActionAttempts       = 5
+	mfaActionRetention      = 24 * time.Hour
 	totpPeriodSeconds       = int64(30)
 	totpDigits              = 6
 	recoveryCodeCount       = 10
 )
 
 var (
-	ErrMFANotConfigured = errors.New("mfa is not configured")
-	ErrMFAInvalid       = errors.New("mfa verification failed")
-	ErrMFAChallenge     = errors.New("mfa challenge is invalid or expired")
-	ErrMFARateLimited   = errors.New("mfa challenge issuance is rate limited")
-	ErrMFAReplay        = errors.New("mfa code replay detected")
+	ErrMFANotConfigured     = errors.New("mfa is not configured")
+	ErrMFAInvalid           = errors.New("mfa verification failed")
+	ErrMFAChallenge         = errors.New("mfa challenge is invalid or expired")
+	ErrMFARateLimited       = errors.New("mfa challenge issuance is rate limited")
+	ErrMFAActionRateLimited = errors.New("mfa sensitive action is rate limited")
+	ErrMFAReplay            = errors.New("mfa code replay detected")
 )
 
 type MFARecord struct {
@@ -66,8 +70,9 @@ type MFARepository interface {
 	FailMFAChallenge(context.Context, [32]byte, time.Time) (int, error)
 	CompleteMFATOTPChallenge(context.Context, [32]byte, time.Time, int64) (User, string, error)
 	CompleteMFARecoveryChallenge(context.Context, [32]byte, [32]byte, time.Time) (User, string, error)
-	AdvanceTOTPCounter(context.Context, string, int64) error
-	ReplaceRecoveryCodes(context.Context, string, [][32]byte) error
+	RecordMFAActionAttempt(context.Context, string, string, time.Time, time.Duration, int) (bool, time.Duration, error)
+	ClearMFAActionAttempts(context.Context, string, string) error
+	RotateRecoveryCodes(context.Context, string, int64, [][32]byte) error
 	DisableMFA(context.Context, string, int64) error
 }
 

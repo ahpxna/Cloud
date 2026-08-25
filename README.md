@@ -7,7 +7,7 @@ background uploads, per-user libraries, and a self-hosted origin.
 
 This repository now contains the first backend vertical slice: invite-only
 accounts, Argon2id password verification, rotating refresh sessions, short-lived
-access tokens, TOTP MFA with one-time recovery codes, durable login throttling, an
+access tokens, TOTP MFA with one-time recovery codes and durable sensitive-action throttling, durable login throttling, an
 authenticated tus gateway, owner isolation, bounded upload concurrency and
 creation rates, SHA-256 verification, fenced quarantine, crash recovery, and
 durable no-overwrite commit. It now also has content-addressed per-owner deduplication,
@@ -66,7 +66,9 @@ make restore-drill
 ```
 
 Use a dedicated probe account for `make synthetic-probe` and local
-`make chaos-resume`. See the integrity, backup/restore, observability, synthetic
+`make chaos-resume`. If Docker Desktop cannot publish the loopback gateway port,
+use `make synthetic-probe-docker` to exercise the same path over the isolated
+Compose ingress network; its HTTP exception is exact-host and test-only. See the integrity, backup/restore, observability, synthetic
 probe, and supply-chain runbooks before scheduling these jobs.
 
 ## Budget-first order
@@ -134,7 +136,7 @@ The only exception is a one-time upgrade from the old pre-ledger Compose
 deployment. After independently confirming which SQL files were already
 applied, set `PHOTO_MIGRATION_BASELINE_VERSION` to that exact version for one
 run, then remove it. The runner fingerprints expected column types/nullability,
-indexes, foreign keys and checks before recording a baseline; presence-only
+indexes, foreign keys and checks through schema v8 before recording a baseline; presence-only
 lookalike schemas are refused. This is explicit operator acknowledgement, not
 an automatic guess about a production schema.
 

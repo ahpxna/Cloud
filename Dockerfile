@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
-FROM golang:1.26.7-alpine3.23 AS build
+ARG GO_BUILD_IMAGE=golang:1.26.7-alpine3.23
+ARG RUNTIME_IMAGE=alpine:3.23
+FROM ${GO_BUILD_IMAGE} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -16,7 +18,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/audit-export ./cmd/audit-export \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
 
-FROM alpine:3.23 AS runtime-base
+FROM ${RUNTIME_IMAGE} AS runtime-base
 RUN apk add --no-cache ca-certificates \
     && addgroup -S -g 10001 photo \
     && adduser -S -D -H -u 10001 -G photo photo

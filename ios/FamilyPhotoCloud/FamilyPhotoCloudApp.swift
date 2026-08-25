@@ -49,6 +49,7 @@ final class AppEnvironment: ObservableObject {
     }
 
     func startUploads() async { await coordinator?.startQueuedUploads() }
+    func appBecameActive() async { await coordinator?.appBecameActive() }
     func registerBackgroundHandler(_ completion: @escaping () -> Void, identifier: String) {
         guard let coordinator else { completion(); return }
         coordinator.registerBackgroundHandler(completion, identifier: identifier)
@@ -57,6 +58,7 @@ final class AppEnvironment: ObservableObject {
 
 struct ContentView: View {
     @ObservedObject var environment: AppEnvironment
+    @Environment(\.scenePhase) private var scenePhase
     @State private var email = ""
     @State private var password = ""
 
@@ -74,6 +76,10 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await environment.appBecameActive() }
         }
     }
 }

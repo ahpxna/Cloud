@@ -18,7 +18,8 @@ RESTIC_REPOSITORY=<restic repository URI>
 RESTIC_PASSWORD_FILE=/root/.config/family-photo-cloud/restic-password
 ```
 
-The backup script stops the upload gateway for a short quiescent window, writes
+Backup and integrity cycles share one host-side consistency lock so manual or
+scheduled runs cannot overlap. The backup script stops the upload gateway for a short quiescent window, writes
 a PostgreSQL custom-format dump, snapshots the database dump plus media,
 manifests, and audit exports into restic, runs a repository check, removes the
 local dump, and restarts the gateway if it was running.
@@ -42,7 +43,12 @@ RESTORE_SNAPSHOT=<snapshot-id> make restore-drill
 The drill restores into `.data/restore-drills/<timestamp>`, starts a disposable
 PostgreSQL container, restores the dump there, locates restored originals, and
 checks every live asset's byte size and SHA-256 against the restored database.
-It never connects to or overwrites the live database/media path.
+For every `signed_manifests` row it also requires the corresponding restored
+manifest file, verifies its Ed25519 signature with the configured **public** key,
+and asserts manifest version, asset count, payload hash, signing key ID, and
+signature bytes against PostgreSQL. The private signing key is never mounted in
+the restore verifier. It never connects to or overwrites the live database/media
+path.
 
 Keep `restore-drill-report.txt` as dated evidence. A quarterly production drill
 should additionally record elapsed restore time, recovered snapshot age, RPO,

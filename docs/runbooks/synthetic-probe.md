@@ -16,7 +16,17 @@ make synthetic-probe \
 ```
 
 Plain HTTP is rejected except when `-allow-http` is explicitly used with a
-loopback host.
+loopback host. If Docker Desktop/CI cannot publish the loopback gateway port,
+start the gateway and use the isolated Compose-network fallback:
+
+```bash
+make synthetic-probe-docker \
+  EMAIL=probe@example.com \
+  PASSWORD_FILE=/absolute/protected/probe-password
+```
+
+That target authorizes HTTP only for the exact Compose DNS hostname
+`upload-gateway`; it does not permit arbitrary RFC1918/plain-HTTP endpoints.
 
 For a local gateway restart test:
 

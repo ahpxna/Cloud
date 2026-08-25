@@ -124,6 +124,27 @@ services:
     cap_drop: ["ALL"]
     restart: unless-stopped
 
+  # Test-only in-network probe for Docker Desktop/CI environments where the
+  # loopback published port is unavailable. Plain HTTP is authorized only for
+  # the exact Compose DNS name passed by the Make target.
+  synthetic-probe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: synthetic-probe
+    profiles: ["gateway"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    networks: [ingress]
+    depends_on:
+      upload-gateway:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
   # Administrative tooling is not shipped in the Internet-facing gateway
   # image. Invoke this one-shot profile only from the private host.
   admin:
@@ -173,6 +194,39 @@ services:
     volumes:
       - ${MANIFEST_OUTPUT_DIR:-./.data/manifests}:/manifests
       - ${MANIFEST_KEY_HOST_PATH:-./.data/secrets/manifest-ed25519.pem}:/run/secrets/manifest-ed25519.pem:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  # Verification/reconciliation never receives the private signing key. It uses
+  # only the public trust anchor and can repair the narrow file-written/DB-row-
+  # missing crash window after independently validating the signed payload.
+  manifest-verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: manifest
+    profiles: ["integrity"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: ${POSTGRES_USER:-photo_cloud}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      MANIFEST_ED25519_PUBLIC_KEY_FILE: /run/secrets/manifest-ed25519-public.pem
+    networks: [database]
+    volumes:
+      - ${MANIFEST_OUTPUT_DIR:-./.data/manifests}:/manifests:ro
+      - ${MANIFEST_PUBLIC_KEY_HOST_PATH:-./.data/secrets/manifest-ed25519-public.pem}:/run/secrets/manifest-ed25519-public.pem:ro
     depends_on:
       postgres:
         condition: service_healthy

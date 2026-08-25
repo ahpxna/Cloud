@@ -49,8 +49,12 @@ window and stores the last accepted counter to reject replay.
   A challenge has five attempts and is consumed on success. Challenge issuance
   is durably capped per user (12 per hour) so repeated correct-password logins
   cannot reset MFA brute-force budget indefinitely.
+  Authenticated `confirm`, `recovery`, and `disable` mutations additionally use
+  a durable per-user five-attempt/five-minute action budget; successful actions
+  clear their own budget. Edge rate limits are defense in depth only.
 - `POST /v1/auth/mfa/recovery` requires an access token plus current TOTP and
-  rotates every recovery code, showing the replacement set once.
+  rotates every recovery code, showing the replacement set once. The accepted
+  TOTP counter and replacement recovery-code set commit atomically.
 - `POST /v1/auth/mfa/disable` requires an access token plus current TOTP and
   deletes TOTP/recovery state while consuming outstanding challenges.
 

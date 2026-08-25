@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Read-only preflight for the future Linux media host. It does not format,
-# mount, encrypt, or alter disks. Run it only after the operator mounts the
-# intended encrypted media volume by UUID.
+# Read-only launch gate for the Linux media host. It does not format, mount,
+# encrypt, or alter disks. The media mount must resolve through an active
+# dm-crypt/LUKS mapping; an unrelated /etc/crypttab entry is not evidence.
 set -euo pipefail
 
 failures=0
@@ -38,7 +38,7 @@ if ! [[ "$minimum_free_gib" =~ ^[0-9]+$ ]]; then
   fail "PHOTO_MEDIA_MIN_FREE_GIB must be a whole number"
 fi
 
-for tool in findmnt findfs df stat docker; do
+for tool in findmnt findfs df stat lsblk cryptsetup docker; do
   require_command "$tool"
 done
 
@@ -86,14 +86,45 @@ if [[ -n "$media_mount" && -d "$media_mount" ]]; then
   else
     pass "media filesystem is writable"
   fi
+
+  encryption_verified=0
+  if [[ -n "$source_device" && "$source_device" == /dev/* ]] && command -v lsblk >/dev/null 2>&1 && command -v cryptsetup >/dev/null 2>&1; then
+    while read -r ancestor ancestor_type ancestor_fstype; do
+      [[ -n "$ancestor" ]] || continue
+      if [[ "$ancestor_type" != "crypt" ]]; then
+        continue
+      fi
+      crypt_name="$(basename "$ancestor")"
+      status_output="$(cryptsetup status "$crypt_name" 2>&1 || true)"
+      if ! grep -Eqi '^[[:space:]]*type:[[:space:]]*LUKS[12]?' <<<"$status_output"; then
+        fail "dm-crypt ancestor $ancestor is not reported as an active LUKS mapping; run preflight with sufficient privilege"
+        continue
+      fi
+      backing_device="$(lsblk -npo PKNAME "$ancestor" 2>/dev/null | head -n1 | xargs || true)"
+      backing_fstype=""
+      if [[ -n "$backing_device" ]]; then
+        backing_fstype="$(lsblk -ndo FSTYPE "$backing_device" 2>/dev/null | head -n1 | xargs || true)"
+      fi
+      if [[ "$backing_fstype" != "crypto_LUKS" ]]; then
+        fail "active crypt mapping $ancestor does not trace to a crypto_LUKS backing device (${backing_device:-unknown}, fstype=${backing_fstype:-unknown})"
+        continue
+      fi
+      pass "media mount traces through active LUKS mapping $ancestor backed by $backing_device"
+      encryption_verified=1
+      break
+    done < <(lsblk -s -n -p -o NAME,TYPE,FSTYPE "$source_device" 2>/dev/null || true)
+  fi
+  if [[ "$encryption_verified" -ne 1 ]]; then
+    fail "could not prove that $media_mount is backed by an active LUKS dm-crypt mapping"
+  fi
 else
   [[ -n "$media_mount" ]] && fail "media mount path does not exist: $media_mount"
 fi
 
 if [[ -r /etc/crypttab ]] && grep -Eq '^[[:space:]]*[^#[:space:]]+' /etc/crypttab; then
-  pass "an encrypted-volume mapping is declared in /etc/crypttab"
+  pass "/etc/crypttab declares at least one encrypted-volume mapping (informational; mount tracing above is authoritative)"
 else
-  warn "could not confirm a LUKS mapping from /etc/crypttab; verify encryption manually"
+  warn "/etc/crypttab has no active mapping declaration; ensure encrypted media unlock is intentionally managed"
 fi
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then

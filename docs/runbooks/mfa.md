@@ -36,6 +36,15 @@ Do not consume the operator's only offline copy during a drill; maintain at leas
 
 Disabling MFA requires a valid current TOTP and an explicit destructive confirmation in the iOS UI. After disabling, test a fresh sign-in and record the reason/date in the access review. If MFA is disabled because the authenticator is lost, treat that as a recovery/security event and rotate affected session credentials as appropriate.
 
+## Abuse-control verification
+
+The server durably limits authenticated MFA `confirm`, `recovery`, and `disable`
+mutations to five attempts per user/action in a five-minute window. A sixth
+request must return `429` with `Retry-After`; a successful protected mutation
+clears only that action's budget. The Cloudflare ruleset adds a broader per-IP
+edge bound but is not the security boundary. PostgreSQL integration tests cover
+this durable state and the atomic recovery-code rotation rollback path.
+
 ## Evidence to retain
 
 Retain only non-secret evidence: date, account role, device, successful challenge/recovery outcomes, and reviewer. Never put TOTP secrets, live recovery codes, bearer tokens, or QR payloads in logs/screenshots retained as audit evidence.

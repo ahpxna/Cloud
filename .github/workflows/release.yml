@@ -11,8 +11,28 @@ permissions:
   id-token: write
 
 jobs:
-  gateway-image:
+  signed-images:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: gateway
+            image_name: upload-gateway
+          - target: admin
+            image_name: admin
+          - target: manifest
+            image_name: manifest
+          - target: scrub
+            image_name: scrub
+          - target: metrics-exporter
+            image_name: metrics-exporter
+          - target: synthetic-probe
+            image_name: synthetic-probe
+          - target: audit-export
+            image_name: audit-export
+          - target: migrate
+            image_name: migrate
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -32,18 +52,37 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      - name: Build and push immutable gateway image
+      - name: Resolve immutable Dockerfile base images
+        id: bases
+        run: |
+          set -euo pipefail
+          resolve() {
+            local tagged="$1"
+            docker pull "$tagged" >/dev/null
+            local pinned
+            pinned="$(docker image inspect --format '{{index .RepoDigests 0}}' "$tagged")"
+            [[ "$pinned" =~ @sha256:[0-9a-f]{64}$ ]]
+            printf '%s\n' "$pinned"
+          }
+          printf 'go_build=%s\n' "$(resolve 'golang:1.26.7-alpine3.23')" >> "$GITHUB_OUTPUT"
+          printf 'runtime=%s\n' "$(resolve 'alpine:3.23')" >> "$GITHUB_OUTPUT"
+      - name: Build and push immutable image
         id: image
         env:
           TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          IMAGE_NAME: ${{ matrix.image_name }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY,,}"
-          image="ghcr.io/${repo}/upload-gateway:${TAG}"
-          docker build --pull --target gateway \
+          image="ghcr.io/${repo}/${IMAGE_NAME}:${TAG}"
+          docker build --pull --target "$TARGET" \
+            --build-arg "GO_BUILD_IMAGE=${{ steps.bases.outputs.go_build }}" \
+            --build-arg "RUNTIME_IMAGE=${{ steps.bases.outputs.runtime }}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             --tag "$image" .
+          trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$image"
           docker push "$image" | tee push.txt
           digest="$(awk '/digest:/ {print $3}' push.txt | tail -n1)"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -57,6 +96,9 @@ jobs:
       - name: Generate build provenance predicate
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          TARGET: ${{ matrix.target }}
+          GO_BUILD_IMAGE: ${{ steps.bases.outputs.go_build }}
+          RUNTIME_IMAGE: ${{ steps.bases.outputs.runtime }}
         run: |
           python3 - <<'PY'
           import json, os
@@ -69,7 +111,12 @@ jobs:
                       "digest": {"sha1": os.environ["GITHUB_SHA"]},
                       "entryPoint": ".github/workflows/release.yml"
                   },
-                  "parameters": {"target": "gateway", "image": os.environ["IMAGE_REF"]},
+                  "parameters": {
+                      "target": os.environ["TARGET"],
+                      "image": os.environ["IMAGE_REF"],
+                      "go_build_image": os.environ["GO_BUILD_IMAGE"],
+                      "runtime_image": os.environ["RUNTIME_IMAGE"]
+                  },
                   "environment": {"runner": "ubuntu-24.04"}
               },
               "metadata": {"reproducible": False},
@@ -96,7 +143,7 @@ jobs:
       - name: Upload release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: gateway-release-evidence-${{ github.ref_name }}
+          name: ${{ matrix.target }}-release-evidence-${{ github.ref_name }}
           path: |
             sbom.cdx.json
             provenance.json

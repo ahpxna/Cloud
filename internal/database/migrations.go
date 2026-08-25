@@ -116,8 +116,8 @@ func Apply(ctx context.Context, conn *pgx.Conn, migrations []Migration, baseline
 }
 
 func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) error {
-	if version < 1 || version > 7 {
-		return fmt.Errorf("refusing baseline %d: schema fingerprint is defined only for versions 1 through 7", version)
+	if version < 1 || version > 8 {
+		return fmt.Errorf("refusing baseline %d: schema fingerprint is defined only for versions 1 through 8", version)
 	}
 
 	columns := []baselineColumn{
@@ -188,6 +188,16 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 			baselineColumn{"mfa_challenges", "consumed_at", "timestamp with time zone", true},
 		)
 	}
+	if version >= 8 {
+		columns = append(columns,
+			baselineColumn{"mfa_action_throttles", "user_id", "uuid", false},
+			baselineColumn{"mfa_action_throttles", "action", "text", false},
+			baselineColumn{"mfa_action_throttles", "window_started_at", "timestamp with time zone", false},
+			baselineColumn{"mfa_action_throttles", "attempt_count", "integer", false},
+			baselineColumn{"mfa_action_throttles", "blocked_until", "timestamp with time zone", true},
+			baselineColumn{"mfa_action_throttles", "updated_at", "timestamp with time zone", false},
+		)
+	}
 	for _, expected := range columns {
 		if err := verifyBaselineColumn(ctx, conn, expected); err != nil {
 			return fmt.Errorf("refusing baseline %d: %w", version, err)
@@ -240,6 +250,11 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 			baselineIndex{"mfa_challenges_active", "mfa_challenges", []string{"challenge_hash", "expires_at", "consumed_at is null", "attempts_remaining > 0"}},
 			baselineIndex{"mfa_challenges_user_recent", "mfa_challenges", []string{"user_id", "created_at"}},
 			baselineIndex{"mfa_challenges_cleanup", "mfa_challenges", []string{"created_at"}},
+		)
+	}
+	if version >= 8 {
+		indexes = append(indexes,
+			baselineIndex{"mfa_action_throttles_cleanup", "mfa_action_throttles", []string{"updated_at"}},
 		)
 	}
 	for _, expected := range indexes {
@@ -296,6 +311,12 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 			baselineConstraint{"mfa_challenges_user_id_fkey", "mfa_challenges", "f", []string{"foreign key (user_id)", "references users(id)", "on delete cascade"}},
 		)
 	}
+	if version >= 8 {
+		constraints = append(constraints,
+			baselineConstraint{"mfa_action_throttles_pkey", "mfa_action_throttles", "p", []string{"primary key (user_id, action)"}},
+			baselineConstraint{"mfa_action_throttles_user_id_fkey", "mfa_action_throttles", "f", []string{"foreign key (user_id)", "references users(id)", "on delete cascade"}},
+		)
+	}
 	for _, expected := range constraints {
 		if err := verifyBaselineConstraint(ctx, conn, expected); err != nil {
 			return fmt.Errorf("refusing baseline %d: %w", version, err)
@@ -333,6 +354,12 @@ func verifyBaselineSchema(ctx context.Context, conn *pgx.Conn, version int) erro
 			baselineCheck{"user_mfa_recovery_codes", "recovery hash", []string{"octet_length(code_hash)", "32"}},
 			baselineCheck{"mfa_challenges", "challenge hash", []string{"octet_length(challenge_hash)", "32"}},
 			baselineCheck{"mfa_challenges", "attempts nonnegative", []string{"attempts_remaining", ">= 0"}},
+		)
+	}
+	if version >= 8 {
+		checks = append(checks,
+			baselineCheck{"mfa_action_throttles", "action domain", []string{"confirm", "recovery", "disable"}},
+			baselineCheck{"mfa_action_throttles", "attempts nonnegative", []string{"attempt_count", ">= 0"}},
 		)
 	}
 	for _, expected := range checks {

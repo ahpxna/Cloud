@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Network
 import UIKit
 
 enum AvailableUploadFinalization {
@@ -62,6 +63,11 @@ final class UploadCoordinator: ObservableObject {
     private let api: PhotoCloudAPI
     private let auth: AuthenticationStore
     private let transport: TUSUploadTransport
+    private let pathMonitor = NWPathMonitor()
+    private let connectivityQueue = DispatchQueue(label: "dev.phanan.FamilyPhotoCloud.connectivity")
+    private var verificationRetryTasks: [UUID: Task<Void, Never>] = [:]
+    private var verificationRetryCounts: [UUID: Int] = [:]
+    private var verificationReconcileInFlight: Set<UUID> = []
 
     init(apiBaseURL: URL) throws {
         api = PhotoCloudAPI(baseURL: apiBaseURL)
@@ -77,6 +83,13 @@ final class UploadCoordinator: ObservableObject {
         transport.uploadFailed = { [weak self] _, context, error in
             Task { @MainActor in await self?.tusFailed(context: context, error: error) }
         }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor [weak self] in
+                await self?.reconcileVerifyingUploads(trigger: "network_available")
+            }
+        }
+        pathMonitor.start(queue: connectivityQueue)
     }
 
     func reload() {
@@ -210,6 +223,10 @@ final class UploadCoordinator: ObservableObject {
         }
     }
 
+    func appBecameActive() async {
+        await reconcileVerifyingUploads(trigger: "foreground")
+    }
+
     func registerBackgroundHandler(_ completion: @escaping () -> Void, identifier: String) {
         transport.registerBackgroundHandler(completion, identifier: identifier)
     }
@@ -337,6 +354,9 @@ final class UploadCoordinator: ObservableObject {
 
     private func reconcile(_ original: QueuedUpload) async {
         guard let sessionID = original.serverSessionID else { return }
+        guard !verificationReconcileInFlight.contains(original.id) else { return }
+        verificationReconcileInFlight.insert(original.id)
+        defer { verificationReconcileInFlight.remove(original.id) }
         var item = original
         do {
             for attempt in 0..<10 {
@@ -344,6 +364,7 @@ final class UploadCoordinator: ObservableObject {
                 let status = try await api.uploadSession(id: sessionID, accessToken: accessToken)
                 switch status.state {
                 case "available":
+                    cancelVerificationRetry(for: item.id)
                     let finalization = AvailableUploadFinalizer.finalize(
                         item,
                         persist: { try AppGroupQueue.save($0) },
@@ -366,6 +387,7 @@ final class UploadCoordinator: ObservableObject {
                     reload()
                     return
                 case "quarantined":
+                    cancelVerificationRetry(for: item.id)
                     item.state = .quarantined
                     item.lastError = "The server rejected this file because its final SHA-256 or byte count did not match. Keep the source copy."
                     try AppGroupQueue.save(item)
@@ -376,12 +398,14 @@ final class UploadCoordinator: ObservableObject {
                     reload()
                     return
                 case "created":
+                    cancelVerificationRetry(for: item.id)
                     item.tusUploadID = nil
                     item.state = .queued
                     try AppGroupQueue.save(item)
                     await recoverTransfer(item)
                     return
                 case "uploading":
+                    cancelVerificationRetry(for: item.id)
                     if item.tusUploadID == nil {
                         await recoverTransfer(item)
                         return
@@ -392,6 +416,7 @@ final class UploadCoordinator: ObservableObject {
                     reload()
                     return
                 case "failed":
+                    cancelVerificationRetry(for: item.id)
                     item.state = .failed
                     item.lastError = "The server marked this upload as failed. Create a new upload from the original file."
                     try AppGroupQueue.save(item)
@@ -409,12 +434,61 @@ final class UploadCoordinator: ObservableObject {
                     }
                 }
             }
+            item.state = .verifying
+            item.lastError = "Server verification is still in progress. The app will check again automatically."
+            try AppGroupQueue.save(item)
+            scheduleVerificationRetry(item)
         } catch {
-            item.state = .failed
-            item.lastError = error.localizedDescription
+            // A failed status poll is not proof that the upload failed. Preserve
+            // the durable verifying state and retry on a backoff, foreground,
+            // or network-restoration signal. Only an explicit server `failed`
+            // state is terminal.
+            item.state = .verifying
+            item.lastError = "Status check will retry automatically: \(error.localizedDescription)"
             try? AppGroupQueue.save(item)
+            scheduleVerificationRetry(item)
         }
         reload()
+    }
+
+    private func reconcileVerifyingUploads(trigger: String) async {
+        reload()
+        let pending = uploads.filter { $0.state == .verifying && $0.serverSessionID != nil }
+        guard !pending.isEmpty else { return }
+        UploadDiagnostics.shared.record("verification_reconcile_triggered", context: ["trigger": trigger])
+        for item in pending {
+            cancelVerificationRetry(for: item.id)
+            await reconcile(item)
+        }
+    }
+
+    private func scheduleVerificationRetry(_ item: QueuedUpload) {
+        guard verificationRetryTasks[item.id] == nil else { return }
+        let previous = verificationRetryCounts[item.id, default: 0]
+        let exponent = min(previous, 5)
+        let delaySeconds = min(30 * (1 << exponent), 15 * 60)
+        verificationRetryCounts[item.id] = previous + 1
+        UploadDiagnostics.shared.record("verification_retry_scheduled", context: [
+            "queue_id": item.id.uuidString,
+            "session_id": item.serverSessionID ?? "",
+        ])
+        verificationRetryTasks[item.id] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delaySeconds))
+            guard !Task.isCancelled, let self else { return }
+            self.verificationRetryTasks[item.id] = nil
+            guard let current = try? AppGroupQueue.all().first(where: { $0.id == item.id }),
+                  current.state == .verifying else {
+                self.verificationRetryCounts[item.id] = nil
+                return
+            }
+            await self.reconcile(current)
+        }
+    }
+
+    private func cancelVerificationRetry(for id: UUID) {
+        verificationRetryTasks[id]?.cancel()
+        verificationRetryTasks[id] = nil
+        verificationRetryCounts[id] = nil
     }
 
     private func tusFailed(context: [String: String]?, error: Error) async {

@@ -9,4 +9,4 @@ This directory versions the edge controls that were previously only a launch-gat
 5. Exercise real TUS `OPTIONS`, `POST`, `HEAD`, and repeated `PATCH` through the public hostname. Do **not** add a low request-rate limit to `/v1/uploads/*`.
 6. Confirm no transform rule strips `Tus-Resumable`, `Upload-Offset`, `Upload-Length`, or `Upload-Metadata`.
 
-The application still enforces durable login/upload admission controls. Edge rules are defense in depth, not the sole authorization mechanism.
+The application still enforces durable login/upload admission controls and durable per-user budgets for authenticated MFA confirm/recovery/disable mutations. Edge rules are defense in depth, not the sole authorization mechanism.

@@ -14,6 +14,14 @@ env: ## Create .env from the safe example when absent
 config: env ## Validate the Compose model without starting containers
 	docker compose $(ALL_PROFILES) config --quiet
 
+.PHONY: resolve-image-digests
+resolve-image-digests: ## Resolve external Compose tags to immutable digest refs
+	bash scripts/resolve-image-digests.sh
+
+.PHONY: verify-image-digests
+verify-image-digests: ## Fail unless external Compose images are pinned by sha256 digest
+	bash scripts/verify-image-digests.sh
+
 .PHONY: db-up
 db-up: env ## Start PostgreSQL for local development
 	docker compose up -d --wait postgres
@@ -48,6 +56,16 @@ scrub: env ## Re-read and SHA-256 every committed original
 integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
 	bash scripts/integrity-cycle.sh
 
+.PHONY: manifest-verify
+manifest-verify: env ## Verify one signed manifest with the public trust key
+	@test -n "$(MANIFEST_FILE)" || (echo "usage: make manifest-verify MANIFEST_FILE=manifest-...json [MANIFEST_ARGS=...]"; exit 1)
+	docker compose --profile integrity run --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
+
+.PHONY: manifest-reconcile
+manifest-reconcile: env ## Repair a verified manifest file -> DB linkage crash window
+	@test -n "$(MANIFEST_FILE)" -a -n "$(OBJECT_KEY)" || (echo "usage: make manifest-reconcile MANIFEST_FILE=manifest-...json OBJECT_KEY=manifests/manifest-...json"; exit 1)
+	docker compose --profile integrity run --rm manifest-verify -mode reconcile -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "$(OBJECT_KEY)"
+
 .PHONY: audit-export
 audit-export: env ## Export append-only upload events to JSONL + SHA-256
 	bash scripts/export-audit.sh
@@ -64,6 +82,19 @@ restore-drill: env ## Restore a snapshot into isolation and re-hash all original
 synthetic-probe: ## Exercise login -> resumable upload -> verify -> download SHA-256
 	@test -n "$(BASE_URL)" -a -n "$(EMAIL)" -a -n "$(PASSWORD_FILE)" || (echo "usage: make synthetic-probe BASE_URL=https://... EMAIL=probe@example.com PASSWORD_FILE=/path/to/password [PROBE_ARGS=...]"; exit 1)
 	go run ./cmd/synthetic-probe -base-url "$(BASE_URL)" -email "$(EMAIL)" -password-file "$(PASSWORD_FILE)" $(PROBE_ARGS)
+
+.PHONY: synthetic-probe-docker
+synthetic-probe-docker: env ## Run the synthetic probe inside the private Docker ingress network
+	@test -n "$(EMAIL)" -a -n "$(PASSWORD_FILE)" || (echo "usage: make synthetic-probe-docker EMAIL=probe@example.com PASSWORD_FILE=/absolute/path/to/password [PROBE_ARGS=...]"; exit 1)
+	@test -f "$(PASSWORD_FILE)" || (echo "probe password file not found: $(PASSWORD_FILE)"; exit 1)
+	docker compose --profile gateway run --rm \
+		-v "$(abspath $(PASSWORD_FILE)):/run/secrets/probe-password:ro" \
+		synthetic-probe \
+		-base-url http://upload-gateway:8080 \
+		-allow-http-host upload-gateway \
+		-email "$(EMAIL)" \
+		-password-file /run/secrets/probe-password \
+		$(PROBE_ARGS)
 
 .PHONY: chaos-resume
 chaos-resume: env ## Restart the local gateway during a slow resumable upload
@@ -114,5 +145,5 @@ ios-test: ## Generate the iOS project and run simulator XCTest (requires full Xc
 	bash scripts/ios-test.sh
 
 .PHONY: integration-test
-integration-test: ## Run PostgreSQL 18 integration test without Docker
-	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go GOCACHE=$(CURDIR)/.cache/go-build go test -tags=integration -count=1 ./internal/upload
+integration-test: ## Run PostgreSQL 18 upload + account/MFA integration tests without Docker
+	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go GOCACHE=$(CURDIR)/.cache/go-build go test -tags=integration -count=1 ./internal/upload ./internal/account

@@ -56,7 +56,7 @@ readable and retry behavior must distinguish `401/403`, `429`, and transient
 - Confirm the final client and server SHA-256 values match.
 - Confirm staging objects cannot be downloaded or listed.
 - Attempt cross-user HEAD, PATCH, DELETE, and download requests.
-- Exceed the login/MFA/refresh/session-create edge thresholds and confirm a
+- Exceed the login/MFA-verify/MFA-sensitive-action/refresh/session-create edge thresholds and confirm a
   machine-readable `429`/block response without affecting healthy TUS PATCH
   resume traffic.
 - Verify Cloudflare and origin logs contain no token, filename, EXIF, or body.

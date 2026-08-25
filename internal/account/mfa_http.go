@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -115,6 +116,9 @@ func (api *API) mfaConfirm(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusConflict, "mfa_enrollment_missing", "start a new MFA enrollment before confirming")
 		return
 	}
+	if !api.allowSensitiveMFAAction(w, r, principal.UserID, "confirm") {
+		return
+	}
 	secret, err := api.mfaCipher.decrypt(principal.UserID, record.EncryptedSecret, record.Nonce)
 	if err != nil {
 		accountProblem(w, http.StatusInternalServerError, "mfa_confirm_failed", "could not confirm MFA")
@@ -138,6 +142,7 @@ func (api *API) mfaConfirm(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusConflict, "mfa_confirm_failed", "could not confirm MFA")
 		return
 	}
+	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "confirm")
 	accountJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
 }
 
@@ -221,12 +226,11 @@ func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 	if !decodeAccountJSON(w, r, &request) {
 		return
 	}
-	counter, valid, err := api.verifyCurrentTOTP(r.Context(), principal.UserID, request.TOTPCode)
-	if err != nil || !valid {
-		accountProblem(w, http.StatusUnauthorized, "invalid_mfa_code", "MFA code is invalid")
+	if !api.allowSensitiveMFAAction(w, r, principal.UserID, "recovery") {
 		return
 	}
-	if err := api.mfaRepo.AdvanceTOTPCounter(r.Context(), principal.UserID, counter); err != nil {
+	counter, valid, err := api.verifyCurrentTOTP(r.Context(), principal.UserID, request.TOTPCode)
+	if err != nil || !valid {
 		accountProblem(w, http.StatusUnauthorized, "invalid_mfa_code", "MFA code is invalid")
 		return
 	}
@@ -235,10 +239,16 @@ func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusInternalServerError, "mfa_recovery_failed", "could not generate recovery codes")
 		return
 	}
-	if err := api.mfaRepo.ReplaceRecoveryCodes(r.Context(), principal.UserID, hashes); err != nil {
+	if err := api.mfaRepo.RotateRecoveryCodes(r.Context(), principal.UserID, counter, hashes); err != nil {
+		if errors.Is(err, ErrMFAReplay) || errors.Is(err, ErrMFANotConfigured) {
+			accountProblem(w, http.StatusUnauthorized, "invalid_mfa_code", "MFA code is invalid")
+			return
+		}
+		api.logger.Error("rotate MFA recovery codes", "user_id", principal.UserID, "error", err)
 		accountProblem(w, http.StatusInternalServerError, "mfa_recovery_failed", "could not generate recovery codes")
 		return
 	}
+	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "recovery")
 	accountJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
 }
 
@@ -256,6 +266,9 @@ func (api *API) mfaDisable(w http.ResponseWriter, r *http.Request) {
 	if !decodeAccountJSON(w, r, &request) {
 		return
 	}
+	if !api.allowSensitiveMFAAction(w, r, principal.UserID, "disable") {
+		return
+	}
 	counter, valid, err := api.verifyCurrentTOTP(r.Context(), principal.UserID, request.TOTPCode)
 	if err != nil || !valid {
 		accountProblem(w, http.StatusUnauthorized, "invalid_mfa_code", "MFA code is invalid")
@@ -269,7 +282,39 @@ func (api *API) mfaDisable(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusInternalServerError, "mfa_disable_failed", "could not disable MFA")
 		return
 	}
+	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "disable")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (api *API) allowSensitiveMFAAction(w http.ResponseWriter, r *http.Request, userID, action string) bool {
+	now := api.now().UTC()
+	allowed, retryAfter, err := api.mfaRepo.RecordMFAActionAttempt(
+		r.Context(), userID, action, now, mfaActionWindow, mfaActionAttempts,
+	)
+	if err != nil {
+		api.logger.Error("record MFA action throttle", "user_id", userID, "action", action, "error", err)
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
+		return false
+	}
+	if !allowed {
+		seconds := int64(retryAfter.Round(time.Second).Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", fmt.Sprint(seconds))
+		accountProblem(w, http.StatusTooManyRequests, "mfa_rate_limited", "too many MFA attempts; try again later")
+		return false
+	}
+	return true
+}
+
+func (api *API) clearSensitiveMFAAction(ctx context.Context, userID, action string) {
+	if err := api.mfaRepo.ClearMFAActionAttempts(ctx, userID, action); err != nil {
+		// The protected action already committed. Do not turn a successful MFA
+		// mutation into a false client failure merely because limiter cleanup
+		// failed; retain the row fail-closed and surface the operational error.
+		api.logger.Error("clear MFA action throttle", "user_id", userID, "action", action, "error", err)
+	}
 }
 
 func (api *API) verifyCurrentTOTP(ctx context.Context, userID, code string) (int64, bool, error) {

@@ -73,6 +73,7 @@ func run() error {
 	timeout := flags.Duration("timeout", 2*time.Minute, "overall probe timeout")
 	chunkDelay := flags.Duration("chunk-delay", 0, "optional pause after every PATCH for chaos testing")
 	allowHTTP := flags.Bool("allow-http", false, "permit plain HTTP for loopback-only development")
+	allowHTTPHost := flags.String("allow-http-host", "", "permit plain HTTP only for this exact test-only hostname")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -83,11 +84,11 @@ func run() error {
 		return errors.New("fixture bytes must be 128 bytes..256 MiB and chunk bytes must be 1 byte..32 MiB")
 	}
 	base, err := url.Parse(*baseRaw)
-	if err != nil || base.Host == "" || (base.Scheme != "https" && !(*allowHTTP && base.Scheme == "http")) {
-		return errors.New("base URL must be HTTPS, or explicit loopback HTTP with -allow-http")
+	if err != nil || base.Host == "" || (base.Scheme != "https" && base.Scheme != "http") {
+		return errors.New("base URL must use HTTPS or explicitly authorized test-only HTTP")
 	}
-	if base.Scheme == "http" && !isLoopbackHost(base.Hostname()) {
-		return errors.New("plain HTTP probe is allowed only for loopback hosts")
+	if base.Scheme == "http" && !httpHostAllowed(base.Hostname(), *allowHTTP, *allowHTTPHost) {
+		return errors.New("plain HTTP probe requires -allow-http for loopback or an exact -allow-http-host test hostname")
 	}
 	passwordBytes, err := os.ReadFile(*passwordFile)
 	if err != nil {
@@ -443,4 +444,18 @@ func makeFixture(size int64) []byte {
 
 func isLoopbackHost(host string) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func httpHostAllowed(host string, allowLoopback bool, exactTestHost string) bool {
+	if allowLoopback && isLoopbackHost(host) {
+		return true
+	}
+	exactTestHost = strings.TrimSpace(exactTestHost)
+	if exactTestHost == "" {
+		return false
+	}
+	// This escape hatch is deliberately exact-match only. It exists for a
+	// disposable Docker network where host port forwarding is unavailable; it
+	// must never turn into a generic RFC1918/plain-HTTP exception.
+	return strings.EqualFold(host, exactTestHost)
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Restore the latest Family Photo Cloud restic snapshot into an isolated
-# directory and disposable PostgreSQL container. This does not touch the live
-# database or media tree.
+# Restore a Family Photo Cloud restic snapshot into an isolated directory and
+# disposable PostgreSQL container. The drill verifies database/media hashes and
+# every signed-manifest signature/linkage without touching live state.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,6 +79,51 @@ if [[ "$asset_count" != "0" ]]; then
     "SELECT storage_key, encode(content_sha256,'hex'), byte_size FROM assets WHERE deleted_at IS NULL ORDER BY id")
 fi
 
+manifests_verified=0
+if [[ "$manifest_count" != "0" ]]; then
+  public_key_path="${MANIFEST_PUBLIC_KEY_HOST_PATH:-$repo_root/.data/secrets/manifest-ed25519-public.pem}"
+  [[ -r "$public_key_path" ]] || { echo "manifest public verification key is required for restore drill: $public_key_path" >&2; exit 2; }
+
+  mapfile -t restored_manifest_dirs < <(find "$target" -type d -name manifests -print)
+  if [[ ${#restored_manifest_dirs[@]} -ne 1 ]]; then
+    echo "expected exactly one restored manifests directory, found ${#restored_manifest_dirs[@]}" >&2
+    exit 1
+  fi
+  restored_manifest_root="${restored_manifest_dirs[0]}"
+  restored_manifest_count="$(find "$restored_manifest_root" -maxdepth 1 -type f -name 'manifest-*.json' -print | wc -l | tr -d ' ')"
+  if [[ "$restored_manifest_count" != "$manifest_count" ]]; then
+    echo "signed manifest file/DB count mismatch: files=$restored_manifest_count db=$manifest_count" >&2
+    exit 1
+  fi
+
+  # Build once, then run the public-key-only verifier without starting live DB
+  # dependencies. Each DB row is asserted against the exact signed file.
+  docker compose --profile integrity build manifest-verify >/dev/null
+  while IFS=$'\t' read -r version object_key db_asset_count payload_hex key_id signature_hex; do
+    [[ "$object_key" == manifests/* ]] || { echo "unexpected manifest object key: $object_key" >&2; exit 1; }
+    relative="${object_key#manifests/}"
+    [[ -n "$relative" && "$relative" != */* && "$relative" != "." && "$relative" != ".." ]] || {
+      echo "unsafe manifest object key: $object_key" >&2
+      exit 1
+    }
+    manifest_file="$restored_manifest_root/$relative"
+    [[ -f "$manifest_file" ]] || { echo "restored manifest missing for DB row: $object_key" >&2; exit 1; }
+
+    docker compose --profile integrity run --rm --no-deps \
+      -v "$manifest_file:/verify/manifest.json:ro" \
+      manifest-verify \
+      -mode verify \
+      -input /verify/manifest.json \
+      -expected-version "$version" \
+      -expected-asset-count "$db_asset_count" \
+      -expected-payload-sha256 "$payload_hex" \
+      -expected-key-id "$key_id" \
+      -expected-signature-hex "$signature_hex"
+    manifests_verified=$((manifests_verified + 1))
+  done < <(docker exec -e PGPASSWORD="$password" "$container" psql -At -F $'\t' -U photo_cloud -d photo_cloud -c \
+    "SELECT manifest_version, object_key, asset_count, encode(payload_sha256,'hex'), signing_key_id, encode(signature,'hex') FROM signed_manifests ORDER BY generated_at, id")
+fi
+
 report="$target/restore-drill-report.txt"
 {
   printf 'completed_at=%s\n' "$stamp"
@@ -86,7 +131,8 @@ report="$target/restore-drill-report.txt"
   printf 'asset_rows=%s\n' "$asset_count"
   printf 'assets_rehashed=%s\n' "$checked"
   printf 'signed_manifests=%s\n' "$manifest_count"
+  printf 'manifests_verified=%s\n' "$manifests_verified"
   printf 'result=PASS\n'
 } > "$report"
 chmod 600 "$report"
-printf 'PASS restore drill: %s assets restored and rehashed; report=%s\n' "$checked" "$report"
+printf 'PASS restore drill: %s assets rehashed, %s signed manifests verified; report=%s\n' "$checked" "$manifests_verified" "$report"
