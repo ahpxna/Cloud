@@ -24,6 +24,17 @@ type memoryAccountRepository struct {
 	nextID   int
 }
 
+func (repository *memoryAccountRepository) SessionActive(_ context.Context, _ string, sessionID string) (bool, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	for _, id := range repository.sessions {
+		if id == sessionID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (repository *memoryAccountRepository) ListDeviceSessions(_ context.Context, _ string) ([]DeviceSession, error) {
 	return nil, nil
 }
@@ -138,6 +149,55 @@ func TestLoginRefreshRotationAndLogout(t *testing.T) {
 	logout.Body.Close()
 	if logout.StatusCode != http.StatusNoContent {
 		t.Fatalf("logout status = %d", logout.StatusCode)
+	}
+}
+
+func TestRevokedSessionRejectsPreviouslyIssuedAccessTokenImmediately(t *testing.T) {
+	passwordHash, err := HashPassword("a strong family password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &memoryAccountRepository{user: User{ID: "10000000-0000-4000-8000-000000000001", Email: "parent@example.com", PasswordHash: passwordHash}, sessions: make(map[[32]byte]string)}
+	tokens, err := auth.NewAccessTokenManager([]byte(strings.Repeat("k", 32)), auth.DefaultIssuer, auth.DefaultAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(repository, tokens, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := httptest.NewServer(api)
+	defer server.Close()
+	login := postAccountJSON(t, server, "/v1/auth/login", `{"email":"parent@example.com","password":"a strong family password","device_name":"iPhone"}`)
+	tokensIssued := decodeTokenResponse(t, login)
+	principal, err := tokens.Verify(tokensIssued.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/v1/auth/sessions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+tokensIssued.AccessToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("active access token status=%d", response.StatusCode)
+	}
+	repository.mu.Lock()
+	for hash, id := range repository.sessions {
+		if id == principal.SessionID {
+			delete(repository.sessions, hash)
+		}
+	}
+	repository.mu.Unlock()
+	response, err = server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked access token status=%d want 401", response.StatusCode)
 	}
 }
 

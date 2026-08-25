@@ -248,7 +248,7 @@ func loadAndVerifyManifest(inputPath string) (verifiedManifest, error) {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return verifiedManifest{}, errors.New("manifest contains trailing JSON values")
 	}
-	publicKey, err := publicKeyFromEnvironment()
+	publicKey, err := publicKeyForManifest(manifest.SigningKeyID)
 	if err != nil {
 		return verifiedManifest{}, err
 	}
@@ -385,6 +385,49 @@ func privateKeyFromEnvironment() (ed25519.PrivateKey, error) {
 	return ed25519.PrivateKey(decoded), nil
 }
 
+func publicKeyForManifest(keyID string) (ed25519.PublicKey, error) {
+	if keyring := os.Getenv("MANIFEST_PUBLIC_KEYRING_DIR"); keyring != "" {
+		if !safeKeyID(keyID) {
+			return nil, errors.New("manifest signing key ID is unsafe for keyring lookup")
+		}
+		return publicKeyFromPEMFile(filepath.Join(keyring, keyID+".pem"))
+	}
+	return publicKeyFromEnvironment()
+}
+
+func safeKeyID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') &&
+			!(character >= '0' && character <= '9') && character != '-' && character != '_' && character != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func publicKeyFromPEMFile(keyPath string) (ed25519.PublicKey, error) {
+	encoded, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest verification key: %w", err)
+	}
+	block, _ := pem.Decode(encoded)
+	if block == nil {
+		return nil, errors.New("manifest verification key is not PEM")
+	}
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse manifest verification key: %w", err)
+	}
+	publicKey, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		return nil, errors.New("manifest verification key is not Ed25519")
+	}
+	return publicKey, nil
+}
+
 func publicKeyFromEnvironment() (ed25519.PublicKey, error) {
 	keyPath := os.Getenv("MANIFEST_ED25519_PUBLIC_KEY_FILE")
 	raw := os.Getenv("MANIFEST_ED25519_PUBLIC_KEY_BASE64")
@@ -392,23 +435,7 @@ func publicKeyFromEnvironment() (ed25519.PublicKey, error) {
 		return nil, errors.New("set only one of MANIFEST_ED25519_PUBLIC_KEY_FILE or MANIFEST_ED25519_PUBLIC_KEY_BASE64")
 	}
 	if keyPath != "" {
-		encoded, err := os.ReadFile(keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("read manifest verification key: %w", err)
-		}
-		block, _ := pem.Decode(encoded)
-		if block == nil {
-			return nil, errors.New("manifest verification key is not PEM")
-		}
-		parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse manifest verification key: %w", err)
-		}
-		publicKey, ok := parsed.(ed25519.PublicKey)
-		if !ok {
-			return nil, errors.New("manifest verification key is not Ed25519")
-		}
-		return publicKey, nil
+		return publicKeyFromPEMFile(keyPath)
 	}
 	if raw == "" {
 		return nil, errors.New("MANIFEST_ED25519_PUBLIC_KEY_FILE or MANIFEST_ED25519_PUBLIC_KEY_BASE64 is required")

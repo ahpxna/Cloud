@@ -202,7 +202,11 @@ func (api *API) accessPrincipal(r *http.Request) (auth.Principal, bool) {
 		return auth.Principal{}, false
 	}
 	principal, err := api.tokens.Verify(parts[1])
-	return principal, err == nil
+	if err != nil {
+		return auth.Principal{}, false
+	}
+	active, err := api.repository.SessionActive(r.Context(), principal.UserID, principal.SessionID)
+	return principal, err == nil && active
 }
 
 func (api *API) login(w http.ResponseWriter, r *http.Request) {

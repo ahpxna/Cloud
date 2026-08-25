@@ -68,12 +68,12 @@ func TestUploadCapabilityIsScopedAndNotAcceptedAsAccessToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := manager.IssueUpload("user-a", "upload-a", time.Now(), time.Hour)
+	raw, err := manager.IssueUpload("user-a", "session-a", "upload-a", time.Now(), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	principal, err := manager.VerifyUpload(raw)
-	if err != nil || principal.UserID != "user-a" || principal.UploadID != "upload-a" || principal.SessionID != "" {
+	if err != nil || principal.UserID != "user-a" || principal.UploadID != "upload-a" || principal.SessionID != "session-a" {
 		t.Fatalf("upload principal = %#v, err=%v", principal, err)
 	}
 	if _, err := manager.Verify(raw); err == nil {

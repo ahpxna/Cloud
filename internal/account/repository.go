@@ -37,6 +37,7 @@ type Repository interface {
 	RevokeRefreshSession(context.Context, [32]byte) error
 	ListDeviceSessions(context.Context, string) ([]DeviceSession, error)
 	RevokeDeviceSession(context.Context, string, string) error
+	SessionActive(context.Context, string, string) (bool, error)
 }
 
 // LoginThrottleRepository persists identity throttling independently of the
@@ -53,6 +54,16 @@ type PostgresRepository struct {
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
+}
+
+func (r *PostgresRepository) SessionActive(ctx context.Context, userID, sessionID string) (bool, error) {
+	var active bool
+	err := r.pool.QueryRow(ctx, `SELECT EXISTS (
+        SELECT 1 FROM user_sessions
+        WHERE id = $1::uuid AND user_id = $2::uuid
+          AND revoked_at IS NULL AND expires_at > now()
+    )`, sessionID, userID).Scan(&active)
+	return active, err
 }
 
 func (r *PostgresRepository) ActiveUserByEmail(ctx context.Context, email string) (User, error) {
@@ -724,6 +735,12 @@ func (r *PostgresRepository) DisableMFA(ctx context.Context, userID string, coun
 	}
 	if command.RowsAffected() != 1 {
 		return ErrMFANotConfigured
+	}
+	if _, err := tx.Exec(ctx, `
+        UPDATE user_sessions
+        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
+        WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

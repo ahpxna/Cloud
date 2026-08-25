@@ -39,8 +39,9 @@ type AccessClaims struct {
 }
 
 type UploadClaims struct {
-	UserID   string `json:"uid"`
-	UploadID string `json:"upid"`
+	UserID    string `json:"uid"`
+	SessionID string `json:"sid"`
+	UploadID  string `json:"upid"`
 	jwt.RegisteredClaims
 }
 
@@ -117,16 +118,15 @@ func (m *AccessTokenManager) Verify(raw string) (Principal, error) {
 	return Principal{UserID: claims.UserID, SessionID: claims.SessionID}, nil
 }
 
-func (m *AccessTokenManager) IssueUpload(ownerID, uploadID string, now time.Time, ttl time.Duration) (string, error) {
-	if ownerID == "" || uploadID == "" {
-		return "", errors.New("owner and upload IDs are required")
+func (m *AccessTokenManager) IssueUpload(ownerID, sessionID, uploadID string, now time.Time, ttl time.Duration) (string, error) {
+	if ownerID == "" || sessionID == "" || uploadID == "" {
+		return "", errors.New("owner, session, and upload IDs are required")
 	}
 	if ttl <= 0 || ttl > 8*24*time.Hour {
 		return "", errors.New("upload-token TTL must be between zero and eight days")
 	}
 	claims := UploadClaims{
-		UserID:   ownerID,
-		UploadID: uploadID,
+		UserID: ownerID, SessionID: sessionID, UploadID: uploadID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    m.issuer,
 			Subject:   ownerID,
@@ -160,8 +160,8 @@ func (m *AccessTokenManager) VerifyUpload(raw string) (Principal, error) {
 	if err != nil || !token.Valid {
 		return Principal{}, errors.New("invalid upload token")
 	}
-	if claims.UserID == "" || claims.UploadID == "" || claims.Subject != claims.UserID {
+	if claims.UserID == "" || claims.SessionID == "" || claims.UploadID == "" || claims.Subject != claims.UserID {
 		return Principal{}, errors.New("invalid upload-token identity")
 	}
-	return Principal{UserID: claims.UserID, UploadID: claims.UploadID}, nil
+	return Principal{UserID: claims.UserID, SessionID: claims.SessionID, UploadID: claims.UploadID}, nil
 }

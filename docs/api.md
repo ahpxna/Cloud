@@ -40,8 +40,9 @@ All MFA state is server-side. TOTP secrets are encrypted with the independent
 only as SHA-256 hashes. TOTP verification accepts the adjacent ±1 30-second
 window and stores the last accepted counter to reject replay.
 
-- `POST /v1/auth/mfa/enroll` requires an access token and returns a new base32
-  secret plus `otpauth_uri`. It invalidates any unconfirmed previous enrollment.
+- `POST /v1/auth/mfa/enroll` requires an active access-token session **and the
+  current password** (`password`), then returns a new base32 secret plus
+  `otpauth_uri`. It invalidates any unconfirmed previous enrollment.
 - `POST /v1/auth/mfa/confirm` requires an access token and the current
   `totp_code`; on success it returns the one-time recovery-code set.
 - `POST /v1/auth/mfa/verify` is the only unauthenticated MFA route. Send the
@@ -112,7 +113,8 @@ that the capability is scoped to that exact session; a different user receives
 most 32 MiB, and returns `429 Retry-After: 2` when concurrency capacity is full.
 Upload capabilities expire after at most 10 minutes (even though the upload
 session may live longer); TUSKit fetches a fresh scoped capability before a
-network request. This limits the damage window after device-session revocation.
+network request. They carry the originating device session and are rejected
+immediately once that session is revoked.
 
 TUSKit persists its applied custom headers. Therefore it must persist this
 scoped upload capability, never the general 15-minute access token. If the app

@@ -201,7 +201,7 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		status = http.StatusCreated
 	}
 	tokenNow := api.now().UTC()
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, tokenNow, uploadCapabilityTTL(session.ExpiresAt.Sub(tokenNow)))
+	uploadToken, err := api.tokens.IssueUpload(principal.UserID, principal.SessionID, session.ID, tokenNow, uploadCapabilityTTL(session.ExpiresAt.Sub(tokenNow)))
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "upload_token_failed", "could not issue upload capability")
 		return
@@ -272,7 +272,7 @@ func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Princ
 		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
 		return
 	}
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, session.ID, now, uploadCapabilityTTL(session.ExpiresAt.Sub(now)))
+	uploadToken, err := api.tokens.IssueUpload(principal.UserID, principal.SessionID, session.ID, now, uploadCapabilityTTL(session.ExpiresAt.Sub(now)))
 	if err != nil {
 		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
 		return

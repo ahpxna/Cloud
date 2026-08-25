@@ -128,3 +128,40 @@ func TestPublicKeyLoadsAndManifestVerificationChecksDatabaseEvidence(t *testing.
 		t.Fatal("mismatched database payload hash was accepted")
 	}
 }
+
+func TestKeyringVerifiesHistoricalManifestsAfterRotation(t *testing.T) {
+	keyring := t.TempDir()
+	for _, keyID := range []string{"key-a", "key-b"} {
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalPKIXPublicKey(publicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(keyring, keyID+".pem"), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := integrity.NewManifest(time.Now().UTC(), keyID, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manifest.Sign(privateKey); err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), keyID+".json")
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("MANIFEST_PUBLIC_KEYRING_DIR", keyring)
+		t.Setenv("MANIFEST_ED25519_PUBLIC_KEY_FILE", "")
+		if _, err := loadAndVerifyManifest(path); err != nil {
+			t.Fatalf("verify manifest signed by %s: %v", keyID, err)
+		}
+	}
+}

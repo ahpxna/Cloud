@@ -223,10 +223,12 @@ services:
       PGUSER: ${POSTGRES_USER:-photo_cloud}
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       MANIFEST_ED25519_PUBLIC_KEY_FILE: /run/secrets/manifest-ed25519-public.pem
+      MANIFEST_PUBLIC_KEYRING_DIR: /run/trust/manifest-public-keyring
     networks: [database]
     volumes:
       - ${MANIFEST_OUTPUT_DIR:-./.data/manifests}:/manifests:ro
       - ${MANIFEST_PUBLIC_KEY_HOST_PATH:-./.data/secrets/manifest-ed25519-public.pem}:/run/secrets/manifest-ed25519-public.pem:ro
+      - ${MANIFEST_PUBLIC_KEYRING_HOST_PATH:-./.data/secrets/manifest-public-keyring}:/run/trust/manifest-public-keyring:ro
     depends_on:
       postgres:
         condition: service_healthy

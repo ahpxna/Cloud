@@ -81,8 +81,8 @@ fi
 
 manifests_verified=0
 if [[ "$manifest_count" != "0" ]]; then
-  public_key_path="${MANIFEST_PUBLIC_KEY_HOST_PATH:-$repo_root/.data/secrets/manifest-ed25519-public.pem}"
-  [[ -r "$public_key_path" ]] || { echo "manifest public verification key is required for restore drill: $public_key_path" >&2; exit 2; }
+  keyring_path="${MANIFEST_PUBLIC_KEYRING_HOST_PATH:-$repo_root/.data/secrets/manifest-public-keyring}"
+  [[ -d "$keyring_path" ]] || { echo "manifest public keyring is required for restore drill: $keyring_path" >&2; exit 2; }
 
   mapfile -t restored_manifest_dirs < <(find "$target" -type d -name manifests -print)
   if [[ ${#restored_manifest_dirs[@]} -ne 1 ]]; then

@@ -350,14 +350,14 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	mux.Handle("/v1/assets", authenticate(config.Tokens, libraryAPI))
-	mux.Handle("/v1/assets/", authenticate(config.Tokens, libraryAPI))
-	mux.Handle("/v1/upload-sessions", authenticate(config.Tokens, uploadAPI))
-	mux.Handle("/v1/upload-sessions/", authenticate(config.Tokens, uploadAPI))
+	mux.Handle("/v1/assets", authenticate(config.Tokens, config.Accounts, libraryAPI))
+	mux.Handle("/v1/assets/", authenticate(config.Tokens, config.Accounts, libraryAPI))
+	mux.Handle("/v1/upload-sessions", authenticate(config.Tokens, config.Accounts, uploadAPI))
+	mux.Handle("/v1/upload-sessions/", authenticate(config.Tokens, config.Accounts, uploadAPI))
 
 	strippedTus := http.StripPrefix(strings.TrimSuffix(tusBasePath, "/"), tusHandler)
 	limiter := newPatchLimiter(config.MaxConcurrentPatches, config.MaxPatchesPerUser)
-	protectedTus := lockPatches(resourceLocks, authenticateTus(config.Tokens, config.Repository, limiter, config.ChunkBytes, strippedTus))
+	protectedTus := lockPatches(resourceLocks, authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus))
 	mux.Handle(strings.TrimSuffix(tusBasePath, "/"), protectedTus)
 	mux.Handle(tusBasePath, protectedTus)
 	server.handler = securityHeaders(mux)
@@ -467,12 +467,19 @@ func processWithLease(
 	return err
 }
 
-func authenticate(tokens *auth.AccessTokenManager, next http.Handler) http.Handler {
+func authenticate(tokens *auth.AccessTokenManager, accounts account.Repository, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := authenticateHeader(tokens, r.Header.Get("Authorization"))
 		if !ok {
 			writeAuthError(w)
 			return
+		}
+		if accounts != nil {
+			active, err := accounts.SessionActive(r.Context(), principal.UserID, principal.SessionID)
+			if err != nil || !active {
+				writeAuthError(w)
+				return
+			}
 		}
 		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
 	})
@@ -480,6 +487,7 @@ func authenticate(tokens *auth.AccessTokenManager, next http.Handler) http.Handl
 
 func authenticateTus(
 	tokens *auth.AccessTokenManager,
+	accounts account.Repository,
 	repository upload.Repository,
 	limiter *patchLimiter,
 	maxPatchBytes int64,
@@ -494,6 +502,13 @@ func authenticateTus(
 		if !ok {
 			writeAuthError(w)
 			return
+		}
+		if accounts != nil {
+			active, err := accounts.SessionActive(r.Context(), principal.UserID, principal.SessionID)
+			if err != nil || !active {
+				writeAuthError(w)
+				return
+			}
 		}
 
 		resourceID := strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(tusBasePath, "/"))

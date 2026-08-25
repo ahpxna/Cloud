@@ -19,6 +19,10 @@ type mfaCodeRequest struct {
 	TOTPCode string `json:"totp_code"`
 }
 
+type mfaEnrollRequest struct {
+	Password string `json:"password"`
+}
+
 func (api *API) issueMFAChallenge(w http.ResponseWriter, ctx context.Context, user User, deviceName string) {
 	if api.mfaRepo == nil {
 		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
@@ -57,6 +61,14 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is unavailable")
 		return
 	}
+	var request mfaEnrollRequest
+	if !decodeAccountJSON(w, r, &request) {
+		return
+	}
+	if len(request.Password) == 0 || len(request.Password) > 1024 {
+		accountProblem(w, http.StatusUnauthorized, "recent_auth_required", "password re-authentication is required to enroll MFA")
+		return
+	}
 	if record, err := api.mfaRepo.TOTPForUser(r.Context(), principal.UserID); err == nil && record.ConfirmedAt != nil {
 		accountProblem(w, http.StatusConflict, "mfa_already_enabled", "disable existing MFA before enrolling a new authenticator")
 		return
@@ -67,6 +79,11 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 	user, err := api.mfaRepo.MFAUserByID(r.Context(), principal.UserID)
 	if err != nil {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
+		return
+	}
+	valid, err := VerifyPassword(user.PasswordHash, request.Password)
+	if err != nil || !valid {
+		accountProblem(w, http.StatusUnauthorized, "recent_auth_required", "password re-authentication is required to enroll MFA")
 		return
 	}
 	secret, encoded, err := newTOTPSecret()
