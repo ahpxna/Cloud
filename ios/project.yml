@@ -37,6 +37,9 @@ targets:
       - package: TUSKit
       - target: FamilyPhotoCloudShare
         embed: true
+    scheme:
+      testTargets:
+        - FamilyPhotoCloudTests
 
   FamilyPhotoCloudShare:
     type: app-extension

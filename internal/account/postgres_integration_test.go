@@ -71,7 +71,7 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 		t.Fatal("confirming MFA left a pre-MFA refresh session active")
 	}
 
-	allowed, _, err := repository.RecordMFAActionAttempt(ctx, userID, "enroll", now, mfaActionWindow, mfaActionAttempts)
+	allowed, _, err = repository.RecordMFAActionAttempt(ctx, userID, "enroll", now, mfaActionWindow, mfaActionAttempts)
 	if err != nil || !allowed {
 		t.Fatalf("MFA enroll throttle: allowed=%v err=%v", allowed, err)
 	}
