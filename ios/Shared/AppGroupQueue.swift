@@ -102,7 +102,7 @@ enum AppGroupQueue {
 
     static func all(in root: URL) throws -> [QueuedUpload] {
         let records = root.appending(path: "records", directoryHint: .isDirectory)
-        guard FileManager.default.fileExists(atPath: records.path()) else { return [] }
+        try createProtectedDirectory(records)
         let files = try FileManager.default.contentsOfDirectory(
             at: records,
             includingPropertiesForKeys: nil,
