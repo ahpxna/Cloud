@@ -15,6 +15,7 @@ load_dotenv "$repo_root/.env"
 
 : "${RESTIC_REPOSITORY:?set RESTIC_REPOSITORY to an encrypted off-site repository}"
 : "${RESTIC_PASSWORD_FILE:?set RESTIC_PASSWORD_FILE to a protected password file}"
+: "${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD for least-privilege database backup}"
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 2; }
 command -v restic >/dev/null 2>&1 || { echo "restic is required" >&2; exit 2; }
@@ -50,11 +51,13 @@ if docker compose ps --status running --services 2>/dev/null | grep -qx 'upload-
   started_gateway=1
 fi
 
-# pg_dump runs inside the trusted database container; secrets remain in Compose
-# environment and are not copied to the host command line.
+# pg_dump uses a dedicated read-only backup role; observability credentials do
+# not get access to auth/session tables. The password is injected only into the
+# exec environment.
 echo "Creating PostgreSQL custom-format dump..."
-docker compose exec -T postgres sh -ec \
-  'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --format=custom --no-owner --no-acl --dbname="$POSTGRES_DB" --username="$POSTGRES_USER"' \
+docker compose exec -T -e PGPASSWORD="$BACKUP_DB_PASSWORD" postgres \
+  pg_dump --format=custom --no-owner --no-acl \
+  --dbname="${POSTGRES_DB:-photo_cloud}" --username=photo_cloud_backup \
   > "$dump"
 [[ -s "$dump" ]] || { echo "database dump is empty" >&2; exit 1; }
 chmod 600 "$dump"

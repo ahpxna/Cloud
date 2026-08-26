@@ -37,15 +37,22 @@ enum AvailableUploadFinalizer {
 
 enum HashWorker {
     static func sha256(of url: URL) async throws -> String {
-        try await Task.detached(priority: .utility) {
+        let worker = Task.detached(priority: .utility) { () throws -> String in
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             var hasher = SHA256()
             while let data = try handle.read(upToCount: 1 << 20), !data.isEmpty {
+                try Task.checkCancellation()
                 hasher.update(data: data)
             }
+            try Task.checkCancellation()
             return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
     }
 }
 
@@ -58,6 +65,7 @@ final class UploadCoordinator: ObservableObject {
     @Published private(set) var mfaExpiresAt: Date?
     @Published private(set) var mfaEnrollment: MFAEnrollment?
     @Published private(set) var mfaRecoveryCodes: [String] = []
+    @Published private(set) var deviceSessions: [DeviceSession] = []
     @Published private(set) var lastError: String?
 
     private let api: PhotoCloudAPI
@@ -202,6 +210,61 @@ final class UploadCoordinator: ObservableObject {
         }
     }
 
+    func refreshDeviceSessions() async {
+        do {
+            let accessToken = try await auth.accessToken(api: api)
+            deviceSessions = try await api.deviceSessions(accessToken: accessToken)
+            lastError = nil
+        } catch let problem as APIProblem where problem.status == 401 {
+            try? await auth.invalidateCredential()
+            deviceSessions = []
+            lastError = "Your session expired. Sign in again."
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func revokeDeviceSession(_ session: DeviceSession) async {
+        do {
+            let accessToken = try await auth.accessToken(api: api)
+            try await api.revokeDeviceSession(id: session.id, accessToken: accessToken)
+            if session.current {
+                try await auth.invalidateCredential()
+                deviceSessions = []
+                lastError = "This device session was revoked. Sign in again to continue."
+            } else {
+                await refreshDeviceSessions()
+            }
+        } catch let problem as APIProblem where problem.status == 401 {
+            try? await auth.invalidateCredential()
+            deviceSessions = []
+            lastError = "Your session expired. Sign in again."
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func signOut() async {
+        do {
+            try await auth.signOut(api: api)
+            deviceSessions = []
+            mfaChallenge = nil
+            mfaExpiresAt = nil
+            mfaEnrollment = nil
+            mfaRecoveryCodes = []
+            lastError = nil
+        } catch {
+            // AuthenticationStore clears Keychain/in-memory credentials even if
+            // the remote revoke fails, so the device is still signed out locally.
+            deviceSessions = []
+            mfaChallenge = nil
+            mfaExpiresAt = nil
+            mfaEnrollment = nil
+            mfaRecoveryCodes = []
+            lastError = "Signed out locally, but the server session could not be revoked: \(error.localizedDescription)"
+        }
+    }
+
     func recoverQuarantinedRecord(_ record: QuarantinedQueueRecord) async {
         do {
             let recovered = try AppGroupQueue.recoverQuarantinedRecord(record)
@@ -321,7 +384,9 @@ final class UploadCoordinator: ObservableObject {
                 item.state = .transferring
                 item.lastError = nil
                 try AppGroupQueue.save(item)
-                try transport.resumeStoredUpload(id: storedID)
+                // TUSUploadTransport.resumeStoredUploads() already asked TUSKit
+                // to reconcile the background session. Do not call resume(id:)
+                // again here or a relaunch can schedule the same upload twice.
             default:
                 await reconcile(item)
                 return

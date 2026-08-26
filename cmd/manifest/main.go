@@ -54,7 +54,7 @@ func run() error {
 	case "sign":
 		return signManifest(*outputPath, *objectKey)
 	case "verify":
-		return verifyManifestFile(*inputPath, manifestExpectations{
+		return verifyManifestFile(*inputPath, *objectKey, manifestExpectations{
 			Version:      *expectedVersion,
 			AssetCount:   *expectedAssetCount,
 			PayloadHash:  *expectedPayloadHash,
@@ -75,13 +75,24 @@ func signManifest(outputPath, objectKey string) error {
 	if err := validateManifestObjectKey(objectKey); err != nil {
 		return err
 	}
+	if err := validateManifestFileBinding(outputPath, objectKey); err != nil {
+		return err
+	}
 	privateKey, err := privateKeyFromEnvironment()
 	if err != nil {
 		return err
 	}
 	keyID := os.Getenv("MANIFEST_SIGNING_KEY_ID")
-	if keyID == "" {
-		return errors.New("MANIFEST_SIGNING_KEY_ID is required")
+	if !safeKeyID(keyID) {
+		return errors.New("MANIFEST_SIGNING_KEY_ID must be a safe keyring identifier")
+	}
+	trustedPublicKey, err := publicKeyForManifest(keyID)
+	if err != nil {
+		return fmt.Errorf("load public key for signing key ID %q: %w", keyID, err)
+	}
+	privatePublicKey, ok := privateKey.Public().(ed25519.PublicKey)
+	if !ok || !privatePublicKey.Equal(trustedPublicKey) {
+		return fmt.Errorf("manifest private key does not match public keyring entry for signing key ID %q", keyID)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -156,7 +167,13 @@ type verifiedManifest struct {
 	Signature   []byte
 }
 
-func verifyManifestFile(inputPath string, expected manifestExpectations) error {
+func verifyManifestFile(inputPath, objectKey string, expected manifestExpectations) error {
+	if inputPath == "" || objectKey == "" {
+		return errors.New("verify mode requires -input /path/manifest.json and -object-key manifests/manifest.json")
+	}
+	if err := validateManifestFileBinding(inputPath, objectKey); err != nil {
+		return err
+	}
 	verified, err := loadAndVerifyManifest(inputPath)
 	if err != nil {
 		return err
@@ -176,6 +193,9 @@ func reconcileManifestFile(inputPath, objectKey string) error {
 		return errors.New("reconcile mode requires -input /path/manifest.json and -object-key manifests/manifest.json")
 	}
 	if err := validateManifestObjectKey(objectKey); err != nil {
+		return err
+	}
+	if err := validateManifestFileBinding(inputPath, objectKey); err != nil {
 		return err
 	}
 	verified, err := loadAndVerifyManifest(inputPath)
@@ -304,6 +324,20 @@ func validateManifestObjectKey(objectKey string) error {
 	relative := strings.TrimPrefix(objectKey, "manifests/")
 	if relative == "" || relative == "." || relative == ".." || strings.Contains(relative, "/") || filepath.Base(relative) != relative {
 		return errors.New("manifest object key must identify one file directly under manifests/")
+	}
+	return nil
+}
+
+func validateManifestFileBinding(path, objectKey string) error {
+	if err := validateManifestObjectKey(objectKey); err != nil {
+		return err
+	}
+	if path == "" {
+		return errors.New("manifest file path is required")
+	}
+	expected := strings.TrimPrefix(objectKey, "manifests/")
+	if filepath.Base(filepath.Clean(path)) != expected {
+		return fmt.Errorf("manifest object key %q must match file name %q", objectKey, filepath.Base(filepath.Clean(path)))
 	}
 	return nil
 }

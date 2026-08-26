@@ -43,10 +43,11 @@ type API struct {
 }
 
 type SecurityConfig struct {
-	LoginThrottleHMACKey []byte
-	GlobalLoginRate      float64
-	GlobalLoginBurst     int
-	MFAEncryptionKey     []byte
+	LoginThrottleHMACKey      []byte
+	GlobalLoginRate           float64
+	GlobalLoginBurst          int
+	MFAEncryptionKey          []byte
+	RefreshRetryEncryptionKey []byte
 }
 
 func NewAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog.Logger) *API {
@@ -75,6 +76,9 @@ func NewSecureAPI(repository Repository, tokens *auth.AccessTokenManager, logger
 	if err != nil {
 		return nil, err
 	}
+	if len(config.RefreshRetryEncryptionKey) != 32 {
+		return nil, errors.New("refresh retry encryption key must contain exactly 32 bytes")
+	}
 	api, err := newAPI(repository, tokens, logger, config)
 	if err != nil {
 		return nil, err
@@ -98,13 +102,16 @@ func newAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog
 	if config.GlobalLoginBurst <= 0 {
 		config.GlobalLoginBurst = 20
 	}
-	// Refresh retry ciphertext only needs to survive a brief lost-response
-	// window. Keep its key process-local instead of coupling recoverable refresh
-	// secrets to any long-lived operator key. A restart intentionally invalidates
-	// the retry cache while leaving normal hashed refresh sessions intact.
-	refreshKey := make([]byte, 32)
-	if _, err := rand.Read(refreshKey); err != nil {
-		return nil, fmt.Errorf("construct refresh retry cipher: %w", err)
+	// Production supplies a persistent, independent key so an in-flight refresh
+	// retry remains decryptable across a gateway crash/restart. Unit-test callers
+	// that use NewAPI receive an ephemeral key because they do not persist retry
+	// capsules across processes. Never reuse the access-token or MFA key here.
+	refreshKey := append([]byte(nil), config.RefreshRetryEncryptionKey...)
+	if len(refreshKey) == 0 {
+		refreshKey = make([]byte, 32)
+		if _, err := rand.Read(refreshKey); err != nil {
+			return nil, fmt.Errorf("construct refresh retry cipher: %w", err)
+		}
 	}
 	refreshCipher, err := newMFACipher(refreshKey)
 	for index := range refreshKey {
@@ -207,6 +214,9 @@ func (api *API) listSessions(w http.ResponseWriter, r *http.Request) {
 		api.logger.Error("list device sessions", "user_id", principal.UserID, "error", err)
 		accountProblem(w, http.StatusInternalServerError, "session_list_failed", "could not list signed-in devices")
 		return
+	}
+	for index := range sessions {
+		sessions[index].Current = sessions[index].ID == principal.SessionID
 	}
 	accountJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }

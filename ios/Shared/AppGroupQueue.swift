@@ -13,15 +13,18 @@ struct QueueRecoveryHooks {
     let afterPayloadMove: () throws -> Void
     let afterRecordWrite: () throws -> Void
     let beforeSourceRecordRemoval: () throws -> Void
+    let beforeRollbackRecordRemoval: () throws -> Void
 
     init(
         afterPayloadMove: @escaping () throws -> Void = {},
         afterRecordWrite: @escaping () throws -> Void = {},
-        beforeSourceRecordRemoval: @escaping () throws -> Void = {}
+        beforeSourceRecordRemoval: @escaping () throws -> Void = {},
+        beforeRollbackRecordRemoval: @escaping () throws -> Void = {}
     ) {
         self.afterPayloadMove = afterPayloadMove
         self.afterRecordWrite = afterRecordWrite
         self.beforeSourceRecordRemoval = beforeSourceRecordRemoval
+        self.beforeRollbackRecordRemoval = beforeRollbackRecordRemoval
     }
 }
 
@@ -257,13 +260,20 @@ enum AppGroupQueue {
             try FileManager.default.removeItem(at: sourceRecord)
             return item
         } catch {
-            // save() writes JSON atomically before applying file protection, so
-            // it may throw after the new record already exists. Always remove
-            // the destination record rather than relying on a "save returned"
-            // flag, then restore the payload only when doing so cannot overwrite
-            // another file.
-            try? removeIfPresent(newRecord)
-            if FileManager.default.fileExists(atPath: newPayload.path())
+            // Roll back only when the newly committed record is definitely gone.
+            // If record cleanup itself fails, keep the new payload beside its
+            // valid record rather than restoring the old payload and leaving a
+            // dangling record that points at missing bytes.
+            var newRecordRemoved = false
+            do {
+                try hooks.beforeRollbackRecordRemoval()
+                try removeIfPresent(newRecord)
+                newRecordRemoved = !FileManager.default.fileExists(atPath: newRecord.path())
+            } catch {
+                newRecordRemoved = false
+            }
+            if newRecordRemoved
+                && FileManager.default.fileExists(atPath: newPayload.path())
                 && !FileManager.default.fileExists(atPath: oldPayload.path()) {
                 try? FileManager.default.moveItem(at: newPayload, to: oldPayload)
             }
@@ -296,9 +306,32 @@ enum AppGroupQueue {
         afterWrite: () throws -> Void = {}
     ) throws {
         let destination = records.appending(path: "\(item.id.uuidString).json")
-        try JSONEncoder.photoCloud.encode(item).write(to: destination, options: [.atomic])
-        try afterWrite()
-        try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: destination.path())
+        let temporary = records.appending(path: ".\(item.id.uuidString).\(UUID().uuidString).json.tmp")
+        do {
+            let encoded = try JSONEncoder.photoCloud.encode(item)
+            try encoded.write(to: temporary)
+            try afterWrite()
+            // Apply file protection before publishing the record. A protection
+            // failure must not leave a newly-written destination that callers
+            // mistake for an unsuccessful save.
+            try FileManager.default.setAttributes(
+                [.protectionKey: backgroundProtection],
+                ofItemAtPath: temporary.path()
+            )
+            if FileManager.default.fileExists(atPath: destination.path()) {
+                _ = try FileManager.default.replaceItemAt(
+                    destination,
+                    withItemAt: temporary,
+                    backupItemName: nil,
+                    options: []
+                )
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        } catch {
+            try? removeIfPresent(temporary)
+            throw error
+        }
     }
 
     private static func recordURL(for id: UUID, in root: URL) -> URL {

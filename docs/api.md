@@ -26,7 +26,7 @@ and a 30-day opaque refresh token. When confirmed MFA is enabled, a correct
 password returns `202` with a one-time 5-minute `challenge` and **no access or
 refresh token**. Complete `/v1/auth/mfa/verify` with either a current TOTP code
 or one unused recovery code before tokens are issued. Store the refresh token
-in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 30 seconds the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes its token and is idempotent.
+in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 30 seconds the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried; `REFRESH_RETRY_ENCRYPTION_KEY_BASE64` is a dedicated persistent 32-byte key so that retry capsule remains decryptable across a gateway crash/restart; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes its token and is idempotent.
 
 
 ### MFA lifecycle
@@ -94,6 +94,11 @@ durable PostgreSQL per-user creation window (`upload_create_rate_limited`); an
 idempotent retry of an existing non-expired identity does not consume that
 window. These controls bound database/event growth from a compromised
 authenticated account.
+
+`expires_at` is the deadline for transfer admission only. `created`, `uploading`,
+and `failed` sessions become `410 Gone` after that deadline, but durable states
+such as `received`, `verifying`, `available`, and `quarantined` remain readable
+for client reconciliation and are returned without a new upload capability.
 
 ## TUS upload
 

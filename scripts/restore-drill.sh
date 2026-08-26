@@ -134,10 +134,11 @@ if [[ "$manifest_count" != "0" ]]; then
     [[ -f "$manifest_file" ]] || { echo "restored manifest missing for DB row: $object_key" >&2; exit 1; }
 
     MANIFEST_PUBLIC_KEYRING_HOST_PATH="$keyring_path" docker compose --profile integrity run --rm --no-deps \
-      -v "$manifest_file:/verify/manifest.json:ro" \
+      -v "$manifest_file:/verify/$relative:ro" \
       manifest-verify \
       -mode verify \
-      -input /verify/manifest.json \
+      -input "/verify/$relative" \
+      -object-key "$object_key" \
       -expected-version "$version" \
       -expected-asset-count "$db_asset_count" \
       -expected-payload-sha256 "$payload_hex" \

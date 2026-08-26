@@ -43,6 +43,7 @@ type Config struct {
 	GlobalLoginRatePerSecond  float64
 	GlobalLoginBurst          int
 	MFAEncryptionKey          []byte
+	RefreshRetryEncryptionKey []byte
 	Logger                    *slog.Logger
 }
 
@@ -332,10 +333,11 @@ func New(config Config) (*Server, error) {
 	})
 	if config.Accounts != nil {
 		accountAPI, err := account.NewSecureAPI(config.Accounts, config.Tokens, config.Logger, account.SecurityConfig{
-			LoginThrottleHMACKey: config.LoginThrottleHMACKey,
-			GlobalLoginRate:      config.GlobalLoginRatePerSecond,
-			GlobalLoginBurst:     config.GlobalLoginBurst,
-			MFAEncryptionKey:     config.MFAEncryptionKey,
+			LoginThrottleHMACKey:      config.LoginThrottleHMACKey,
+			GlobalLoginRate:           config.GlobalLoginRatePerSecond,
+			GlobalLoginBurst:          config.GlobalLoginBurst,
+			MFAEncryptionKey:          config.MFAEncryptionKey,
+			RefreshRetryEncryptionKey: config.RefreshRetryEncryptionKey,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configure account security: %w", err)

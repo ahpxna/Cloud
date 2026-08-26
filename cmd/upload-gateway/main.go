@@ -42,6 +42,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	refreshRetryEncryptionKey, err := decodeSecretEnvExact("REFRESH_RETRY_ENCRYPTION_KEY_BASE64", 32)
+	if err != nil {
+		return err
+	}
 	tokens, err := auth.NewAccessTokenManager(key, auth.DefaultIssuer, auth.DefaultAudience)
 	if err != nil {
 		return err
@@ -137,6 +141,7 @@ func run(logger *slog.Logger) error {
 		GlobalLoginRatePerSecond:  globalLoginRate,
 		GlobalLoginBurst:          globalLoginBurst,
 		MFAEncryptionKey:          mfaEncryptionKey,
+		RefreshRetryEncryptionKey: refreshRetryEncryptionKey,
 		Logger:                    logger,
 	})
 	if err != nil {

@@ -110,6 +110,35 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertTrue(try AppGroupQueue.all(in: root).isEmpty)
     }
 
+
+    func testRecoverQuarantinedRecordKeepsValidPairWhenRollbackRecordRemovalFails() throws {
+        let root = temporaryQueueRoot()
+        let original = queuedUpload(id: UUID(), state: .queued)
+        try write(original, in: root)
+        try Data("{not-json".utf8).write(to: recordURL(for: original, in: root), options: .atomic)
+
+        XCTAssertTrue(try AppGroupQueue.all(in: root).isEmpty)
+        let quarantined = try AppGroupQueue.quarantinedRecords(in: root)
+        XCTAssertEqual(quarantined.count, 1)
+
+        enum Injected: Error { case beforeSourceRemoval, rollbackRemoval }
+        XCTAssertThrowsError(try AppGroupQueue.recoverQuarantinedRecord(
+            quarantined[0],
+            in: root,
+            hooks: QueueRecoveryHooks(
+                beforeSourceRecordRemoval: { throw Injected.beforeSourceRemoval },
+                beforeRollbackRecordRemoval: { throw Injected.rollbackRemoval }
+            )
+        ))
+
+        let recovered = try AppGroupQueue.all(in: root)
+        XCTAssertEqual(recovered.count, 1)
+        let recoveredItem = try XCTUnwrap(recovered.first)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: recoveredItem, in: root).path()))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantineURL(for: quarantined[0], in: root).path()))
+    }
+
     func testRecoverQuarantinedRecordRefusesAmbiguousPayloadsWithoutDeletingBytes() throws {
         let root = temporaryQueueRoot()
         let original = queuedUpload(id: UUID(), state: .queued)

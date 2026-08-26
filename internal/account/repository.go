@@ -29,6 +29,7 @@ type DeviceSession struct {
 	CreatedAt  time.Time `json:"created_at"`
 	LastUsedAt time.Time `json:"last_used_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	Current    bool      `json:"current"`
 }
 
 type RefreshRotation struct {

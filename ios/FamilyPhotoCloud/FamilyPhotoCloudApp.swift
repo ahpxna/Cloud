@@ -208,6 +208,38 @@ private struct UploadQueueView: View {
                     }
                 }
 
+                Section("Devices & sessions") {
+                    Button("Refresh signed-in devices") {
+                        Task { await coordinator.refreshDeviceSessions() }
+                    }
+                    ForEach(coordinator.deviceSessions) { session in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(session.deviceName)
+                                if session.current {
+                                    Text("Current")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.thinMaterial, in: Capsule())
+                                }
+                            }
+                            Text("Last used \(session.lastUsedAt, style: .relative) · expires \(session.expiresAt, style: .relative)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Button(session.current ? "Revoke this device" : "Revoke device", role: .destructive) {
+                                Task { await coordinator.revokeDeviceSession(session) }
+                            }
+                        }
+                    }
+                    Button("Sign out", role: .destructive) {
+                        Task {
+                            await coordinator.signOut()
+                            await library.reload()
+                        }
+                    }
+                }
+
                 if !coordinator.quarantinedRecords.isEmpty {
                     Section("Queue recovery") {
                         Text("Corrupt queue metadata is isolated from payload bytes. Recovery creates a fresh upload identity and restarts from byte zero.")

@@ -98,13 +98,19 @@ make config
 make db-up
 ```
 
-Generate three independent gateway secrets in the untracked `.env`, then start
-the gateway. Never reuse a key across these purposes:
+Generate independent runtime database passwords plus four gateway cryptographic
+secrets in the untracked `.env`, then start the gateway. The bootstrap
+`POSTGRES_USER` credential is migration-only; runtime services use the scoped
+roles created by `db-role-bootstrap`. Never reuse a password/key across these
+purposes:
 
 ```bash
 openssl rand -base64 32  # ACCESS_TOKEN_HMAC_KEY_BASE64
 openssl rand -base64 32  # LOGIN_THROTTLE_HMAC_KEY_BASE64
 openssl rand -base64 32  # MFA_ENCRYPTION_KEY_BASE64 (exactly 32 decoded bytes)
+openssl rand -base64 32  # REFRESH_RETRY_ENCRYPTION_KEY_BASE64 (exactly 32 decoded bytes)
+# Also replace GATEWAY_DB_PASSWORD, ADMIN_DB_PASSWORD,
+# INTEGRITY_DB_PASSWORD, READONLY_DB_PASSWORD, and BACKUP_DB_PASSWORD with independent values.
 make gateway-up
 make create-user EMAIL=parent@example.com
 ```

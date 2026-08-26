@@ -12,6 +12,7 @@ load_dotenv "$repo_root/.env"
 : "${MANIFEST_SIGNING_KEY_ID:?set MANIFEST_SIGNING_KEY_ID}"
 key_path="${MANIFEST_KEY_HOST_PATH:-$repo_root/.data/secrets/manifest-ed25519.pem}"
 public_key_path="${MANIFEST_PUBLIC_KEY_HOST_PATH:-$repo_root/.data/secrets/manifest-ed25519-public.pem}"
+keyring_dir="${MANIFEST_PUBLIC_KEYRING_HOST_PATH:-$repo_root/.data/secrets/manifest-public-keyring}"
 output_dir="${MANIFEST_OUTPUT_DIR:-$repo_root/.data/manifests}"
 [[ -f "$key_path" ]] || { echo "manifest key missing: $key_path" >&2; exit 2; }
 
@@ -22,6 +23,22 @@ if [[ ! -f "$public_key_path" ]]; then
   mkdir -p "$(dirname "$public_key_path")"
   openssl pkey -in "$key_path" -pubout -out "$public_key_path"
   chmod 0644 "$public_key_path" 2>/dev/null || true
+fi
+
+if [[ ! "$MANIFEST_SIGNING_KEY_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+  echo "MANIFEST_SIGNING_KEY_ID contains unsafe keyring characters" >&2
+  exit 2
+fi
+mkdir -p "$keyring_dir"
+chmod 700 "$keyring_dir" 2>/dev/null || true
+keyring_public="$keyring_dir/$MANIFEST_SIGNING_KEY_ID.pem"
+if [[ -f "$keyring_public" ]]; then
+  cmp -s "$public_key_path" "$keyring_public" || {
+    echo "public key does not match existing keyring entry: $keyring_public" >&2
+    exit 2
+  }
+else
+  install -m 0644 "$public_key_path" "$keyring_public"
 fi
 
 mkdir -p "$output_dir"
@@ -44,6 +61,7 @@ docker compose --profile integrity run --rm manifest \
 docker compose --profile integrity run --rm manifest-verify \
   -mode verify \
   -input "/manifests/$manifest_name" \
+  -object-key "manifests/$manifest_name" \
   -expected-key-id "$MANIFEST_SIGNING_KEY_ID"
 
 operator_lock_release

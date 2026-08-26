@@ -46,8 +46,19 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
 
     func resumeStoredUploads() {
         restoreStoredContexts()
-        for upload in (try? client.getStoredUploads()) ?? [] {
-            _ = try? client.resume(id: upload.id)
+        // Let TUSKit reconcile persisted metadata with any background
+        // URLSession tasks from the previous process. Calling resume(id:) for
+        // every stored upload here can schedule a duplicate task after relaunch.
+        _ = client.start()
+
+        // Failed uploads are not part of start()'s normal continuation set.
+        // Retry only the IDs TUSKit explicitly marks failed; this follows the
+        // library's new-session contract without blindly rescheduling every
+        // persisted upload.
+        if let failedIDs = try? client.failedUploadIds() {
+            for id in failedIDs {
+                _ = try? client.retry(id: id)
+            }
         }
     }
 

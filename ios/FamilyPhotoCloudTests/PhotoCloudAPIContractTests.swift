@@ -72,6 +72,87 @@ final class PhotoCloudAPIContractTests: XCTestCase {
         XCTAssertEqual(credential.refreshToken, "new-refresh")
     }
 
+
+    func testDeviceSessionsMarksCurrentSessionFromAPI() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            URLProtocolStub.handler = nil
+        }
+
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path, "/v1/auth/sessions")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            ))
+            let body = Data(#"{"sessions":[{"id":"11111111-2222-4333-8444-555555555555","device_name":"iPhone","created_at":"2026-08-26T00:00:00Z","last_used_at":"2026-08-26T00:01:00Z","expires_at":"2026-09-25T00:00:00Z","current":true}]}"#.utf8)
+            return (response, body)
+        }
+
+        let api = PhotoCloudAPI(baseURL: URL(string: "https://photos.example.test")!, session: session)
+        let sessions = try await api.deviceSessions(accessToken: "access-token")
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions[0].deviceName, "iPhone")
+        XCTAssertTrue(sessions[0].current)
+    }
+
+    func testRevokeDeviceSessionUsesAuthenticatedDelete() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            URLProtocolStub.handler = nil
+        }
+
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "DELETE")
+            XCTAssertEqual(request.url?.path, "/v1/auth/sessions/11111111-2222-4333-8444-555555555555")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 204, httpVersion: "HTTP/1.1", headerFields: nil
+            ))
+            return (response, Data())
+        }
+
+        let api = PhotoCloudAPI(baseURL: URL(string: "https://photos.example.test")!, session: session)
+        try await api.revokeDeviceSession(
+            id: "11111111-2222-4333-8444-555555555555",
+            accessToken: "access-token"
+        )
+    }
+
+    func testLogoutSendsRefreshTokenAndClearsServerSessionEndpoint() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            URLProtocolStub.handler = nil
+        }
+
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/v1/auth/logout")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            let body = try XCTUnwrap(request.httpBody)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+            XCTAssertEqual(object["refresh_token"], "refresh-token")
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 204, httpVersion: "HTTP/1.1", headerFields: nil
+            ))
+            return (response, Data())
+        }
+
+        let api = PhotoCloudAPI(baseURL: URL(string: "https://photos.example.test")!, session: session)
+        try await api.logout(refreshToken: "refresh-token")
+    }
 }
 
 private func requestBody(from request: URLRequest) throws -> Data {

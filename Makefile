@@ -59,7 +59,7 @@ integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
 .PHONY: manifest-verify
 manifest-verify: env ## Verify one signed manifest with the public trust key
 	@test -n "$(MANIFEST_FILE)" || (echo "usage: make manifest-verify MANIFEST_FILE=manifest-...json [MANIFEST_ARGS=...]"; exit 1)
-	docker compose --profile integrity run --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
+	docker compose --profile integrity run --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
 
 .PHONY: manifest-reconcile
 manifest-reconcile: env ## Repair a verified manifest file -> DB linkage crash window

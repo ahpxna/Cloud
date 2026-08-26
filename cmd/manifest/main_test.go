@@ -165,3 +165,21 @@ func TestKeyringVerifiesHistoricalManifestsAfterRotation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateManifestFileBinding(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	matching := filepath.Join(root, "manifest-20260826.json")
+	if err := validateManifestFileBinding(matching, "manifests/manifest-20260826.json"); err != nil {
+		t.Fatalf("matching file/object binding rejected: %v", err)
+	}
+	if err := validateManifestFileBinding(matching, "manifests/other.json"); err == nil {
+		t.Fatal("mismatched object key and filename was accepted")
+	}
+	if err := validateManifestFileBinding(matching, "other/manifest-20260826.json"); err == nil {
+		t.Fatal("object key outside manifests/ was accepted")
+	}
+	if err := validateManifestFileBinding("", "manifests/manifest-20260826.json"); err == nil {
+		t.Fatal("empty manifest file path was accepted")
+	}
+}

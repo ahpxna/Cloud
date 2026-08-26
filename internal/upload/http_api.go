@@ -201,7 +201,11 @@ func (api *API) create(w http.ResponseWriter, r *http.Request, principal auth.Pr
 		status = http.StatusCreated
 	}
 	tokenNow := api.now().UTC()
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, principal.SessionID, session.ID, tokenNow, uploadCapabilityTTL(session.ExpiresAt.Sub(tokenNow)))
+	if uploadTransferExpired(session, tokenNow) {
+		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
+		return
+	}
+	uploadToken, err := api.issueUploadCapability(principal, session, tokenNow)
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "upload_token_failed", "could not issue upload capability")
 		return
@@ -271,13 +275,13 @@ func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Princ
 		return
 	}
 	now := api.now().UTC()
-	if !session.ExpiresAt.After(now) || session.State == StateExpired {
+	if uploadTransferExpired(session, now) {
 		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
 		return
 	}
-	uploadToken, err := api.tokens.IssueUpload(principal.UserID, principal.SessionID, session.ID, now, uploadCapabilityTTL(session.ExpiresAt.Sub(now)))
+	uploadToken, err := api.issueUploadCapability(principal, session, now)
 	if err != nil {
-		writeProblem(w, http.StatusGone, "upload_session_expired", "upload session has expired")
+		writeProblem(w, http.StatusInternalServerError, "upload_token_failed", "could not issue upload capability")
 		return
 	}
 	writeJSON(w, http.StatusOK, sessionResponse{
@@ -290,6 +294,40 @@ func (api *API) get(w http.ResponseWriter, r *http.Request, principal auth.Princ
 		ChunkBytes:     api.chunkBytes,
 		UploadToken:    uploadToken,
 	})
+}
+
+func uploadTransferExpired(session Session, now time.Time) bool {
+	if session.State == StateExpired {
+		return true
+	}
+	switch session.State {
+	case StateCreated, StateUploading, StateFailed:
+		return !session.ExpiresAt.After(now)
+	default:
+		// expires_at is a transfer-admission deadline, not the lifetime of the
+		// durable verification/result record. Once all bytes are received, GET
+		// must remain useful for reconciliation even days later.
+		return false
+	}
+}
+
+func uploadStateAcceptsCapability(state State) bool {
+	switch state {
+	case StateCreated, StateUploading, StateFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (api *API) issueUploadCapability(principal auth.Principal, session Session, now time.Time) (string, error) {
+	if !uploadStateAcceptsCapability(session.State) {
+		return "", nil
+	}
+	return api.tokens.IssueUpload(
+		principal.UserID, principal.SessionID, session.ID, now,
+		uploadCapabilityTTL(session.ExpiresAt.Sub(now)),
+	)
 }
 
 func uploadCapabilityTTL(remaining time.Duration) time.Duration {

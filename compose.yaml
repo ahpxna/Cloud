@@ -9,6 +9,8 @@ networks:
     internal: true
   tunnel-egress:
     name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-tunnel-egress
+  notification-egress:
+    name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-notification-egress
   protocol-lab:
     name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-protocol-lab
     internal: true
@@ -38,9 +40,38 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # Runtime roles are separate from the bootstrap superuser. This runs on every
+  # deployment so existing volumes are upgraded without docker-entrypoint hooks.
+  db-role-bootstrap:
+    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    command: ["/bin/sh", "/opt/photo-cloud/bootstrap-db-roles.sh", "bootstrap"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
+      POSTGRES_USER: ${POSTGRES_USER:-photo_cloud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      GATEWAY_DB_PASSWORD: ${GATEWAY_DB_PASSWORD:?set GATEWAY_DB_PASSWORD in .env}
+      ADMIN_DB_PASSWORD: ${ADMIN_DB_PASSWORD:?set ADMIN_DB_PASSWORD in .env}
+      INTEGRITY_DB_PASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
+      READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
+      BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env}
+    networks: [database]
+    volumes:
+      - ./scripts/bootstrap-db-roles.sh:/opt/photo-cloud/bootstrap-db-roles.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
   # A real migration runner tracks checksums and runs on every deployment.
   # docker-entrypoint init scripts are intentionally not used because they do
-  # not run when an existing PostgreSQL volume is upgraded.
+  # not run when an existing PostgreSQL volume is upgraded. Migrations remain
+  # the only privileged DB writer; Internet-facing/runtime services never use
+  # this bootstrap credential.
   migrate:
     build:
       context: .
@@ -57,6 +88,33 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-role-bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  db-runtime-grants:
+    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    command: ["/bin/sh", "/opt/photo-cloud/bootstrap-db-roles.sh", "finalize"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
+      POSTGRES_USER: ${POSTGRES_USER:-photo_cloud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      GATEWAY_DB_PASSWORD: ${GATEWAY_DB_PASSWORD:?set GATEWAY_DB_PASSWORD in .env}
+      ADMIN_DB_PASSWORD: ${ADMIN_DB_PASSWORD:?set ADMIN_DB_PASSWORD in .env}
+      INTEGRITY_DB_PASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
+      READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
+      BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env}
+    networks: [database]
+    volumes:
+      - ./scripts/bootstrap-db-roles.sh:/opt/photo-cloud/bootstrap-db-roles.sh:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -75,11 +133,12 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_gateway
+      PGPASSWORD: ${GATEWAY_DB_PASSWORD:?set GATEWAY_DB_PASSWORD in .env}
       ACCESS_TOKEN_HMAC_KEY_BASE64: ${ACCESS_TOKEN_HMAC_KEY_BASE64:-}
       LOGIN_THROTTLE_HMAC_KEY_BASE64: ${LOGIN_THROTTLE_HMAC_KEY_BASE64:-}
       MFA_ENCRYPTION_KEY_BASE64: ${MFA_ENCRYPTION_KEY_BASE64:-}
+      REFRESH_RETRY_ENCRYPTION_KEY_BASE64: ${REFRESH_RETRY_ENCRYPTION_KEY_BASE64:-}
       GLOBAL_LOGIN_RATE_PER_SECOND: ${GLOBAL_LOGIN_RATE_PER_SECOND:-1}
       GLOBAL_LOGIN_BURST: ${GLOBAL_LOGIN_BURST:-20}
       UPLOAD_SESSION_CREATE_WINDOW: ${UPLOAD_SESSION_CREATE_WINDOW:-1m}
@@ -108,7 +167,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
@@ -158,13 +217,13 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_admin
+      PGPASSWORD: ${ADMIN_DB_PASSWORD:?set ADMIN_DB_PASSWORD in .env}
     networks: [database]
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     read_only: true
     tmpfs:
@@ -186,18 +245,22 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_integrity
+      PGPASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
       MANIFEST_SIGNING_KEY_ID: ${MANIFEST_SIGNING_KEY_ID:-}
       MANIFEST_ED25519_PRIVATE_KEY_FILE: /run/secrets/manifest-ed25519.pem
+      MANIFEST_ED25519_PUBLIC_KEY_FILE: /run/secrets/manifest-ed25519-public.pem
+      MANIFEST_PUBLIC_KEYRING_DIR: /run/trust/manifest-public-keyring
     networks: [database]
     volumes:
       - ${MANIFEST_OUTPUT_DIR:-./.data/manifests}:/manifests
       - ${MANIFEST_KEY_HOST_PATH:-./.data/secrets/manifest-ed25519.pem}:/run/secrets/manifest-ed25519.pem:ro
+      - ${MANIFEST_PUBLIC_KEY_HOST_PATH:-./.data/secrets/manifest-ed25519-public.pem}:/run/secrets/manifest-ed25519-public.pem:ro
+      - ${MANIFEST_PUBLIC_KEYRING_HOST_PATH:-./.data/secrets/manifest-public-keyring}:/run/trust/manifest-public-keyring:ro
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     read_only: true
     tmpfs:
@@ -220,8 +283,8 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_integrity
+      PGPASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
       MANIFEST_ED25519_PUBLIC_KEY_FILE: /run/secrets/manifest-ed25519-public.pem
       MANIFEST_PUBLIC_KEYRING_DIR: /run/trust/manifest-public-keyring
     networks: [database]
@@ -232,7 +295,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     read_only: true
     tmpfs:
@@ -254,8 +317,8 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_integrity
+      PGPASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
       PHOTO_MEDIA_ROOT: /srv/media
     networks: [database]
     volumes:
@@ -264,7 +327,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     read_only: true
     tmpfs:
@@ -286,8 +349,8 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_readonly
+      PGPASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
       PHOTO_MEDIA_ROOT: /srv/media
       METRICS_ADDR: :9090
     ports:
@@ -298,7 +361,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/readyz"]
@@ -347,7 +410,7 @@ services:
       - --storage.path=/alertmanager
     ports:
       - "127.0.0.1:${ALERTMANAGER_DEV_PORT:-9093}:9093"
-    networks: [database]
+    networks: [database, notification-egress]
     volumes:
       - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
@@ -398,15 +461,15 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGDATABASE: ${POSTGRES_DB:-photo_cloud}
-      PGUSER: ${POSTGRES_USER:-photo_cloud}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGUSER: photo_cloud_readonly
+      PGPASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
     networks: [database]
     volumes:
       - ${AUDIT_EXPORT_DIR:-./.data/audit}:/audit
     depends_on:
       postgres:
         condition: service_healthy
-      migrate:
+      db-runtime-grants:
         condition: service_completed_successfully
     read_only: true
     tmpfs:

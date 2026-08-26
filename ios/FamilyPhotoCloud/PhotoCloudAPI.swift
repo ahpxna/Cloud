@@ -85,6 +85,28 @@ struct MFARecoveryCodes: Codable, Sendable {
     }
 }
 
+struct DeviceSession: Codable, Identifiable, Sendable {
+    let id: String
+    let deviceName: String
+    let createdAt: Date
+    let lastUsedAt: Date
+    let expiresAt: Date
+    let current: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case deviceName = "device_name"
+        case createdAt = "created_at"
+        case lastUsedAt = "last_used_at"
+        case expiresAt = "expires_at"
+        case current
+    }
+}
+
+private struct DeviceSessionsResponse: Codable, Sendable {
+    let sessions: [DeviceSession]
+}
+
 struct APIProblem: Codable, Error, LocalizedError, Sendable {
     let status: Int
     let code: String
@@ -191,6 +213,38 @@ struct PhotoCloudAPI: Sendable {
             method: "POST",
             body: Request(totpCode: totpCode),
             bearer: accessToken
+        )
+    }
+
+    func deviceSessions(accessToken: String) async throws -> [DeviceSession] {
+        try await request(
+            path: "/v1/auth/sessions",
+            method: "GET",
+            body: Optional<String>.none,
+            bearer: accessToken,
+            response: DeviceSessionsResponse.self
+        ).sessions
+    }
+
+    func revokeDeviceSession(id: String, accessToken: String) async throws {
+        try await requestNoContent(
+            path: "/v1/auth/sessions/\(id)",
+            method: "DELETE",
+            body: Optional<String>.none,
+            bearer: accessToken
+        )
+    }
+
+    func logout(refreshToken: String) async throws {
+        struct Request: Encodable {
+            let refreshToken: String
+            enum CodingKeys: String, CodingKey { case refreshToken = "refresh_token" }
+        }
+        try await requestNoContent(
+            path: "/v1/auth/logout",
+            method: "POST",
+            body: Request(refreshToken: refreshToken),
+            bearer: nil
         )
     }
 
@@ -377,6 +431,25 @@ actor AuthenticationStore {
         try KeychainStore.deleteCredential()
     }
 
+    func signOut(api: PhotoCloudAPI) async throws {
+        let current = try credential ?? KeychainStore.loadCredential()
+        refreshTask?.cancel()
+        refreshTask = nil
+
+        var remoteError: (any Error)?
+        if let current {
+            do {
+                try await api.logout(refreshToken: current.refreshToken)
+            } catch {
+                remoteError = error
+            }
+        }
+
+        credential = nil
+        try KeychainStore.deleteCredential()
+        if let remoteError { throw remoteError }
+    }
+
     func accessToken(api: PhotoCloudAPI) async throws -> String {
         let storedCredential = try credential ?? KeychainStore.loadCredential()
         guard var current = storedCredential else { throw APIProblem(status: 401, code: "not_signed_in", detail: "Sign in before uploading.") }
@@ -402,6 +475,15 @@ actor AuthenticationStore {
             refreshTask = task
             do {
                 current = try await task.value
+            } catch let problem as APIProblem where problem.status == 401 {
+                refreshTask = nil
+                credential = nil
+                try? KeychainStore.deleteCredential()
+                throw APIProblem(
+                    status: 401,
+                    code: "session_expired",
+                    detail: "Your session is no longer valid. Sign in again to continue."
+                )
             } catch {
                 refreshTask = nil
                 throw error
