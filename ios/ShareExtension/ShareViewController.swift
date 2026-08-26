@@ -5,14 +5,14 @@ final class ShareViewController: SLComposeServiceViewController {
     override func isContentValid() -> Bool { true }
 
     override func didSelectPost() {
-        let providers = extensionContext?.inputItems
-            .compactMap({ $0 as? NSExtensionItem })
-            .flatMap(\.attachments ?? [])
+        let providers: [(NSItemProvider, UTType)] = (extensionContext?.inputItems ?? [])
+            .compactMap { $0 as? NSExtensionItem }
+            .flatMap { $0.attachments ?? [] }
             .compactMap { provider -> (NSItemProvider, UTType)? in
                 if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) { return (provider, .image) }
                 if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) { return (provider, .movie) }
                 return nil
-            } ?? []
+            }
         guard !providers.isEmpty else {
             cancel(with: "Choose an image or video to add to the queue.")
             return
