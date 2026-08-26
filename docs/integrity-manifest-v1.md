@@ -1,6 +1,6 @@
 # Integrity Manifest v1
 
-Status: implemented canonical format; scheduled generator and storage scrubber pending.
+Status: implemented canonical format, scheduled generator, and storage scrubber.
 
 The manifest is a signed inventory of assets that already reached `available`.
 It detects an altered database inventory or unrecorded loss of originals; it

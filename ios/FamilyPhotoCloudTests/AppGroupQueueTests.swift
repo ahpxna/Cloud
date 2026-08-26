@@ -165,13 +165,29 @@ final class AppGroupQueueTests: XCTestCase {
         let orphan = queuedUpload(id: UUID(), state: .queued)
         let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: payloads, withIntermediateDirectories: true)
-        try Data("payload".utf8).write(to: payloadURL(for: orphan, in: root))
+        let payload = payloadURL(for: orphan, in: root)
+        try Data("payload".utf8).write(to: payload)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-6 * 60)],
+            ofItemAtPath: payload.path()
+        )
 
         let recovered = try AppGroupQueue.all(in: root)
 
         XCTAssertEqual(recovered.count, 1)
         XCTAssertNotEqual(recovered[0].id, orphan.id)
         XCTAssertEqual(recovered[0].payloadFilename, orphan.payloadFilename)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: orphan, in: root).path()))
+    }
+
+    func testFreshPayloadIsNotRecoveredWhileShareExtensionCanStillPublishRecord() throws {
+        let root = temporaryQueueRoot()
+        let orphan = queuedUpload(id: UUID(), state: .queued)
+        let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: payloads, withIntermediateDirectories: true)
+        try Data("payload".utf8).write(to: payloadURL(for: orphan, in: root))
+
+        XCTAssertTrue(try AppGroupQueue.all(in: root).isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: orphan, in: root).path()))
     }
 

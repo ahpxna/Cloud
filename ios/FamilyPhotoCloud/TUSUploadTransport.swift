@@ -68,6 +68,18 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         (try? client.getStoredUploads())?.first(where: { $0.context?["session_id"] == sessionID })?.id
     }
 
+    func isFailedStoredUpload(id: UUID) -> Bool {
+        (try? client.failedUploadIDs().contains(id)) ?? false
+    }
+
+    /// A terminal server-side session must not leave a persisted TUSKit task
+    /// eligible for a later `start()` call. This deletes only TUSKit's local
+    /// cache; the App Group payload remains available for a fresh session.
+    func discardStoredUpload(id: UUID) throws {
+        headerProvider.unregister(id: id)
+        _ = try client.cancelAndDelete(id: id)
+    }
+
     func resumeStoredUpload(id: UUID) throws {
         try client.resume(id: id)
     }

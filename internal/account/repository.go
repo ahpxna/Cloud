@@ -261,17 +261,32 @@ func (r *PostgresRepository) ListDeviceSessions(ctx context.Context, userID stri
 }
 
 func (r *PostgresRepository) RevokeDeviceSession(ctx context.Context, userID, sessionID string) error {
-	command, err := r.pool.Exec(ctx, `
-        UPDATE user_sessions
-        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
-        WHERE id = $1::uuid AND user_id = $2::uuid AND revoked_at IS NULL`, sessionID, userID)
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if command.RowsAffected() != 1 {
-		return ErrInvalidCredentials
+	defer tx.Rollback(ctx)
+
+	// A refresh rotates one device into a new row. Find the stable family even
+	// when the selected generation was already revoked, then revoke every live
+	// descendant so a concurrent refresh cannot evade a device revoke.
+	var familyID string
+	if err := tx.QueryRow(ctx, `
+        SELECT session_family_id::text
+        FROM user_sessions
+        WHERE id = $1::uuid AND user_id = $2::uuid`, sessionID, userID).Scan(&familyID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidCredentials
+		}
+		return err
 	}
-	return nil
+	if _, err := tx.Exec(ctx, `
+        UPDATE user_sessions
+        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
+        WHERE user_id = $1::uuid AND session_family_id = $2::uuid AND revoked_at IS NULL`, userID, familyID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (r *PostgresRepository) RecordLoginAttempt(

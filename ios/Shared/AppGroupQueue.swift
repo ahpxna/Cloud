@@ -52,6 +52,10 @@ enum AppGroupQueue {
     static let appGroupIdentifier = "group.dev.phanan.familyphotocloud"
     private static let backgroundProtection = FileProtectionType.completeUntilFirstUserAuthentication
     private static let staleTemporaryAge: TimeInterval = 24 * 60 * 60
+    // The Share Extension publishes payload bytes before its queue record. Do
+    // not treat a just-created payload as a crash orphan while that extension
+    // is still committing the record in another process.
+    private static let orphanRecoveryMinimumAge: TimeInterval = 5 * 60
 
     static func enqueue(ephemeralSource: URL, type: UTType) throws -> QueuedUpload {
         guard type.conforms(to: .image) || type.conforms(to: .movie) else {
@@ -351,13 +355,23 @@ enum AppGroupQueue {
         let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
         guard FileManager.default.fileExists(atPath: payloads.path()) else { return }
         let claimed = Set(existing.map(\.payloadFilename))
+        let orphanCutoff = Date().addingTimeInterval(-orphanRecoveryMinimumAge)
         let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
-        let quarantinedIDs = Set(((try? FileManager.default.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
-            .compactMap { UUID(uuidString: $0.lastPathComponent.replacingOccurrences(of: ".json.corrupt", with: "")) })
-        for payload in try FileManager.default.contentsOfDirectory(at: payloads, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+        let quarantinedRecords = (try? FileManager.default.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        // A corrupt record can intentionally point at a payload whose filename
+        // differs from its queue UUID after recovery. Its bytes must remain
+        // reserved for explicit user recovery; without parseable metadata we
+        // cannot safely infer that filename from the corrupt record alone.
+        guard quarantinedRecords.isEmpty else { return }
+        for payload in try FileManager.default.contentsOfDirectory(
+            at: payloads,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            let modifiedAt = try payload.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .now
             guard !claimed.contains(payload.lastPathComponent),
+                  modifiedAt <= orphanCutoff,
                   let oldID = UUID(uuidString: payload.deletingPathExtension().lastPathComponent),
-                  !quarantinedIDs.contains(oldID),
                   let type = UTType(filenameExtension: payload.pathExtension),
                   type.conforms(to: .image) || type.conforms(to: .movie) else { continue }
             try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: payload.path())

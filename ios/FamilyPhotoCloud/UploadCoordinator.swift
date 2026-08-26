@@ -393,33 +393,47 @@ final class UploadCoordinator: ObservableObject {
         do {
             let accessToken = try await auth.accessToken(api: api)
             let session = try await api.uploadSession(id: sessionID, accessToken: accessToken)
+            // TUSKit can publish its metadata before this queue record's
+            // tusUploadID is atomically saved. Reattach that task after a
+            // crash instead of scheduling a second upload for the session.
+            if let storedID = transport.storedUploadID(forSessionID: sessionID) {
+                item.tusUploadID = storedID
+                item.state = transport.isFailedStoredUpload(id: storedID) ? .failed : .transferring
+                item.lastError = item.state == .failed
+                    ? "Upload paused after its network retry limit. Tap Resume and check status to retry it."
+                    : nil
+                try AppGroupQueue.save(item)
+                reload()
+                return
+            }
             switch session.state {
             case "created":
                 try await enqueueTransfer(&item, session: session, accessToken: accessToken)
             case "uploading":
-                guard let storedID = transport.storedUploadID(forSessionID: sessionID) else {
-                    // A TUS resource cannot be resumed safely without its
-                    // local TUSKit context. Reset the incomplete server object
-                    // under owner authentication, then recreate the same
-                    // deterministic resource from byte zero. This deliberately
-                    // keeps the original local payload until availability.
-                    let reset = try await api.restartUploadSession(id: sessionID, accessToken: accessToken)
-                    item.tusUploadID = nil
-                    try await enqueueTransfer(&item, session: reset, accessToken: accessToken)
-                    reload()
-                    return
-                }
-                item.tusUploadID = storedID
-                item.state = .transferring
-                item.lastError = nil
-                try AppGroupQueue.save(item)
-                // TUSUploadTransport.resumeStoredUploads() already asked TUSKit
-                // to reconcile the background session. Do not call resume(id:)
-                // again here or a relaunch can schedule the same upload twice.
+                // Without a persisted TUSKit context, discard the incomplete
+                // server object before rebuilding from byte zero.
+                let reset = try await api.restartUploadSession(id: sessionID, accessToken: accessToken)
+                item.tusUploadID = nil
+                try await enqueueTransfer(&item, session: reset, accessToken: accessToken)
+                reload()
+                return
             default:
                 await reconcile(item)
                 return
             }
+        } catch let problem as APIProblem where problem.status == 410 && problem.code == "upload_session_expired" {
+            // Reusing the queue identity lets the server revive its expired
+            // idempotency row. First remove stale local TUS state so a later
+            // launch cannot restart the expired transfer in parallel.
+            if let tusID = item.tusUploadID ?? transport.storedUploadID(forSessionID: sessionID) {
+                try? transport.discardStoredUpload(id: tusID)
+            }
+            item.serverSessionID = nil
+            item.tusUploadID = nil
+            item.state = .queued
+            item.lastError = nil
+            try? AppGroupQueue.save(item)
+            await begin(item)
         } catch {
             item.state = .queued
             item.lastError = error.localizedDescription

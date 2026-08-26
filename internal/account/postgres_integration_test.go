@@ -289,6 +289,40 @@ func TestPostgresMFAChallengeIssuanceLimit(t *testing.T) {
 	}
 }
 
+func TestPostgresDeviceRevokeRevokesRefreshFamilyAfterRotation(t *testing.T) {
+	pool, ctx := accountIntegrationPool(t)
+	repository := NewPostgresRepository(pool)
+
+	var userID string
+	if err := pool.QueryRow(ctx, `
+        INSERT INTO users (email, password_hash, state)
+        VALUES ('device-family-revoke@example.com', 'test-only-password-hash', 'active')
+        RETURNING id::text`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	parentHash := sha256.Sum256([]byte("device-family-parent"))
+	parentID, err := repository.CreateRefreshSession(ctx, userID, "Family iPhone", parentHash, now.Add(30*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	childHash := sha256.Sum256([]byte("device-family-child"))
+	rotation, err := repository.RotateRefreshSession(ctx, parentHash, childHash, [32]byte{}, now.Add(30*24*time.Hour), nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RevokeDeviceSession(ctx, userID, parentID); err != nil {
+		t.Fatal(err)
+	}
+	active, err := repository.SessionActive(ctx, userID, rotation.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("revoke of a rotated parent left the child session active")
+	}
+}
+
 func accountIntegrationPool(t *testing.T) (*pgxpool.Pool, context.Context) {
 	t.Helper()
 	port := accountAvailablePort(t)
