@@ -11,7 +11,7 @@ func TestUploadTransferExpiredOnlyExpiresTransferStates(t *testing.T) {
 	expiredAt := now.Add(-time.Minute)
 	future := now.Add(time.Hour)
 
-	for _, state := range []State{StateCreated, StateUploading, StateFailed} {
+	for _, state := range []State{StateCreated, StateUploading} {
 		session := Session{State: state, ExpiresAt: expiredAt}
 		if !uploadTransferExpired(session, now) {
 			t.Fatalf("state %s with expired transfer deadline was accepted", state)
@@ -43,7 +43,7 @@ func TestUploadTransferExpiredOnlyExpiresTransferStates(t *testing.T) {
 
 func TestUploadCapabilityOnlyIssuedForTransferStates(t *testing.T) {
 	t.Parallel()
-	for _, state := range []State{StateCreated, StateUploading, StateFailed} {
+	for _, state := range []State{StateCreated, StateUploading} {
 		if !uploadStateAcceptsCapability(state) {
 			t.Fatalf("state %s should accept upload capability", state)
 		}
@@ -54,6 +54,7 @@ func TestUploadCapabilityOnlyIssuedForTransferStates(t *testing.T) {
 		StateVerified,
 		StateCommitting,
 		StateAvailable,
+		StateFailed,
 		StateExpired,
 		StateQuarantining,
 		StateQuarantined,

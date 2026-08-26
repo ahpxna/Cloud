@@ -9,13 +9,17 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  security-events: write
 
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml
 
+  security:
+    uses: ./.github/workflows/security.yml
+
   signed-images:
-    needs: validate
+    needs: [validate, security]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

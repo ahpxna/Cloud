@@ -51,6 +51,7 @@ enum AppGroupQueueError: LocalizedError {
 enum AppGroupQueue {
     static let appGroupIdentifier = "group.dev.phanan.familyphotocloud"
     private static let backgroundProtection = FileProtectionType.completeUntilFirstUserAuthentication
+    private static let staleTemporaryAge: TimeInterval = 24 * 60 * 60
 
     static func enqueue(ephemeralSource: URL, type: UTType) throws -> QueuedUpload {
         guard type.conforms(to: .image) || type.conforms(to: .movie) else {
@@ -103,6 +104,7 @@ enum AppGroupQueue {
     static func all(in root: URL) throws -> [QueuedUpload] {
         let records = root.appending(path: "records", directoryHint: .isDirectory)
         try createProtectedDirectory(records)
+        try removeStaleTemporaryFiles(in: root, records: records)
         let files = try FileManager.default.contentsOfDirectory(
             at: records,
             includingPropertiesForKeys: nil,
@@ -236,6 +238,15 @@ enum AppGroupQueue {
             throw AppGroupQueueError.unsupportedPayload
         }
 
+        let records = root.appending(path: "records", directoryHint: .isDirectory)
+        if let existing = try existingRecordClaiming(payloadFilename: oldPayload.lastPathComponent, in: records) {
+            // A previous recovery committed the valid record but was killed
+            // before it could remove the corrupt source. Do not mint a second
+            // queue identity for the same bytes.
+            try? FileManager.default.removeItem(at: sourceRecord)
+            return existing
+        }
+
         let newID = UUID()
         let newRecord = recordURL(for: newID, in: root)
         do {
@@ -256,7 +267,6 @@ enum AppGroupQueue {
                 tusUploadID: nil,
                 lastError: "Recovered from isolated corrupt queue metadata; upload will restart from byte zero."
             )
-            let records = root.appending(path: "records", directoryHint: .isDirectory)
             try save(item, in: records, afterWrite: hooks.afterRecordWrite)
             try hooks.beforeSourceRecordRemoval()
             try FileManager.default.removeItem(at: sourceRecord)
@@ -350,6 +360,7 @@ enum AppGroupQueue {
                   !quarantinedIDs.contains(oldID),
                   let type = UTType(filenameExtension: payload.pathExtension),
                   type.conforms(to: .image) || type.conforms(to: .movie) else { continue }
+            try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: payload.path())
             let item = QueuedUpload(
                 id: UUID(),
                 payloadFilename: payload.lastPathComponent,
@@ -365,6 +376,31 @@ enum AppGroupQueue {
             )
             try save(item, in: records)
             existing.append(item)
+        }
+    }
+
+    private static func existingRecordClaiming(payloadFilename: String, in records: URL) throws -> QueuedUpload? {
+        guard FileManager.default.fileExists(atPath: records.path()) else { return nil }
+        for record in try FileManager.default.contentsOfDirectory(at: records, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) where record.pathExtension == "json" {
+            if let item = try? JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: record)), item.payloadFilename == payloadFilename {
+                return item
+            }
+        }
+        return nil
+    }
+
+    private static func removeStaleTemporaryFiles(in root: URL, records: URL) throws {
+        let cutoff = Date().addingTimeInterval(-staleTemporaryAge)
+        let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
+        for directory in [payloads, records] where FileManager.default.fileExists(atPath: directory.path()) {
+            for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey], options: []) {
+                let name = file.lastPathComponent
+                let isImporting = directory == payloads && name.hasPrefix(".") && name.hasSuffix(".importing")
+                let isRecordTemp = directory == records && name.hasPrefix(".") && name.hasSuffix(".json.tmp")
+                guard isImporting || isRecordTemp else { continue }
+                let modified = try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantFuture
+                if modified < cutoff { try? FileManager.default.removeItem(at: file) }
+            }
         }
     }
 

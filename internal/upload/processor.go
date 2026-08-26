@@ -237,7 +237,7 @@ func (p *Processor) Process(ctx context.Context, id string) error {
 	}
 
 	if sourcePath != finalPath {
-		if err := commitWithoutReplace(sourcePath, finalPath, observedHash, observedSize); err != nil {
+		if err := commitWithoutReplace(ctx, sourcePath, finalPath, observedHash, observedSize); err != nil {
 			// Stay COMMITTING. Startup reconciliation can safely retry because
 			// commitWithoutReplace never replaces an existing destination.
 			return fmt.Errorf("durable_commit_move_failed: %w", err)
@@ -519,7 +519,7 @@ func quarantineWithoutReplace(ctx context.Context, source, destination string, e
 	return verifyDestination()
 }
 
-func commitWithoutReplace(source, destination string, expectedHash [32]byte, expectedSize int64) error {
+func commitWithoutReplace(ctx context.Context, source, destination string, expectedHash [32]byte, expectedSize int64) error {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
 	}
@@ -527,7 +527,7 @@ func commitWithoutReplace(source, destination string, expectedHash [32]byte, exp
 		if !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("create no-replace durable link: %w", err)
 		}
-		hash, size, verifyErr := hashAndSync(context.Background(), destination)
+		hash, size, verifyErr := hashAndSync(ctx, destination)
 		if verifyErr != nil {
 			return fmt.Errorf("verify existing destination: %w", verifyErr)
 		}

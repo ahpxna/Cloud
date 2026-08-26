@@ -142,7 +142,7 @@ func (r *PostgresRepository) RotateRefreshSession(
         JOIN users AS account ON account.id = session.user_id
         WHERE session.refresh_token_sha256 = $1
           AND account.state = 'active' AND account.deleted_at IS NULL
-        FOR UPDATE`, oldHash[:],
+		FOR UPDATE OF session`, oldHash[:],
 	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &sessionID, &familyID, &revokedAt, &expiresAt, &storedRetryRequestHash, &storedRetryCiphertext, &storedRetryNonce, &retryUntil)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RefreshRotation{}, ErrInvalidCredentials
@@ -477,9 +477,7 @@ func (r *PostgresRepository) CreateMFAChallenge(
 
 	// Serialize challenge issuance for a user. This prevents concurrent successful
 	// password logins from racing past the durable per-user issuance bound.
-	var lockedUserID string
-	if err := tx.QueryRow(ctx, `
-        SELECT id::text FROM users WHERE id = $1::uuid FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+	if err := lockUserTransaction(ctx, tx, userID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrMFAChallenge
 		}
@@ -666,9 +664,7 @@ func (r *PostgresRepository) RecordMFAActionAttempt(
 
 	// Serialize first insertion and subsequent mutations by user so parallel
 	// requests cannot race around the durable attempt budget.
-	var lockedUserID string
-	if err := tx.QueryRow(ctx, `
-        SELECT id::text FROM users WHERE id = $1::uuid FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+	if err := lockUserTransaction(ctx, tx, userID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, 0, ErrInvalidCredentials
 		}
@@ -728,6 +724,17 @@ func (r *PostgresRepository) RecordMFAActionAttempt(
 		return false, 0, err
 	}
 	return true, 0, tx.Commit(ctx)
+}
+
+// lockUserTransaction serializes per-user state transitions while keeping the
+// gateway role read-only on users. Advisory locks are transaction-scoped and
+// are released automatically on both commit and rollback.
+func lockUserTransaction(ctx context.Context, tx pgx.Tx, userID string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, userID); err != nil {
+		return err
+	}
+	var existing string
+	return tx.QueryRow(ctx, `SELECT id::text FROM users WHERE id = $1::uuid`, userID).Scan(&existing)
 }
 
 func (r *PostgresRepository) ClearMFAActionAttempts(ctx context.Context, userID, action string) error {

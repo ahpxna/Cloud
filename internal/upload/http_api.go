@@ -301,7 +301,7 @@ func uploadTransferExpired(session Session, now time.Time) bool {
 		return true
 	}
 	switch session.State {
-	case StateCreated, StateUploading, StateFailed:
+	case StateCreated, StateUploading:
 		return !session.ExpiresAt.After(now)
 	default:
 		// expires_at is a transfer-admission deadline, not the lifetime of the
@@ -313,7 +313,7 @@ func uploadTransferExpired(session Session, now time.Time) bool {
 
 func uploadStateAcceptsCapability(state State) bool {
 	switch state {
-	case StateCreated, StateUploading, StateFailed:
+	case StateCreated, StateUploading:
 		return true
 	default:
 		return false

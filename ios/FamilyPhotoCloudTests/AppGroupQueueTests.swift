@@ -175,6 +175,28 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: orphan, in: root).path()))
     }
 
+    func testRecoverQuarantinedRecordReturnsExistingPayloadClaim() throws {
+        let root = temporaryQueueRoot()
+        let original = queuedUpload(id: UUID(), state: .queued)
+        try write(original, in: root)
+        let records = root.appending(path: "records", directoryHint: .isDirectory)
+        let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: quarantine, withIntermediateDirectories: true)
+        let corrupt = quarantine.appending(path: "\(original.id.uuidString).json.corrupt")
+        try Data("broken".utf8).write(to: corrupt)
+        try FileManager.default.removeItem(at: recordURL(for: original, in: root))
+        let recovered = queuedUpload(id: UUID(), state: .queued, payloadFilename: original.payloadFilename)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(recovered).write(to: recordURL(for: recovered, in: root))
+        let record = QuarantinedQueueRecord(id: corrupt.lastPathComponent, filename: corrupt.lastPathComponent, modifiedAt: nil)
+
+        let result = try AppGroupQueue.recoverQuarantinedRecord(record, in: root)
+
+        XCTAssertEqual(result.id, recovered.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: corrupt.path()))
+    }
+
     private func temporaryQueueRoot() -> URL {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "FamilyPhotoCloudTests-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -188,10 +210,10 @@ final class AppGroupQueueTests: XCTestCase {
             .appending(path: record.filename)
     }
 
-    private func queuedUpload(id: UUID, state: UploadState) -> QueuedUpload {
+    private func queuedUpload(id: UUID, state: UploadState, payloadFilename: String? = nil) -> QueuedUpload {
         QueuedUpload(
             id: id,
-            payloadFilename: "\(id.uuidString).heic",
+            payloadFilename: payloadFilename ?? "\(id.uuidString).heic",
             originalFilename: "IMG.heic",
             typeIdentifier: UTType.heic.identifier,
             createdAt: Date(timeIntervalSince1970: 1),

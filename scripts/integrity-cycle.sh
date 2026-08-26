@@ -25,7 +25,7 @@ if [[ ! -f "$public_key_path" ]]; then
   chmod 0644 "$public_key_path" 2>/dev/null || true
 fi
 
-if [[ ! "$MANIFEST_SIGNING_KEY_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+if [[ ! "$MANIFEST_SIGNING_KEY_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
   echo "MANIFEST_SIGNING_KEY_ID contains unsafe keyring characters" >&2
   exit 2
 fi

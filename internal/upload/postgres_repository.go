@@ -106,9 +106,15 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 	if err := consumeCreateAdmission(ctx, tx, input); err != nil {
 		return Session{}, false, err
 	}
+	// Quota is an owner-scoped admission invariant. Serialize it without
+	// locking the users row, so the Internet-facing gateway retains no UPDATE
+	// privilege on account data merely to use it as a mutex.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, input.OwnerID); err != nil {
+		return Session{}, false, err
+	}
 
 	var quotaBytes *int64
-	if err := tx.QueryRow(ctx, `SELECT quota_bytes FROM users WHERE id = $1::uuid FOR UPDATE`, input.OwnerID).Scan(&quotaBytes); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT quota_bytes FROM users WHERE id = $1::uuid`, input.OwnerID).Scan(&quotaBytes); err != nil {
 		return Session{}, false, err
 	}
 	if input.MaxActiveSessions > 0 {
@@ -534,7 +540,7 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 		err = tx.QueryRow(ctx, `
             SELECT id::text, storage_key FROM assets
             WHERE owner_id = $1::uuid AND content_sha256 = $2 AND deleted_at IS NULL
-	            FOR SHARE`, session.OwnerID, hash[:]).Scan(&assetID, &existingStorageKey)
+	            `, session.OwnerID, hash[:]).Scan(&assetID, &existingStorageKey)
 		if err != nil {
 			return err
 		}

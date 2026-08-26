@@ -78,6 +78,10 @@ SELECT format(
   current_database()
 ) \gexec
 REVOKE ALL ON SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
+-- Existing databases upgraded from older PostgreSQL releases can retain the
+-- historical PUBLIC CREATE grant. Remove it explicitly before granting the
+-- scoped runtime roles any schema access.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
@@ -155,6 +159,13 @@ BEGIN
   END IF;
   IF has_table_privilege('photo_cloud_backup', 'users', 'UPDATE') THEN
     RAISE EXCEPTION 'backup database role is writable';
+  END IF;
+  IF has_schema_privilege('photo_cloud_gateway', 'public', 'CREATE')
+     OR has_schema_privilege('photo_cloud_admin', 'public', 'CREATE')
+     OR has_schema_privilege('photo_cloud_integrity', 'public', 'CREATE')
+     OR has_schema_privilege('photo_cloud_readonly', 'public', 'CREATE')
+     OR has_schema_privilege('photo_cloud_backup', 'public', 'CREATE') THEN
+    RAISE EXCEPTION 'runtime database role can create objects in public schema';
   END IF;
 END
 $$;

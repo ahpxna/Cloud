@@ -293,7 +293,15 @@ final class UploadCoordinator: ObservableObject {
         }
         for item in uploads where item.state != .available && item.state != .quarantined {
             if item.state == .failed {
-                guard retryFailed, let tusID = item.tusUploadID, failedTUSUploads.contains(tusID) else { continue }
+                guard retryFailed else { continue }
+                if item.serverSessionID == nil {
+                    await begin(item)
+                    continue
+                }
+                guard let tusID = item.tusUploadID, failedTUSUploads.contains(tusID) else {
+                    await recoverTransfer(item)
+                    continue
+                }
                 do {
                     guard try transport.retryFailedUpload(id: tusID) else {
                         throw URLError(.cannotLoadFromNetwork)
