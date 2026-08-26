@@ -47,7 +47,7 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
     func resumeStoredUploads() {
         restoreStoredContexts()
         for upload in (try? client.getStoredUploads()) ?? [] {
-            try? client.resume(id: upload.id)
+            _ = try? client.resume(id: upload.id)
         }
     }
 
@@ -131,22 +131,41 @@ private final class ScopedHeaderProvider: @unchecked Sendable {
     }
 
     func resolve(requestID: UUID, headers: [String: String], completion: @escaping ([String: String]) -> Void) {
+        let callback = HeaderCompletion(completion)
         lock.lock()
         let sessionID = sessionIDs[requestID]
         lock.unlock()
-        guard let sessionID else { completion(headers); return }
-        Task {
+        guard let sessionID else { callback.call(headers); return }
+        let capability = self.capability
+        Task { @Sendable in
             do {
                 let token = try await capability(sessionID)
                 var fresh = headers
                 fresh["Authorization"] = "Bearer \(token)"
-                completion(fresh)
+                callback.call(fresh)
             } catch {
                 // Keep the last scoped capability; TUSKit will retry after a
                 // transient auth/network failure. A general access token never
                 // reaches this persisted header path.
-                completion(headers)
+                callback.call(headers)
             }
         }
+    }
+}
+
+/// TUSKit 3.7.1 exposes its header-generator completion as a traditional
+/// escaping closure rather than an `@Sendable` closure. The callback is owned
+/// by TUSKit and may be invoked after async capability refresh, so isolate that
+/// legacy callback behind one narrowly scoped unchecked-Sendable bridge instead
+/// of allowing the non-Sendable closure itself to cross into `Task`.
+private final class HeaderCompletion: @unchecked Sendable {
+    private let completion: ([String: String]) -> Void
+
+    init(_ completion: @escaping ([String: String]) -> Void) {
+        self.completion = completion
+    }
+
+    func call(_ headers: [String: String]) {
+        completion(headers)
     }
 }
