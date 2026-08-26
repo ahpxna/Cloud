@@ -17,7 +17,7 @@ final class PhotoCloudAPIContractTests: XCTestCase {
             XCTAssertEqual(request.url?.path, "/v1/auth/mfa/enroll")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-            let requestBody = try XCTUnwrap(request.httpBody)
+            let requestBody = try requestBody(from: request)
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: String])
             XCTAssertEqual(object["password"], "current-password")
 
@@ -49,7 +49,7 @@ final class PhotoCloudAPIContractTests: XCTestCase {
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.url?.path, "/v1/auth/refresh")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-            let requestBody = try XCTUnwrap(request.httpBody)
+            let requestBody = try requestBody(from: request)
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: String])
             XCTAssertEqual(object["refresh_token"], "old-refresh")
             XCTAssertEqual(object["rotation_request_id"], "11111111-2222-4333-8444-555555555555")
@@ -72,6 +72,30 @@ final class PhotoCloudAPIContractTests: XCTestCase {
         XCTAssertEqual(credential.refreshToken, "new-refresh")
     }
 
+}
+
+private func requestBody(from request: URLRequest) throws -> Data {
+    if let body = request.httpBody {
+        return body
+    }
+    guard let stream = request.httpBodyStream else {
+        throw URLError(.badServerResponse)
+    }
+    stream.open()
+    defer { stream.close() }
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 4_096)
+    while stream.hasBytesAvailable {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count < 0 {
+            throw stream.streamError ?? URLError(.cannotDecodeContentData)
+        }
+        if count == 0 {
+            break
+        }
+        result.append(buffer, count: count)
+    }
+    return result
 }
 
 private final class URLProtocolStub: URLProtocol {
