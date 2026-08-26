@@ -52,7 +52,7 @@ func (api *API) issueMFAChallenge(w http.ResponseWriter, ctx context.Context, us
 }
 
 func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
-	principal, ok := api.accessPrincipal(r)
+	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
@@ -73,7 +73,7 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusConflict, "mfa_already_enabled", "disable existing MFA before enrolling a new authenticator")
 		return
 	} else if err != nil && !errors.Is(err, ErrMFANotConfigured) {
-		accountProblem(w, http.StatusInternalServerError, "mfa_enroll_failed", "could not begin MFA enrollment")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	user, err := api.mfaRepo.MFAUserByID(r.Context(), principal.UserID)
@@ -99,7 +99,7 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	secret, encoded, err := newTOTPSecret()
 	if err != nil {
-		accountProblem(w, http.StatusInternalServerError, "mfa_enroll_failed", "could not begin MFA enrollment")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	encrypted, nonce, err := api.mfaCipher.encrypt(user.ID, secret)
@@ -107,7 +107,7 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 		secret[index] = 0
 	}
 	if err != nil {
-		accountProblem(w, http.StatusInternalServerError, "mfa_enroll_failed", "could not begin MFA enrollment")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	if err := api.mfaRepo.SavePendingTOTP(r.Context(), user.ID, encrypted, nonce); err != nil {
@@ -116,7 +116,7 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		api.logger.Error("save pending MFA", "user_id", user.ID, "error", err)
-		accountProblem(w, http.StatusInternalServerError, "mfa_enroll_failed", "could not begin MFA enrollment")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "enroll")
@@ -127,7 +127,7 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) mfaConfirm(w http.ResponseWriter, r *http.Request) {
-	principal, ok := api.accessPrincipal(r)
+	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
@@ -166,9 +166,9 @@ func (api *API) mfaConfirm(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusInternalServerError, "mfa_confirm_failed", "could not confirm MFA")
 		return
 	}
-	if err := api.mfaRepo.ConfirmTOTP(r.Context(), principal.UserID, counter, hashes); err != nil {
+	if err := api.mfaRepo.ConfirmTOTP(r.Context(), principal.UserID, counter, hashes, record.Nonce); err != nil {
 		api.logger.Error("confirm MFA", "user_id", principal.UserID, "error", err)
-		accountProblem(w, http.StatusConflict, "mfa_confirm_failed", "could not confirm MFA")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "confirm")
@@ -192,7 +192,12 @@ func (api *API) mfaVerify(w http.ResponseWriter, r *http.Request) {
 	now := api.now().UTC()
 	challenge, err := api.mfaRepo.MFAChallengeByHash(r.Context(), hash, now)
 	if err != nil {
-		accountProblem(w, http.StatusUnauthorized, "invalid_mfa_challenge", "MFA challenge is invalid or expired")
+		if errors.Is(err, ErrMFAChallenge) {
+			accountProblem(w, http.StatusUnauthorized, "invalid_mfa_challenge", "MFA challenge is invalid or expired")
+		} else {
+			api.logger.Error("load MFA challenge", "error", err)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+		}
 		return
 	}
 
@@ -221,10 +226,15 @@ func (api *API) mfaVerify(w http.ResponseWriter, r *http.Request) {
 			api.rejectMFAAttempt(w, r, hash, now)
 			return
 		}
-		accountProblem(w, http.StatusUnauthorized, "invalid_mfa_challenge", "MFA challenge is invalid or expired")
+		if errors.Is(err, ErrMFAChallenge) {
+			accountProblem(w, http.StatusUnauthorized, "invalid_mfa_challenge", "MFA challenge is invalid or expired")
+		} else {
+			api.logger.Error("complete MFA challenge", "error", err)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+		}
 		return
 	}
-	api.createTokenPair(w, r.Context(), user, deviceName)
+	api.createTokenPair(w, r.Context(), user, deviceName, true)
 }
 
 func (api *API) rejectMFAAttempt(w http.ResponseWriter, r *http.Request, hash [32]byte, now time.Time) {
@@ -242,7 +252,7 @@ func (api *API) rejectMFAAttempt(w http.ResponseWriter, r *http.Request, hash [3
 }
 
 func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
-	principal, ok := api.accessPrincipal(r)
+	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
@@ -265,7 +275,7 @@ func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 	}
 	codes, hashes, err := newRecoveryCodes()
 	if err != nil {
-		accountProblem(w, http.StatusInternalServerError, "mfa_recovery_failed", "could not generate recovery codes")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	if err := api.mfaRepo.RotateRecoveryCodes(r.Context(), principal.UserID, counter, hashes); err != nil {
@@ -274,7 +284,7 @@ func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		api.logger.Error("rotate MFA recovery codes", "user_id", principal.UserID, "error", err)
-		accountProblem(w, http.StatusInternalServerError, "mfa_recovery_failed", "could not generate recovery codes")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "recovery")
@@ -282,7 +292,7 @@ func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) mfaDisable(w http.ResponseWriter, r *http.Request) {
-	principal, ok := api.accessPrincipal(r)
+	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
@@ -308,7 +318,7 @@ func (api *API) mfaDisable(w http.ResponseWriter, r *http.Request) {
 			accountProblem(w, http.StatusUnauthorized, "invalid_mfa_code", "MFA code is invalid")
 			return
 		}
-		accountProblem(w, http.StatusInternalServerError, "mfa_disable_failed", "could not disable MFA")
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
 		return
 	}
 	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "disable")

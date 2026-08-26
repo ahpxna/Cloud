@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [gateway, admin, manifest, scrub, metrics-exporter, synthetic-probe, audit-export, migrate]
+        target: [gateway, admin, manifest, scrub, metrics-exporter, synthetic-probe, audit-export, migrate, session-maintenance]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Install Trivy

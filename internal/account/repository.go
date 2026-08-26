@@ -14,6 +14,7 @@ import (
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrRefreshReplay      = errors.New("refresh token replay detected")
+	ErrMFARequired        = errors.New("mfa is required")
 )
 
 type User struct {
@@ -42,7 +43,7 @@ type RefreshRotation struct {
 
 type Repository interface {
 	ActiveUserByEmail(context.Context, string) (User, error)
-	CreateRefreshSession(context.Context, string, string, [32]byte, time.Time) (string, error)
+	CreateRefreshSession(context.Context, string, string, [32]byte, time.Time, bool) (string, error)
 	RotateRefreshSession(context.Context, [32]byte, [32]byte, [32]byte, time.Time, []byte, []byte, time.Time) (RefreshRotation, error)
 	RevokeRefreshSession(context.Context, [32]byte) error
 	ListDeviceSessions(context.Context, string) ([]DeviceSession, error)
@@ -69,9 +70,19 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 func (r *PostgresRepository) SessionActive(ctx context.Context, userID, sessionID string) (bool, error) {
 	var active bool
 	err := r.pool.QueryRow(ctx, `SELECT EXISTS (
-        SELECT 1 FROM user_sessions
-        WHERE id = $1::uuid AND user_id = $2::uuid
-          AND revoked_at IS NULL AND expires_at > now()
+        SELECT 1
+        FROM device_sessions AS device
+        WHERE device.user_id = $2::uuid
+          AND device.revoked_at IS NULL
+          AND device.expires_at > now()
+          AND (
+            device.id = $1::uuid
+            OR EXISTS (
+                SELECT 1 FROM user_sessions AS generation
+                WHERE generation.id = $1::uuid
+                  AND generation.device_session_id = device.id
+            )
+          )
     )`, sessionID, userID).Scan(&active)
 	return active, err
 }
@@ -93,14 +104,51 @@ func (r *PostgresRepository) CreateRefreshSession(
 	userID, deviceName string,
 	tokenHash [32]byte,
 	expiresAt time.Time,
+	mfaSatisfied bool,
 ) (string, error) {
-	var sessionID string
-	err := r.pool.QueryRow(ctx, `
-        INSERT INTO user_sessions (user_id, device_name, refresh_token_sha256, expires_at)
-        VALUES ($1::uuid, $2, $3, $4)
-        RETURNING id::text`, userID, deviceName, tokenHash[:], expiresAt,
-	).Scan(&sessionID)
-	return sessionID, err
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	var authEpoch int64
+	if err := tx.QueryRow(ctx, `
+        SELECT auth_epoch FROM users
+        WHERE id = $1::uuid AND state = 'active' AND deleted_at IS NULL
+        FOR UPDATE`, userID).Scan(&authEpoch); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrInvalidCredentials
+		}
+		return "", err
+	}
+	if !mfaSatisfied {
+		var required bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+            SELECT 1 FROM user_mfa_totp
+            WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL
+        )`, userID).Scan(&required); err != nil {
+			return "", err
+		}
+		if required {
+			return "", ErrMFARequired
+		}
+	}
+	var deviceSessionID string
+	if err := tx.QueryRow(ctx, `
+        INSERT INTO device_sessions (user_id, device_name, expires_at)
+        VALUES ($1::uuid, $2, $3)
+        RETURNING id::text`, userID, deviceName, expiresAt).Scan(&deviceSessionID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `
+        INSERT INTO user_sessions (device_session_id, refresh_token_sha256, expires_at)
+        VALUES ($1::uuid, $2, $3)`, deviceSessionID, tokenHash[:], expiresAt); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return deviceSessionID, nil
 }
 
 func (r *PostgresRepository) RotateRefreshSession(
@@ -116,75 +164,80 @@ func (r *PostgresRepository) RotateRefreshSession(
 	}
 	defer tx.Rollback(ctx)
 
-	// Expired retry ciphertext is useless and should not become a long-lived
-	// encrypted archive of refresh secrets. Bound its database lifetime even on
-	// active installations without a separate cleanup daemon.
-	if _, err := tx.Exec(ctx, `
-        UPDATE user_sessions
-        SET refresh_retry_request_sha256 = NULL, refresh_retry_ciphertext = NULL,
-            refresh_retry_nonce = NULL, refresh_retry_until = NULL
-        WHERE refresh_retry_until IS NOT NULL AND refresh_retry_until <= $1`, now); err != nil {
+	var deviceID string
+	if err := tx.QueryRow(ctx, `SELECT device_session_id::text FROM user_sessions WHERE refresh_token_sha256 = $1`, oldHash[:]).Scan(&deviceID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RefreshRotation{}, ErrInvalidCredentials
+		}
 		return RefreshRotation{}, err
 	}
-
 	var user User
-	var deviceName, sessionID, familyID string
+	var deviceRevokedAt *time.Time
+	var deviceExpiresAt time.Time
+	if err := tx.QueryRow(ctx, `
+        SELECT account.id::text, account.email, account.password_hash, account.role,
+               device.revoked_at, device.expires_at
+        FROM device_sessions AS device
+        JOIN users AS account ON account.id = device.user_id
+        WHERE device.id = $1::uuid AND account.state = 'active' AND account.deleted_at IS NULL
+        FOR UPDATE OF device`, deviceID).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceRevokedAt, &deviceExpiresAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RefreshRotation{}, ErrInvalidCredentials
+		}
+		return RefreshRotation{}, err
+	}
+	var generationID string
 	var revokedAt, retryUntil *time.Time
 	var expiresAt time.Time
 	var storedRetryRequestHash, storedRetryCiphertext, storedRetryNonce []byte
-	err = tx.QueryRow(ctx, `
-        SELECT account.id::text, account.email, account.password_hash,
-               account.role, session.device_name, session.id::text,
-               session.session_family_id::text, session.revoked_at, session.expires_at,
-               session.refresh_retry_request_sha256, session.refresh_retry_ciphertext,
-               session.refresh_retry_nonce, session.refresh_retry_until
-        FROM user_sessions AS session
-        JOIN users AS account ON account.id = session.user_id
-        WHERE session.refresh_token_sha256 = $1
-          AND account.state = 'active' AND account.deleted_at IS NULL
-		FOR UPDATE OF session`, oldHash[:],
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &sessionID, &familyID, &revokedAt, &expiresAt, &storedRetryRequestHash, &storedRetryCiphertext, &storedRetryNonce, &retryUntil)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return RefreshRotation{}, ErrInvalidCredentials
-	}
-	if err != nil {
+	if err := tx.QueryRow(ctx, `
+        SELECT id::text, revoked_at, expires_at,
+               refresh_retry_request_sha256, refresh_retry_ciphertext,
+               refresh_retry_nonce, refresh_retry_until
+        FROM user_sessions
+        WHERE refresh_token_sha256 = $1 AND device_session_id = $2::uuid
+        FOR UPDATE`, oldHash[:], deviceID).Scan(&generationID, &revokedAt, &expiresAt, &storedRetryRequestHash, &storedRetryCiphertext, &storedRetryNonce, &retryUntil); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RefreshRotation{}, ErrInvalidCredentials
+		}
 		return RefreshRotation{}, err
 	}
+	if deviceRevokedAt != nil || !deviceExpiresAt.After(now) {
+		return RefreshRotation{}, ErrInvalidCredentials
+	}
 	if revokedAt != nil || !expiresAt.After(now) {
-		// A transport failure may hide the successful rotation response from the
-		// client. During a very short grace window, return the exact successor
-		// token rather than treating the retry as theft. The successor secret is
-		// stored only as authenticated ciphertext on the revoked parent row.
 		requestIDMatches := len(storedRetryRequestHash) == 32 && subtle.ConstantTimeCompare(storedRetryRequestHash, retryRequestHash[:]) == 1
 		if revokedAt != nil && retryUntil != nil && retryUntil.After(now) && requestIDMatches && len(storedRetryCiphertext) != 0 && len(storedRetryNonce) != 0 {
-			var nextSessionID string
-			err := tx.QueryRow(ctx, `
-                SELECT id::text
-                FROM user_sessions
-                WHERE parent_session_id = $1::uuid
-                  AND revoked_at IS NULL AND expires_at > $2
-                ORDER BY created_at DESC
-                LIMIT 1`, sessionID, now).Scan(&nextSessionID)
-			if err == nil {
-				if _, err := tx.Exec(ctx, `UPDATE user_sessions SET last_used_at = $2 WHERE id = $1::uuid`, sessionID, now); err != nil {
+			var successorExists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+                SELECT 1 FROM user_sessions
+                WHERE parent_session_id = $1::uuid AND device_session_id = $2::uuid
+                  AND revoked_at IS NULL AND expires_at > $3
+            )`, generationID, deviceID, now).Scan(&successorExists); err != nil {
+				return RefreshRotation{}, err
+			}
+			if successorExists {
+				if _, err := tx.Exec(ctx, `UPDATE user_sessions SET last_used_at = $2 WHERE id = $1::uuid`, generationID, now); err != nil {
+					return RefreshRotation{}, err
+				}
+				if _, err := tx.Exec(ctx, `UPDATE device_sessions SET last_used_at = $2 WHERE id = $1::uuid`, deviceID, now); err != nil {
 					return RefreshRotation{}, err
 				}
 				if err := tx.Commit(ctx); err != nil {
 					return RefreshRotation{}, err
 				}
-				return RefreshRotation{User: user, SessionID: nextSessionID, RetryTokenCiphertext: storedRetryCiphertext, RetryTokenNonce: storedRetryNonce, Retried: true}, nil
+				return RefreshRotation{User: user, SessionID: deviceID, RetryTokenCiphertext: storedRetryCiphertext, RetryTokenNonce: storedRetryNonce, Retried: true}, nil
 			}
-			if !errors.Is(err, pgx.ErrNoRows) {
-				return RefreshRotation{}, err
-			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, $2), last_used_at = $2 WHERE id = $1::uuid`, deviceID, now); err != nil {
+			return RefreshRotation{}, err
 		}
 		if _, err := tx.Exec(ctx, `
             UPDATE user_sessions
-            SET revoked_at = COALESCE(revoked_at, $2), reused_at = $2, last_used_at = $2
-            WHERE session_family_id = $1::uuid AND revoked_at IS NULL`, familyID, now); err != nil {
-			return RefreshRotation{}, err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE user_sessions SET reused_at = $2, last_used_at = $2 WHERE id = $1::uuid`, sessionID, now); err != nil {
+            SET revoked_at = COALESCE(revoked_at, $2),
+                reused_at = CASE WHEN id = $3::uuid THEN $2 ELSE reused_at END,
+                last_used_at = CASE WHEN id = $3::uuid THEN $2 ELSE last_used_at END
+            WHERE device_session_id = $1::uuid`, deviceID, now, generationID); err != nil {
 			return RefreshRotation{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -202,49 +255,55 @@ func (r *PostgresRepository) RotateRefreshSession(
             SET revoked_at = $2, last_used_at = $2,
                 refresh_retry_request_sha256 = $3, refresh_retry_ciphertext = $4,
                 refresh_retry_nonce = $5, refresh_retry_until = $6
-            WHERE id = $1::uuid`, sessionID, now, retryRequestHash[:], retryCiphertext, retryNonce, now.Add(refreshRetryGrace)); err != nil {
+            WHERE id = $1::uuid`, generationID, now, retryRequestHash[:], retryCiphertext, retryNonce, now.Add(refreshRetryGrace)); err != nil {
 			return RefreshRotation{}, err
 		}
-	} else if _, err := tx.Exec(ctx, `
-        UPDATE user_sessions SET revoked_at = $2, last_used_at = $2 WHERE id = $1::uuid`, sessionID, now); err != nil {
+	} else if _, err := tx.Exec(ctx, `UPDATE user_sessions SET revoked_at = $2, last_used_at = $2 WHERE id = $1::uuid`, generationID, now); err != nil {
 		return RefreshRotation{}, err
 	}
-	var nextSessionID string
-	err = tx.QueryRow(ctx, `
-        INSERT INTO user_sessions (
-            user_id, device_name, refresh_token_sha256, expires_at,
-            session_family_id, parent_session_id
-        ) VALUES ($1::uuid, $2, $3, $4, $5::uuid, $6::uuid)
-        RETURNING id::text`, user.ID, deviceName, newHash[:], newExpiresAt, familyID, sessionID,
-	).Scan(&nextSessionID)
-	if err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO user_sessions (device_session_id, refresh_token_sha256, expires_at, parent_session_id) VALUES ($1::uuid, $2, $3, $4::uuid)`, deviceID, newHash[:], newExpiresAt, generationID); err != nil {
+		return RefreshRotation{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE device_sessions SET last_used_at = $2, expires_at = GREATEST(expires_at, $3) WHERE id = $1::uuid`, deviceID, now, newExpiresAt); err != nil {
 		return RefreshRotation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return RefreshRotation{}, err
 	}
-	return RefreshRotation{User: user, SessionID: nextSessionID}, nil
+	return RefreshRotation{User: user, SessionID: deviceID}, nil
 }
 
 func (r *PostgresRepository) RevokeRefreshSession(ctx context.Context, tokenHash [32]byte) error {
-	_, err := r.pool.Exec(ctx, `
-        WITH target_family AS (
-            SELECT session_family_id
-            FROM user_sessions
-            WHERE refresh_token_sha256 = $1
-        )
-        UPDATE user_sessions
-        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
-        WHERE session_family_id IN (SELECT session_family_id FROM target_family)`, tokenHash[:])
-	return err
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var deviceID string
+	if err := tx.QueryRow(ctx, `SELECT device_session_id::text FROM user_sessions WHERE refresh_token_sha256 = $1`, tokenHash[:]).Scan(&deviceID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	var locked string
+	if err := tx.QueryRow(ctx, `SELECT id::text FROM device_sessions WHERE id = $1::uuid FOR UPDATE`, deviceID).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now() WHERE id = $1::uuid`, deviceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now() WHERE device_session_id = $1::uuid`, deviceID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (r *PostgresRepository) ListDeviceSessions(ctx context.Context, userID string) ([]DeviceSession, error) {
-	rows, err := r.pool.Query(ctx, `
-        SELECT id::text, device_name, created_at, last_used_at, expires_at
-        FROM user_sessions
-        WHERE user_id = $1::uuid AND revoked_at IS NULL AND expires_at > now()
-        ORDER BY last_used_at DESC, id DESC`, userID)
+	rows, err := r.pool.Query(ctx, `SELECT id::text, device_name, created_at, last_used_at, expires_at FROM device_sessions WHERE user_id = $1::uuid AND revoked_at IS NULL AND expires_at > now() ORDER BY last_used_at DESC, id DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -266,24 +325,17 @@ func (r *PostgresRepository) RevokeDeviceSession(ctx context.Context, userID, se
 		return err
 	}
 	defer tx.Rollback(ctx)
-
-	// A refresh rotates one device into a new row. Find the stable family even
-	// when the selected generation was already revoked, then revoke every live
-	// descendant so a concurrent refresh cannot evade a device revoke.
-	var familyID string
-	if err := tx.QueryRow(ctx, `
-        SELECT session_family_id::text
-        FROM user_sessions
-        WHERE id = $1::uuid AND user_id = $2::uuid`, sessionID, userID).Scan(&familyID); err != nil {
+	var locked string
+	if err := tx.QueryRow(ctx, `SELECT id::text FROM device_sessions WHERE id = $1::uuid AND user_id = $2::uuid FOR UPDATE`, sessionID, userID).Scan(&locked); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrInvalidCredentials
 		}
 		return err
 	}
-	if _, err := tx.Exec(ctx, `
-        UPDATE user_sessions
-        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
-        WHERE user_id = $1::uuid AND session_family_id = $2::uuid AND revoked_at IS NULL`, userID, familyID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now() WHERE id = $1::uuid`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now() WHERE device_session_id = $1::uuid`, sessionID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -410,15 +462,18 @@ func (r *PostgresRepository) SavePendingTOTP(ctx context.Context, userID string,
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockUserTransaction(ctx, tx, userID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidCredentials
+		}
+		return err
+	}
 	command, err := tx.Exec(ctx, `
         INSERT INTO user_mfa_totp (user_id, encrypted_secret, nonce, confirmed_at, last_used_counter, updated_at)
         VALUES ($1::uuid, $2, $3, NULL, NULL, now())
         ON CONFLICT (user_id) DO UPDATE
-        SET encrypted_secret = EXCLUDED.encrypted_secret,
-            nonce = EXCLUDED.nonce,
-            confirmed_at = NULL,
-            last_used_counter = NULL,
-            updated_at = now()
+        SET encrypted_secret = EXCLUDED.encrypted_secret, nonce = EXCLUDED.nonce,
+            confirmed_at = NULL, last_used_counter = NULL, updated_at = now()
         WHERE user_mfa_totp.confirmed_at IS NULL`, userID, encryptedSecret, nonce)
 	if err != nil {
 		return err
@@ -432,11 +487,14 @@ func (r *PostgresRepository) SavePendingTOTP(ctx context.Context, userID string,
 	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = COALESCE(consumed_at, now()) WHERE user_id = $1::uuid AND consumed_at IS NULL`, userID); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `UPDATE users SET auth_epoch = auth_epoch + 1 WHERE id = $1::uuid`, userID); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
-func (r *PostgresRepository) ConfirmTOTP(ctx context.Context, userID string, counter int64, recoveryHashes [][32]byte) error {
-	if len(recoveryHashes) == 0 {
+func (r *PostgresRepository) ConfirmTOTP(ctx context.Context, userID string, counter int64, recoveryHashes [][32]byte, expectedNonce []byte) error {
+	if len(recoveryHashes) == 0 || len(expectedNonce) == 0 {
 		return ErrMFAInvalid
 	}
 	tx, err := r.pool.Begin(ctx)
@@ -444,43 +502,35 @@ func (r *PostgresRepository) ConfirmTOTP(ctx context.Context, userID string, cou
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockUserTransaction(ctx, tx, userID); err != nil {
+		return err
+	}
 	var confirmedAt *time.Time
-	if err := tx.QueryRow(ctx, `SELECT confirmed_at FROM user_mfa_totp WHERE user_id = $1::uuid FOR UPDATE`, userID).Scan(&confirmedAt); errors.Is(err, pgx.ErrNoRows) {
+	var nonce []byte
+	if err := tx.QueryRow(ctx, `SELECT confirmed_at, nonce FROM user_mfa_totp WHERE user_id = $1::uuid FOR UPDATE`, userID).Scan(&confirmedAt, &nonce); errors.Is(err, pgx.ErrNoRows) {
 		return ErrMFANotConfigured
 	} else if err != nil {
 		return err
 	}
-	if confirmedAt != nil {
+	if confirmedAt != nil || subtle.ConstantTimeCompare(nonce, expectedNonce) != 1 {
 		return ErrMFAInvalid
 	}
-	if _, err := tx.Exec(ctx, `
-        UPDATE user_mfa_totp
-        SET confirmed_at = now(), last_used_counter = $2, updated_at = now()
-        WHERE user_id = $1::uuid`, userID, counter); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE user_mfa_totp SET confirmed_at = now(), last_used_counter = $2, updated_at = now() WHERE user_id = $1::uuid`, userID, counter); err != nil {
 		return err
 	}
 	if err := replaceRecoveryCodesTx(ctx, tx, userID, recoveryHashes); err != nil {
 		return err
 	}
-	// Enabling MFA changes the account authentication assurance level. Revoke
-	// every refresh family issued before the second factor existed so a stolen
-	// pre-MFA refresh token cannot keep minting access tokens indefinitely.
-	if _, err := tx.Exec(ctx, `
-        UPDATE user_sessions
-        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
-        WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE users SET auth_epoch = auth_epoch + 1 WHERE id = $1::uuid`, userID); err != nil {
+		return err
+	}
+	if err := revokeAllDeviceSessionsTx(ctx, tx, userID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-func (r *PostgresRepository) CreateMFAChallenge(
-	ctx context.Context,
-	userID, deviceName string,
-	hash [32]byte,
-	now, expiresAt time.Time,
-	attempts int,
-) error {
+func (r *PostgresRepository) CreateMFAChallenge(ctx context.Context, userID, deviceName string, hash [32]byte, now, expiresAt time.Time, attempts int) error {
 	if attempts <= 0 || deviceName == "" || !expiresAt.After(now) {
 		return ErrMFAChallenge
 	}
@@ -489,41 +539,28 @@ func (r *PostgresRepository) CreateMFAChallenge(
 		return err
 	}
 	defer tx.Rollback(ctx)
-
-	// Serialize challenge issuance for a user. This prevents concurrent successful
-	// password logins from racing past the durable per-user issuance bound.
 	if err := lockUserTransaction(ctx, tx, userID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrMFAChallenge
-		}
 		return err
 	}
-
-	if _, err := tx.Exec(ctx, `
-        DELETE FROM mfa_challenges
-        WHERE created_at < $1`, now.Add(-mfaChallengeRetention)); err != nil {
+	var authEpoch int64
+	var configured bool
+	if err := tx.QueryRow(ctx, `SELECT account.auth_epoch, EXISTS (SELECT 1 FROM user_mfa_totp WHERE user_id = account.id AND confirmed_at IS NOT NULL) FROM users AS account WHERE account.id = $1::uuid`, userID).Scan(&authEpoch, &configured); err != nil {
 		return err
 	}
-
+	if !configured {
+		return ErrMFANotConfigured
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM mfa_challenges WHERE created_at < $1`, now.Add(-mfaChallengeRetention)); err != nil {
+		return err
+	}
 	var recent int
-	if err := tx.QueryRow(ctx, `
-        SELECT count(*)
-        FROM mfa_challenges
-        WHERE user_id = $1::uuid AND created_at >= $2`,
-		userID, now.Add(-mfaChallengeIssueWindow),
-	).Scan(&recent); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM mfa_challenges WHERE user_id = $1::uuid AND created_at >= $2`, userID, now.Add(-mfaChallengeIssueWindow)).Scan(&recent); err != nil {
 		return err
 	}
 	if recent >= mfaChallengeIssueLimit {
 		return ErrMFARateLimited
 	}
-
-	if _, err := tx.Exec(ctx, `
-        INSERT INTO mfa_challenges (
-            challenge_hash, user_id, device_name, expires_at, attempts_remaining, created_at
-        ) VALUES ($1, $2::uuid, $3, $4, $5, $6)`,
-		hash[:], userID, deviceName, expiresAt, attempts, now,
-	); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO mfa_challenges (challenge_hash, user_id, device_name, expires_at, attempts_remaining, created_at, auth_epoch) VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)`, hash[:], userID, deviceName, expiresAt, attempts, now, authEpoch); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -538,17 +575,11 @@ func (r *PostgresRepository) MFAChallengeByHash(ctx context.Context, hash [32]by
         FROM mfa_challenges AS challenge
         JOIN users AS account ON account.id = challenge.user_id
         JOIN user_mfa_totp AS mfa ON mfa.user_id = challenge.user_id
-        WHERE challenge.challenge_hash = $1
-          AND challenge.consumed_at IS NULL
-          AND challenge.attempts_remaining > 0
-          AND challenge.expires_at > $2
+        WHERE challenge.challenge_hash = $1 AND challenge.consumed_at IS NULL
+          AND challenge.attempts_remaining > 0 AND challenge.expires_at > $2
+          AND challenge.auth_epoch = account.auth_epoch
           AND mfa.confirmed_at IS NOT NULL
-          AND account.state = 'active' AND account.deleted_at IS NULL`, hash[:], now,
-	).Scan(
-		&challenge.User.ID, &challenge.User.Email, &challenge.User.PasswordHash, &challenge.User.Role,
-		&challenge.DeviceName, &challenge.EncryptedSecret, &challenge.Nonce,
-		&challenge.LastUsedCounter, &challenge.ExpiresAt, &challenge.Attempts,
-	)
+          AND account.state = 'active' AND account.deleted_at IS NULL`, hash[:], now).Scan(&challenge.User.ID, &challenge.User.Email, &challenge.User.PasswordHash, &challenge.User.Role, &challenge.DeviceName, &challenge.EncryptedSecret, &challenge.Nonce, &challenge.LastUsedCounter, &challenge.ExpiresAt, &challenge.Attempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return MFAChallenge{}, ErrMFAChallenge
 	}
@@ -589,6 +620,7 @@ func (r *PostgresRepository) CompleteMFATOTPChallenge(ctx context.Context, hash 
           AND challenge.consumed_at IS NULL
           AND challenge.attempts_remaining > 0
           AND challenge.expires_at > $2
+          AND challenge.auth_epoch = account.auth_epoch
           AND mfa.confirmed_at IS NOT NULL
           AND account.state = 'active' AND account.deleted_at IS NULL
         FOR UPDATE OF challenge, mfa`, hash[:], now,
@@ -632,6 +664,7 @@ func (r *PostgresRepository) CompleteMFARecoveryChallenge(ctx context.Context, c
           AND challenge.consumed_at IS NULL
           AND challenge.attempts_remaining > 0
           AND challenge.expires_at > $2
+          AND challenge.auth_epoch = account.auth_epoch
           AND mfa.confirmed_at IS NOT NULL
           AND account.state = 'active' AND account.deleted_at IS NULL
         FOR UPDATE OF challenge`, challengeHash[:], now,
@@ -741,15 +774,10 @@ func (r *PostgresRepository) RecordMFAActionAttempt(
 	return true, 0, tx.Commit(ctx)
 }
 
-// lockUserTransaction serializes per-user state transitions while keeping the
-// gateway role read-only on users. Advisory locks are transaction-scoped and
-// are released automatically on both commit and rollback.
+// lockUserTransaction serializes account-assurance transitions on the durable users row.
 func lockUserTransaction(ctx context.Context, tx pgx.Tx, userID string) error {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, userID); err != nil {
-		return err
-	}
 	var existing string
-	return tx.QueryRow(ctx, `SELECT id::text FROM users WHERE id = $1::uuid`, userID).Scan(&existing)
+	return tx.QueryRow(ctx, `SELECT id::text FROM users WHERE id = $1::uuid FOR UPDATE`, userID).Scan(&existing)
 }
 
 func (r *PostgresRepository) ClearMFAActionAttempts(ctx context.Context, userID, action string) error {
@@ -794,6 +822,14 @@ func (r *PostgresRepository) RotateRecoveryCodes(ctx context.Context, userID str
 	return tx.Commit(ctx)
 }
 
+func revokeAllDeviceSessionsTx(ctx context.Context, tx pgx.Tx, userID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now() WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `UPDATE user_sessions AS generation SET revoked_at = COALESCE(generation.revoked_at, now()), last_used_at = now() FROM device_sessions AS device WHERE generation.device_session_id = device.id AND device.user_id = $1::uuid AND generation.revoked_at IS NULL`, userID)
+	return err
+}
+
 func replaceRecoveryCodesTx(ctx context.Context, tx pgx.Tx, userID string, hashes [][32]byte) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM user_mfa_recovery_codes WHERE user_id = $1::uuid`, userID); err != nil {
 		return err
@@ -812,12 +848,11 @@ func (r *PostgresRepository) DisableMFA(ctx context.Context, userID string, coun
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockUserTransaction(ctx, tx, userID); err != nil {
+		return err
+	}
 	var lastUsed *int64
-	err = tx.QueryRow(ctx, `
-        SELECT last_used_counter
-        FROM user_mfa_totp
-        WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL
-        FOR UPDATE`, userID).Scan(&lastUsed)
+	err = tx.QueryRow(ctx, `SELECT last_used_counter FROM user_mfa_totp WHERE user_id = $1::uuid AND confirmed_at IS NOT NULL FOR UPDATE`, userID).Scan(&lastUsed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrMFANotConfigured
 	}
@@ -840,10 +875,10 @@ func (r *PostgresRepository) DisableMFA(ctx context.Context, userID string, coun
 	if command.RowsAffected() != 1 {
 		return ErrMFANotConfigured
 	}
-	if _, err := tx.Exec(ctx, `
-        UPDATE user_sessions
-        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
-        WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE users SET auth_epoch = auth_epoch + 1 WHERE id = $1::uuid`, userID); err != nil {
+		return err
+	}
+	if err := revokeAllDeviceSessionsTx(ctx, tx, userID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

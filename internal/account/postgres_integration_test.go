@@ -49,7 +49,7 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 	}
 
 	preMFARefresh := sha256.Sum256([]byte("pre-mfa-refresh-token"))
-	preMFASessionID, err := repository.CreateRefreshSession(ctx, userID, "Pre-MFA iPhone", preMFARefresh, now.Add(30*24*time.Hour))
+	preMFASessionID, err := repository.CreateRefreshSession(ctx, userID, "Pre-MFA iPhone", preMFARefresh, now.Add(30*24*time.Hour), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 		sha256.Sum256([]byte("initial-recovery-1")),
 		sha256.Sum256([]byte("initial-recovery-2")),
 	}
-	if err := repository.ConfirmTOTP(ctx, userID, 100, initialRecovery); err != nil {
+	if err := repository.ConfirmTOTP(ctx, userID, 100, initialRecovery, make([]byte, 12)); err != nil {
 		t.Fatal(err)
 	}
 	active, err := repository.SessionActive(ctx, userID, preMFASessionID)
@@ -175,7 +175,7 @@ func TestPostgresRefreshRotationRetryGraceIsBoundToRequestID(t *testing.T) {
 	newHash := sha256.Sum256([]byte("refresh-new"))
 	requestA := sha256.Sum256([]byte("rotation-request-a"))
 	requestB := sha256.Sum256([]byte("rotation-request-b"))
-	if _, err := repository.CreateRefreshSession(ctx, userID, "Retry iPhone", oldHash, now.Add(30*24*time.Hour)); err != nil {
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Retry iPhone", oldHash, now.Add(30*24*time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
 	ciphertext := []byte("authenticated-ciphertext")
@@ -235,7 +235,7 @@ func TestPostgresRefreshRotationRetryGraceExpires(t *testing.T) {
 	oldHash := sha256.Sum256([]byte("refresh-expiry-old"))
 	newHash := sha256.Sum256([]byte("refresh-expiry-new"))
 	requestID := sha256.Sum256([]byte("rotation-request-expiry"))
-	if _, err := repository.CreateRefreshSession(ctx, userID, "Expiry iPhone", oldHash, now.Add(30*24*time.Hour)); err != nil {
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Expiry iPhone", oldHash, now.Add(30*24*time.Hour), false); err != nil {
 		t.Fatal(err)
 	}
 	first, err := repository.RotateRefreshSession(ctx, oldHash, newHash, requestID, now.Add(30*24*time.Hour), []byte("authenticated-ciphertext"), []byte("123456789012"), now)
@@ -271,7 +271,7 @@ func TestPostgresMFAChallengeIssuanceLimit(t *testing.T) {
 	if err := repository.SavePendingTOTP(ctx, userID, []byte("encrypted-test-secret"), make([]byte, 12)); err != nil {
 		t.Fatal(err)
 	}
-	if err := repository.ConfirmTOTP(ctx, userID, 100, [][32]byte{sha256.Sum256([]byte("recovery"))}); err != nil {
+	if err := repository.ConfirmTOTP(ctx, userID, 100, [][32]byte{sha256.Sum256([]byte("recovery"))}, make([]byte, 12)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,7 +302,7 @@ func TestPostgresDeviceRevokeRevokesRefreshFamilyAfterRotation(t *testing.T) {
 	}
 	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
 	parentHash := sha256.Sum256([]byte("device-family-parent"))
-	parentID, err := repository.CreateRefreshSession(ctx, userID, "Family iPhone", parentHash, now.Add(30*24*time.Hour))
+	parentID, err := repository.CreateRefreshSession(ctx, userID, "Family iPhone", parentHash, now.Add(30*24*time.Hour), false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -57,6 +57,7 @@ services:
       INTEGRITY_DB_PASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
       READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
       BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env}
+      SESSION_MAINTENANCE_DB_PASSWORD: ${SESSION_MAINTENANCE_DB_PASSWORD:?set SESSION_MAINTENANCE_DB_PASSWORD in .env}
     networks: [database]
     volumes:
       - ./scripts/bootstrap-db-roles.sh:/opt/photo-cloud/bootstrap-db-roles.sh:ro
@@ -112,11 +113,39 @@ services:
       INTEGRITY_DB_PASSWORD: ${INTEGRITY_DB_PASSWORD:?set INTEGRITY_DB_PASSWORD in .env}
       READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
       BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env}
+      SESSION_MAINTENANCE_DB_PASSWORD: ${SESSION_MAINTENANCE_DB_PASSWORD:?set SESSION_MAINTENANCE_DB_PASSWORD in .env}
     networks: [database]
     volumes:
       - ./scripts/bootstrap-db-roles.sh:/opt/photo-cloud/bootstrap-db-roles.sh:ro
     depends_on:
       migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  session-maintenance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: session-maintenance
+    profiles: ["maintenance"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-photo_cloud}
+      PGUSER: photo_cloud_session_maintenance
+      PGPASSWORD: ${SESSION_MAINTENANCE_DB_PASSWORD:?set SESSION_MAINTENANCE_DB_PASSWORD in .env}
+      SESSION_HISTORY_RETENTION_DAYS: ${SESSION_HISTORY_RETENTION_DAYS:-180}
+    networks: [database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-runtime-grants:
         condition: service_completed_successfully
     read_only: true
     tmpfs:

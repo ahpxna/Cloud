@@ -66,12 +66,11 @@ func (repository *memoryAccountRepository) RotateRefreshSession(
 ) (RefreshRotation, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	if _, ok := repository.sessions[oldHash]; !ok {
+	id, ok := repository.sessions[oldHash]
+	if !ok {
 		return RefreshRotation{}, ErrInvalidCredentials
 	}
 	delete(repository.sessions, oldHash)
-	repository.nextID++
-	id := "90000000-0000-4000-8000-00000000000" + string(rune('0'+repository.nextID))
 	repository.sessions[newHash] = id
 	return RefreshRotation{User: repository.user, SessionID: id}, nil
 }

@@ -52,6 +52,41 @@ func run() error {
 		return errors.New("usage: audit-export -output /protected/path/events.jsonl [-after-sequence N]")
 	}
 
+	directory := filepath.Dir(*output)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	sidecar := *output + ".sha256"
+	if _, err := os.Stat(*output); err == nil {
+		if _, sideErr := os.Stat(sidecar); sideErr == nil {
+			return fmt.Errorf("refusing to replace existing export %s", *output)
+		} else if !errors.Is(sideErr, os.ErrNotExist) {
+			return sideErr
+		}
+		// Crash recovery: the JSONL hard-link may have reached disk before its
+		// checksum sidecar. Repair only the missing sidecar from immutable bytes;
+		// this path deliberately does not require PostgreSQL to be online.
+		digest, err := fileSHA256(*output)
+		if err != nil {
+			return err
+		}
+		if err := publishSidecarNoReplace(directory, sidecar, digest, filepath.Base(*output)); err != nil {
+			return err
+		}
+		if err := syncDirectory(directory); err != nil {
+			return err
+		}
+		fmt.Printf("repaired missing checksum sidecar for %s\n", *output)
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Stat(sidecar); err == nil {
+		return fmt.Errorf("refusing export because checksum sidecar already exists without JSONL: %s", sidecar)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
@@ -63,10 +98,6 @@ func run() error {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
 
-	directory := filepath.Dir(*output)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return err
-	}
 	temp, err := os.CreateTemp(directory, ".audit-export-*")
 	if err != nil {
 		return err
@@ -92,14 +123,12 @@ func run() error {
 		return err
 	}
 	count := 0
-	var last int64 = *after
+	last := *after
 	for rows.Next() {
 		var item event
-		if err := rows.Scan(
-			&item.SequenceID, &item.UploadSessionID, &item.OwnerID, &item.EventType,
+		if err := rows.Scan(&item.SequenceID, &item.UploadSessionID, &item.OwnerID, &item.EventType,
 			&item.OffsetFrom, &item.OffsetTo, &item.Attempt, &item.ErrorCode,
-			&item.RequestID, &item.Details, &item.OccurredAt,
-		); err != nil {
+			&item.RequestID, &item.Details, &item.OccurredAt); err != nil {
 			rows.Close()
 			temp.Close()
 			return err
@@ -135,26 +164,73 @@ func run() error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	if _, err := os.Stat(*output); err == nil {
-		return fmt.Errorf("refusing to replace existing export %s", *output)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
+
 	if err := os.Link(tempPath, *output); err != nil {
-		return err
+		return fmt.Errorf("publish audit JSONL without replacement: %w", err)
+	}
+	if err := syncDirectory(directory); err != nil {
+		return fmt.Errorf("persist audit JSONL directory entry: %w", err)
 	}
 	digest := hex.EncodeToString(hasher.Sum(nil))
-	sidecar := *output + ".sha256"
-	sidecarContent := []byte(fmt.Sprintf("%s  %s\n", digest, filepath.Base(*output)))
-	if err := os.WriteFile(sidecar, sidecarContent, 0o600); err != nil {
-		_ = os.Remove(*output)
+	if err := publishSidecarNoReplace(directory, sidecar, digest, filepath.Base(*output)); err != nil {
 		return err
 	}
-	dir, err := os.Open(directory)
-	if err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	if err := syncDirectory(directory); err != nil {
+		return fmt.Errorf("persist audit checksum directory entry: %w", err)
 	}
 	fmt.Printf("exported %d events through sequence %d to %s\n", count, last, *output)
 	return nil
+}
+
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func publishSidecarNoReplace(directory, sidecar, digest, basename string) error {
+	temp, err := os.CreateTemp(directory, ".audit-sha256-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := fmt.Fprintf(temp, "%s  %s\n", digest, basename); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(tempPath, sidecar); err != nil {
+		return fmt.Errorf("publish checksum sidecar without replacement: %w", err)
+	}
+	return nil
+}
+
+func syncDirectory(directory string) error {
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		dir.Close()
+		return err
+	}
+	return dir.Close()
 }

@@ -16,7 +16,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/metrics-exporter ./cmd/metrics-exporter \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/synthetic-probe ./cmd/synthetic-probe \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/audit-export ./cmd/audit-export \
-    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/session-maintenance ./cmd/session-maintenance
 
 FROM ${RUNTIME_IMAGE} AS runtime-base
 RUN apk add --no-cache ca-certificates \
@@ -57,6 +58,10 @@ FROM runtime-base AS migrate
 COPY --from=build /out/migrate /usr/local/bin/migrate
 COPY db/migrations /app/migrations
 ENTRYPOINT ["/usr/local/bin/migrate"]
+
+FROM runtime-base AS session-maintenance
+COPY --from=build /out/session-maintenance /usr/local/bin/session-maintenance
+ENTRYPOINT ["/usr/local/bin/session-maintenance"]
 
 # Keep the Internet-facing gateway as Docker's default final target. CI still
 # builds and scans every privileged/offline tool target explicitly.

@@ -23,12 +23,14 @@ case "$mode" in
     : "${INTEGRITY_DB_PASSWORD:?INTEGRITY_DB_PASSWORD is required}"
     : "${READONLY_DB_PASSWORD:?READONLY_DB_PASSWORD is required}"
     : "${BACKUP_DB_PASSWORD:?BACKUP_DB_PASSWORD is required}"
+    : "${SESSION_MAINTENANCE_DB_PASSWORD:?SESSION_MAINTENANCE_DB_PASSWORD is required}"
     psql_super \
       --set=gateway_password="$GATEWAY_DB_PASSWORD" \
       --set=admin_password="$ADMIN_DB_PASSWORD" \
       --set=integrity_password="$INTEGRITY_DB_PASSWORD" \
       --set=readonly_password="$READONLY_DB_PASSWORD" \
-      --set=backup_password="$BACKUP_DB_PASSWORD" <<'SQL'
+      --set=backup_password="$BACKUP_DB_PASSWORD" \
+      --set=session_maintenance_password="$SESSION_MAINTENANCE_DB_PASSWORD" <<'SQL'
 SELECT format(
   'CREATE ROLE photo_cloud_gateway LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD %L',
   :'gateway_password'
@@ -54,6 +56,11 @@ SELECT format(
   :'backup_password'
 )
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'photo_cloud_backup') \gexec
+SELECT format(
+  'CREATE ROLE photo_cloud_session_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD %L',
+  :'session_maintenance_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'photo_cloud_session_maintenance') \gexec
 
 -- Rotate passwords on every bootstrap so changing .env does not require a
 -- manual ALTER ROLE on an existing installation.
@@ -62,6 +69,7 @@ SELECT format('ALTER ROLE photo_cloud_admin PASSWORD %L', :'admin_password') \ge
 SELECT format('ALTER ROLE photo_cloud_integrity PASSWORD %L', :'integrity_password') \gexec
 SELECT format('ALTER ROLE photo_cloud_readonly PASSWORD %L', :'readonly_password') \gexec
 SELECT format('ALTER ROLE photo_cloud_backup PASSWORD %L', :'backup_password') \gexec
+SELECT format('ALTER ROLE photo_cloud_session_maintenance PASSWORD %L', :'session_maintenance_password') \gexec
 SQL
     ;;
   finalize)
@@ -70,27 +78,29 @@ SQL
 -- process actually touches; a compromised Internet-facing gateway therefore
 -- cannot rewrite manifest/scrub evidence or schema migration history.
 SELECT format(
-  'REVOKE ALL PRIVILEGES ON DATABASE %I FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup',
+  'REVOKE ALL PRIVILEGES ON DATABASE %I FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance',
   current_database()
 ) \gexec
 SELECT format(
-  'GRANT CONNECT ON DATABASE %I TO photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup',
+  'GRANT CONNECT ON DATABASE %I TO photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance',
   current_database()
 ) \gexec
-REVOKE ALL ON SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
+REVOKE ALL ON SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance;
 -- Existing databases upgraded from older PostgreSQL releases can retain the
 -- historical PUBLIC CREATE grant. Remove it explicitly before granting the
 -- scoped runtime roles any schema access.
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-GRANT USAGE ON SCHEMA public TO photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
+GRANT USAGE ON SCHEMA public TO photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance;
 
-REVOKE ALL ON ALL TABLES IN SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
-REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance;
 
 -- Gateway: auth/session/MFA state machine + upload state machine + visible asset
 -- reads. upload_events remains append-only at the privilege layer as well as by
 -- trigger: the gateway can insert events but cannot update or delete them.
 GRANT SELECT ON users TO photo_cloud_gateway;
+GRANT UPDATE (auth_epoch) ON users TO photo_cloud_gateway;
+GRANT SELECT, INSERT, UPDATE ON device_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON user_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE, DELETE ON login_throttles TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE, DELETE ON user_mfa_totp TO photo_cloud_gateway;
@@ -127,14 +137,17 @@ GRANT SELECT ON upload_sessions, assets, upload_events, asset_integrity_checks, 
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO photo_cloud_backup;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO photo_cloud_backup;
 
+-- Session history retention is a one-shot maintenance identity, not a gateway privilege.
+GRANT SELECT, DELETE ON user_sessions, device_sessions TO photo_cloud_session_maintenance;
+
 -- Do not silently widen privileges on future migrations. New tables are denied
 -- until this script is updated explicitly; this makes schema growth fail closed.
 SELECT format(
-  'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON TABLES FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup',
+  'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON TABLES FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance',
   current_user
 ) \gexec
 SELECT format(
-  'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON SEQUENCES FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup',
+  'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON SEQUENCES FROM photo_cloud_gateway, photo_cloud_admin, photo_cloud_integrity, photo_cloud_readonly, photo_cloud_backup, photo_cloud_session_maintenance',
   current_user
 ) \gexec
 
@@ -154,11 +167,16 @@ BEGIN
     RAISE EXCEPTION 'gateway database role can mutate integrity/migration evidence';
   END IF;
   IF has_table_privilege('photo_cloud_readonly', 'users', 'SELECT')
-     OR has_table_privilege('photo_cloud_readonly', 'user_sessions', 'SELECT') THEN
+     OR has_table_privilege('photo_cloud_readonly', 'user_sessions', 'SELECT')
+     OR has_table_privilege('photo_cloud_readonly', 'device_sessions', 'SELECT') THEN
     RAISE EXCEPTION 'observability database role can read auth/session tables';
   END IF;
   IF has_table_privilege('photo_cloud_backup', 'users', 'UPDATE') THEN
     RAISE EXCEPTION 'backup database role is writable';
+  END IF;
+  IF has_table_privilege('photo_cloud_session_maintenance', 'user_sessions', 'UPDATE')
+     OR has_table_privilege('photo_cloud_session_maintenance', 'users', 'SELECT') THEN
+    RAISE EXCEPTION 'session maintenance role is over-privileged';
   END IF;
   IF has_schema_privilege('photo_cloud_gateway', 'public', 'CREATE')
      OR has_schema_privilege('photo_cloud_admin', 'public', 'CREATE')

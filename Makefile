@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
-ALL_PROFILES := --profile gateway --profile edge --profile protocol-lab --profile integrity --profile observability --profile audit
+ALL_PROFILES := --profile gateway --profile edge --profile protocol-lab --profile integrity --profile observability --profile audit --profile maintenance
 
 .PHONY: help
 help: ## Show available commands
@@ -65,6 +65,10 @@ manifest-verify: env ## Verify one signed manifest with the public trust key
 manifest-reconcile: env ## Repair a verified manifest file -> DB linkage crash window
 	@test -n "$(MANIFEST_FILE)" -a -n "$(OBJECT_KEY)" || (echo "usage: make manifest-reconcile MANIFEST_FILE=manifest-...json OBJECT_KEY=manifests/manifest-...json"; exit 1)
 	docker compose --profile integrity run --rm manifest-verify -mode reconcile -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "$(OBJECT_KEY)"
+
+.PHONY: session-maintenance
+session-maintenance: env ## Prune expired/revoked refresh generations past retention
+	docker compose --profile maintenance run --rm session-maintenance
 
 .PHONY: audit-export
 audit-export: env ## Export append-only upload events to JSONL + SHA-256

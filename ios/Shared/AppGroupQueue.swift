@@ -32,6 +32,7 @@ enum AppGroupQueueError: LocalizedError {
     case appGroupUnavailable
     case unsupportedPayload
     case cleanupRequiresAvailable
+    case queueIdentityCollision
 
     var errorDescription: String? {
         switch self {
@@ -41,6 +42,8 @@ enum AppGroupQueueError: LocalizedError {
             return "The shared item is not an image or video file."
         case .cleanupRequiresAvailable:
             return "An upload can only be removed after server verification is complete."
+        case .queueIdentityCollision:
+            return "Queue metadata conflicts with an existing payload identity. The original bytes were left untouched."
         }
     }
 }
@@ -118,13 +121,20 @@ enum AppGroupQueue {
         var items: [QueuedUpload] = []
         for file in files {
             do {
-                items.append(try JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: file)))
+                let decoded = try JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: file))
+                let item = try normalizeLegacyIdentity(decoded, recordURL: file, records: records)
+                if !items.contains(where: { $0.id == item.id }) {
+                    items.append(item)
+                }
             } catch {
                 // Preserve the original payload; isolate only malformed queue
                 // metadata so one record cannot stop every healthy upload.
                 let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
                 try? createProtectedDirectory(quarantine)
-                try? FileManager.default.moveItem(at: file, to: quarantine.appending(path: file.lastPathComponent + ".corrupt"))
+                let destination = quarantine.appending(path: file.lastPathComponent + ".corrupt")
+                if !FileManager.default.fileExists(atPath: destination.path()) {
+                    try? FileManager.default.moveItem(at: file, to: destination)
+                }
             }
         }
         try recoverOrphanedPayloads(in: root, records: records, existing: &items)
@@ -251,15 +261,24 @@ enum AppGroupQueue {
             return existing
         }
 
-        let newID = UUID()
-        let newRecord = recordURL(for: newID, in: root)
+        // The local identity is always the payload basename. A fresh
+        // clientAssetID provides a new server idempotency identity without
+        // renaming durable bytes or breaking future quarantine recovery.
+        let localID = originalID
+        let canonicalRecord = recordURL(for: localID, in: root)
+        if FileManager.default.fileExists(atPath: canonicalRecord.path()) {
+            if let existing = try? JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: canonicalRecord)),
+               existing.payloadFilename == oldPayload.lastPathComponent {
+                try? FileManager.default.removeItem(at: sourceRecord)
+                return existing
+            }
+            throw AppGroupQueueError.queueIdentityCollision
+        }
         do {
-            // The queue ID is deliberately independent from the payload name.
-            // Publishing a new record around the existing bytes avoids the
-            // crash window created by moving the payload before record commit.
             try hooks.afterPayloadMove()
             let item = QueuedUpload(
-                id: newID,
+                id: localID,
+                clientAssetID: UUID(),
                 payloadFilename: oldPayload.lastPathComponent,
                 originalFilename: "Recovered-\(oldPayload.lastPathComponent)",
                 typeIdentifier: type.identifier,
@@ -278,7 +297,7 @@ enum AppGroupQueue {
         } catch {
             do {
                 try hooks.beforeRollbackRecordRemoval()
-                try removeIfPresent(newRecord)
+                try removeIfPresent(canonicalRecord)
             } catch {}
             throw error
         }
@@ -358,11 +377,10 @@ enum AppGroupQueue {
         let orphanCutoff = Date().addingTimeInterval(-orphanRecoveryMinimumAge)
         let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
         let quarantinedRecords = (try? FileManager.default.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
-        // A corrupt record can intentionally point at a payload whose filename
-        // differs from its queue UUID after recovery. Its bytes must remain
-        // reserved for explicit user recovery; without parseable metadata we
-        // cannot safely infer that filename from the corrupt record alone.
-        guard quarantinedRecords.isEmpty else { return }
+        let quarantinedPayloadIDs = Set(quarantinedRecords.compactMap { file -> UUID? in
+            let name = file.lastPathComponent.replacingOccurrences(of: ".json.corrupt", with: "")
+            return UUID(uuidString: name)
+        })
         for payload in try FileManager.default.contentsOfDirectory(
             at: payloads,
             includingPropertiesForKeys: [.contentModificationDateKey],
@@ -372,11 +390,13 @@ enum AppGroupQueue {
             guard !claimed.contains(payload.lastPathComponent),
                   modifiedAt <= orphanCutoff,
                   let oldID = UUID(uuidString: payload.deletingPathExtension().lastPathComponent),
+                  !quarantinedPayloadIDs.contains(oldID),
                   let type = UTType(filenameExtension: payload.pathExtension),
                   type.conforms(to: .image) || type.conforms(to: .movie) else { continue }
             try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: payload.path())
             let item = QueuedUpload(
-                id: UUID(),
+                id: oldID,
+                clientAssetID: UUID(),
                 payloadFilename: payload.lastPathComponent,
                 originalFilename: "Recovered-\(payload.lastPathComponent)",
                 typeIdentifier: type.identifier,
@@ -391,6 +411,48 @@ enum AppGroupQueue {
             try save(item, in: records)
             existing.append(item)
         }
+    }
+
+    /// V18 recovery could publish B.json pointing at A.heic. Canonicalize that
+    /// legacy state on read by publishing A.json first and only then retiring
+    /// B.json. The old queue UUID is preserved as clientAssetID so an existing
+    /// server session remains idempotent.
+    private static func normalizeLegacyIdentity(
+        _ item: QueuedUpload,
+        recordURL source: URL,
+        records: URL
+    ) throws -> QueuedUpload {
+        guard let payloadID = UUID(uuidString: URL(fileURLWithPath: item.payloadFilename).deletingPathExtension().lastPathComponent) else {
+            throw AppGroupQueueError.unsupportedPayload
+        }
+        guard payloadID != item.id else { return item }
+
+        let normalized = QueuedUpload(
+            id: payloadID,
+            clientAssetID: item.clientAssetID,
+            payloadFilename: item.payloadFilename,
+            originalFilename: item.originalFilename,
+            typeIdentifier: item.typeIdentifier,
+            createdAt: item.createdAt,
+            state: item.state,
+            byteCount: item.byteCount,
+            sha256: item.sha256,
+            serverSessionID: item.serverSessionID,
+            tusUploadID: item.tusUploadID,
+            lastError: item.lastError
+        )
+        let destination = records.appending(path: "\(payloadID.uuidString).json")
+        if FileManager.default.fileExists(atPath: destination.path()) {
+            let existing = try JSONDecoder.photoCloud.decode(QueuedUpload.self, from: Data(contentsOf: destination))
+            guard existing.payloadFilename == item.payloadFilename else {
+                throw AppGroupQueueError.queueIdentityCollision
+            }
+            if source != destination { try removeIfPresent(source) }
+            return existing
+        }
+        try save(normalized, in: records)
+        if source != destination { try removeIfPresent(source) }
+        return normalized
     }
 
     private static func existingRecordClaiming(payloadFilename: String, in records: URL) throws -> QueuedUpload? {

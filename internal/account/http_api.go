@@ -204,7 +204,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) listSessions(w http.ResponseWriter, r *http.Request) {
-	principal, ok := api.accessPrincipal(r)
+	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
@@ -212,7 +212,7 @@ func (api *API) listSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := api.repository.ListDeviceSessions(r.Context(), principal.UserID)
 	if err != nil {
 		api.logger.Error("list device sessions", "user_id", principal.UserID, "error", err)
-		accountProblem(w, http.StatusInternalServerError, "session_list_failed", "could not list signed-in devices")
+		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 		return
 	}
 	for index := range sessions {
@@ -222,11 +222,11 @@ func (api *API) listSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) revokeSession(w http.ResponseWriter, r *http.Request, sessionID string) {
-	if sessionID == "" || strings.Contains(sessionID, "/") {
+	if sessionID == "" || strings.Contains(sessionID, "/") || !validRotationRequestID(sessionID) {
 		accountProblem(w, http.StatusNotFound, "not_found", "device session not found")
 		return
 	}
-	principal, ok := api.accessPrincipal(r)
+	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
 		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
@@ -237,23 +237,34 @@ func (api *API) revokeSession(w http.ResponseWriter, r *http.Request, sessionID 
 			return
 		}
 		api.logger.Error("revoke device session", "user_id", principal.UserID, "error", err)
-		accountProblem(w, http.StatusInternalServerError, "session_revoke_failed", "could not revoke device")
+		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (api *API) accessPrincipal(r *http.Request) (auth.Principal, bool) {
+func (api *API) authenticateAccess(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
 	parts := strings.Fields(r.Header.Get("Authorization"))
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return auth.Principal{}, false
 	}
 	principal, err := api.tokens.Verify(parts[1])
 	if err != nil {
+		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return auth.Principal{}, false
 	}
 	active, err := api.repository.SessionActive(r.Context(), principal.UserID, principal.SessionID)
-	return principal, err == nil && active
+	if err != nil {
+		api.logger.Error("validate access session", "user_id", principal.UserID, "error", err)
+		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+		return auth.Principal{}, false
+	}
+	if !active {
+		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
+		return auth.Principal{}, false
+	}
+	return principal, true
 }
 
 func (api *API) login(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +318,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if !errors.Is(err, ErrInvalidCredentials) {
 			api.logger.Error("lookup account", "error", err)
-			accountProblem(w, http.StatusInternalServerError, "authentication_unavailable", "authentication is temporarily unavailable")
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 			return
 		}
 		_, _ = VerifyPassword(api.dummyHash, request.Password)
@@ -317,7 +328,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	valid, err := VerifyPassword(user.PasswordHash, request.Password)
 	if err != nil {
 		api.logger.Error("invalid password record", "user_id", user.ID, "error", err)
-		accountProblem(w, http.StatusInternalServerError, "authentication_unavailable", "authentication is temporarily unavailable")
+		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 		return
 	}
 	if !valid {
@@ -333,19 +344,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	} else {
 		api.limiter.Reset(email)
 	}
-	if api.mfaRepo != nil {
-		record, err := api.mfaRepo.TOTPForUser(r.Context(), user.ID)
-		if err == nil && record.ConfirmedAt != nil {
-			api.issueMFAChallenge(w, r.Context(), user, request.DeviceName)
-			return
-		}
-		if err != nil && !errors.Is(err, ErrMFANotConfigured) {
-			api.logger.Error("load MFA state", "user_id", user.ID, "error", err)
-			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
-			return
-		}
-	}
-	api.createTokenPair(w, r.Context(), user, request.DeviceName)
+	api.createTokenPair(w, r.Context(), user, request.DeviceName, false)
 }
 
 func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
@@ -382,10 +381,15 @@ func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
 		r.Context(), oldHash, newHash, retryRequestHash, now.Add(refreshTokenTTL), retryCiphertext, retryNonce, now,
 	)
 	if err != nil {
-		if errors.Is(err, ErrRefreshReplay) {
-			api.logger.Warn("refresh token replay; revoked token family")
+		if errors.Is(err, ErrRefreshReplay) || errors.Is(err, ErrInvalidCredentials) {
+			if errors.Is(err, ErrRefreshReplay) {
+				api.logger.Warn("refresh token replay; revoked device session")
+			}
+			accountProblem(w, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid or expired")
+		} else {
+			api.logger.Error("rotate refresh session", "error", err)
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 		}
-		accountProblem(w, http.StatusUnauthorized, "invalid_refresh_token", "refresh token is invalid or expired")
 		return
 	}
 	refreshRaw := newRaw
@@ -428,24 +432,28 @@ func (api *API) logout(w http.ResponseWriter, r *http.Request) {
 	hash, ok := refreshHash(request.RefreshToken)
 	if ok {
 		if err := api.repository.RevokeRefreshSession(r.Context(), hash); err != nil {
-			accountProblem(w, http.StatusInternalServerError, "logout_failed", "could not revoke session")
+			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 			return
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (api *API) createTokenPair(w http.ResponseWriter, ctx context.Context, user User, deviceName string) {
+func (api *API) createTokenPair(w http.ResponseWriter, ctx context.Context, user User, deviceName string, mfaSatisfied bool) {
 	rawRefresh, refreshDigest, err := newRefreshToken()
 	if err != nil {
 		accountProblem(w, http.StatusInternalServerError, "token_issue_failed", "could not issue token")
 		return
 	}
 	now := api.now().UTC()
-	sessionID, err := api.repository.CreateRefreshSession(ctx, user.ID, deviceName, refreshDigest, now.Add(refreshTokenTTL))
+	sessionID, err := api.repository.CreateRefreshSession(ctx, user.ID, deviceName, refreshDigest, now.Add(refreshTokenTTL), mfaSatisfied)
 	if err != nil {
+		if errors.Is(err, ErrMFARequired) && !mfaSatisfied {
+			api.issueMFAChallenge(w, ctx, user, deviceName)
+			return
+		}
 		api.logger.Error("create refresh session", "user_id", user.ID, "error", err)
-		accountProblem(w, http.StatusInternalServerError, "token_issue_failed", "could not issue token")
+		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
 		return
 	}
 	accessToken, err := api.tokens.Issue(auth.Principal{UserID: user.ID, SessionID: sessionID}, now, accessTokenTTL)

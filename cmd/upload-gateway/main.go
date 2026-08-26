@@ -62,11 +62,12 @@ func run(logger *slog.Logger) error {
 	if err := pool.Ping(startupContext); err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	gatewayLease, err := acquireSingleGatewayLease(startupContext, pool)
+	mediaRoot := envString("PHOTO_MEDIA_ROOT", "/srv/media")
+	gatewayLease, err := acquireWriterLease(startupContext, pool, mediaRoot)
 	if err != nil {
 		return err
 	}
-	defer gatewayLease.Release()
+	defer gatewayLease.Close()
 
 	maxUploadBytes, err := envInt64("TUS_MAX_UPLOAD_BYTES", 20<<30)
 	if err != nil {
@@ -125,7 +126,7 @@ func run(logger *slog.Logger) error {
 		Repository:                repository,
 		Accounts:                  account.NewPostgresRepository(pool),
 		Tokens:                    tokens,
-		MediaRoot:                 envString("PHOTO_MEDIA_ROOT", "/srv/media"),
+		MediaRoot:                 mediaRoot,
 		MaxUploadBytes:            maxUploadBytes,
 		ChunkBytes:                chunkBytes,
 		VerificationJobs:          verificationJobs,
@@ -186,31 +187,17 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("graceful shutdown: %w", err)
 		}
 		return nil
+	case err := <-gatewayLease.Lost():
+		shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelShutdown()
+		_ = server.Shutdown(shutdownContext)
+		return err
 	case err := <-serverErrors:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	}
-}
-
-const singleGatewayAdvisoryLock int64 = 7042026082401
-
-func acquireSingleGatewayLease(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, error) {
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("reserve gateway database connection: %w", err)
-	}
-	var acquired bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, singleGatewayAdvisoryLock).Scan(&acquired); err != nil {
-		conn.Release()
-		return nil, fmt.Errorf("acquire single-gateway writer lock: %w", err)
-	}
-	if !acquired {
-		conn.Release()
-		return nil, errors.New("another upload gateway already holds the writable-media lease")
-	}
-	return conn, nil
 }
 
 func decodeSecretEnv(name string) ([]byte, error) {

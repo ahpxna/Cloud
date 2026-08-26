@@ -65,7 +65,7 @@ type MFARepository interface {
 	MFAUserByID(context.Context, string) (User, error)
 	TOTPForUser(context.Context, string) (MFARecord, error)
 	SavePendingTOTP(context.Context, string, []byte, []byte) error
-	ConfirmTOTP(context.Context, string, int64, [][32]byte) error
+	ConfirmTOTP(context.Context, string, int64, [][32]byte, []byte) error
 	CreateMFAChallenge(context.Context, string, string, [32]byte, time.Time, time.Time, int) error
 	MFAChallengeByHash(context.Context, [32]byte, time.Time) (MFAChallenge, error)
 	FailMFAChallenge(context.Context, [32]byte, time.Time) (int, error)
