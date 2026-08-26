@@ -296,7 +296,7 @@ final class UploadCoordinator: ObservableObject {
                 guard retryFailed, let tusID = item.tusUploadID, failedTUSUploads.contains(tusID) else { continue }
                 do {
                     guard try transport.retryFailedUpload(id: tusID) else {
-                        throw URLError(.cannotResume)
+                        throw URLError(.cannotLoadFromNetwork)
                     }
                     var retrying = item
                     retrying.state = .transferring
