@@ -141,7 +141,7 @@ final class PhotoCloudAPIContractTests: XCTestCase {
             XCTAssertEqual(request.url?.path, "/v1/auth/logout")
             XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try requestBody(from: request)
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
             XCTAssertEqual(object["refresh_token"], "refresh-token")
             let response = try XCTUnwrap(HTTPURLResponse(
