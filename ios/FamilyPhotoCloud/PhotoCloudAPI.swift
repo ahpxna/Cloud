@@ -212,8 +212,8 @@ struct PhotoCloudAPI: Sendable {
         ).credential
     }
 
-    func createUploadSession(_ request: CreateUploadRequest, accessToken: String) async throws -> UploadSession {
-        try await request(path: "/v1/upload-sessions", method: "POST", body: request, bearer: accessToken, response: UploadSession.self)
+    func createUploadSession(_ uploadRequest: CreateUploadRequest, accessToken: String) async throws -> UploadSession {
+        try await request(path: "/v1/upload-sessions", method: "POST", body: uploadRequest, bearer: accessToken, response: UploadSession.self)
     }
 
     func uploadSession(id: String, accessToken: String) async throws -> UploadSession {
@@ -378,8 +378,8 @@ actor AuthenticationStore {
     }
 
     func accessToken(api: PhotoCloudAPI) async throws -> String {
-        var current = try credential ?? KeychainStore.loadCredential()
-        guard var current else { throw APIProblem(status: 401, code: "not_signed_in", detail: "Sign in before uploading.") }
+        let storedCredential = try credential ?? KeychainStore.loadCredential()
+        guard var current = storedCredential else { throw APIProblem(status: 401, code: "not_signed_in", detail: "Sign in before uploading.") }
         if current.accessExpiresAt > Date.now.addingTimeInterval(60) { return current.accessToken }
         guard current.refreshExpiresAt > .now else {
             try KeychainStore.deleteCredential()

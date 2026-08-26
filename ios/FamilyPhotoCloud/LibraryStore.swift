@@ -47,7 +47,7 @@ final class LibraryStore: ObservableObject {
             applyPaginationState()
             error = nil
         } catch {
-            error = error.localizedDescription
+            self.error = error.localizedDescription
         }
     }
 
@@ -98,7 +98,9 @@ final class LibraryStore: ObservableObject {
             create: true
         ).appending(path: "VerifiedOriginals", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
-        let target = caches.appending(path: "\(asset.id).\(asset.originalFilename.pathExtension)")
+        let pathExtension = URL(fileURLWithPath: asset.originalFilename).pathExtension
+        let cacheFilename = pathExtension.isEmpty ? asset.id : "\(asset.id).\(pathExtension)"
+        let target = caches.appending(path: cacheFilename)
         try? FileManager.default.removeItem(at: target)
         try FileManager.default.moveItem(at: temporaryURL, to: target)
         cachedURLs[asset.id] = target
