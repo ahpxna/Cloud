@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -251,7 +252,13 @@ func envInt64(name string, fallback int64) (int64, error) {
 
 func envInt(name string, fallback int) (int, error) {
 	value, err := envInt64(name, int64(fallback))
-	return int(value), err
+	if err != nil {
+		return 0, err
+	}
+	if value > math.MaxInt {
+		return 0, fmt.Errorf("%s exceeds the maximum supported integer", name)
+	}
+	return int(value), nil
 }
 
 func envFloat(name string, fallback float64) (float64, error) {
