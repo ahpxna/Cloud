@@ -228,8 +228,14 @@ func (r *PostgresRepository) RotateRefreshSession(
 
 func (r *PostgresRepository) RevokeRefreshSession(ctx context.Context, tokenHash [32]byte) error {
 	_, err := r.pool.Exec(ctx, `
-        UPDATE user_sessions SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
-        WHERE refresh_token_sha256 = $1`, tokenHash[:])
+        WITH target_family AS (
+            SELECT session_family_id
+            FROM user_sessions
+            WHERE refresh_token_sha256 = $1
+        )
+        UPDATE user_sessions
+        SET revoked_at = COALESCE(revoked_at, now()), last_used_at = now()
+        WHERE session_family_id IN (SELECT session_family_id FROM target_family)`, tokenHash[:])
 	return err
 }
 

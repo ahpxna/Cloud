@@ -6,7 +6,7 @@ Run this after the immutable-original backup succeeds, using a private key that
 is not stored in the media mount or Docker environment of `upload-gateway`.
 
 ```bash
-export DATABASE_URL='postgresql://photo_cloud:...@127.0.0.1:5432/photo_cloud'
+export DATABASE_URL='postgresql://photo_cloud_integrity:...@127.0.0.1:5432/photo_cloud'
 export MANIFEST_SIGNING_KEY_ID='offline-ed25519-2026-01'
 export MANIFEST_ED25519_PRIVATE_KEY_FILE='/secure/offline/manifest-ed25519.pem'
 
@@ -14,6 +14,11 @@ go run ./cmd/manifest \
   -output /secure/manifests/2026-08-20.json \
   -object-key manifests/2026-08-20.json
 ```
+
+For the Compose deployment, prefer `make integrity-cycle`; it injects the
+scoped `photo_cloud_integrity` credential. The bootstrap PostgreSQL credential
+is only for migrations and role provisioning and must never be used by this
+runtime integrity command.
 
 The key file must contain a PKCS#8 Ed25519 private key PEM. The CLI can instead
 read `MANIFEST_ED25519_PRIVATE_KEY_BASE64` (unpadded standard Base64, 64 raw

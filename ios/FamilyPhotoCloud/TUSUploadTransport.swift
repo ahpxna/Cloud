@@ -44,16 +44,24 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         return id
     }
 
-    func resumeStoredUploads() {
+    /// Starts normal persisted work and returns uploads that exhausted
+    /// TUSKit's retry budget. Callers must surface those as retryable instead
+    /// of claiming they are actively transferring.
+    func resumeStoredUploads() -> Set<UUID> {
         restoreStoredContexts()
         // Let TUSKit reconcile persisted metadata with any background
         // URLSession tasks from the previous process. Calling resume(id:) for
         // every stored upload here can schedule a duplicate task after relaunch.
         _ = client.start()
+        return Set((try? client.failedUploadIDs()) ?? [])
+    }
 
-        // TUSKit 3.7.1 has no separate failed-upload enumeration. Keep
-        // relaunch recovery delegated to start() so we do not schedule
-        // duplicate background tasks; explicit retry stays user initiated.
+    func retryFailedUpload(id: UUID) throws -> Bool {
+        if let upload = try client.getStoredUploads().first(where: { $0.id == id }),
+           let sessionID = upload.context?["session_id"] {
+            headerProvider.register(id: id, sessionID: sessionID)
+        }
+        try client.retry(id: id)
     }
 
     func storedUploadID(forSessionID sessionID: String) -> UUID? {
@@ -102,11 +110,13 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
     }
 
     func didFinishUpload(id: UUID, url: URL, context: [String: String]?, client: TUSClient) {
+        headerProvider.unregister(id: id)
         Task { @MainActor in UploadDiagnostics.shared.record("tus_finished", context: context, tusUploadID: id) }
         uploadFinished?(id, context)
     }
 
     func uploadFailed(id: UUID, error: Error, context: [String: String]?, client: TUSClient) {
+        headerProvider.unregister(id: id)
         Task { @MainActor in UploadDiagnostics.shared.record("tus_failed", context: context, tusUploadID: id, error: error) }
         uploadFailed?(id, context, error)
     }
@@ -132,6 +142,12 @@ private final class ScopedHeaderProvider: @unchecked Sendable {
     func register(id: UUID, sessionID: String) {
         lock.lock()
         sessionIDs[id] = sessionID
+        lock.unlock()
+    }
+
+    func unregister(id: UUID) {
+        lock.lock()
+        sessionIDs.removeValue(forKey: id)
         lock.unlock()
     }
 

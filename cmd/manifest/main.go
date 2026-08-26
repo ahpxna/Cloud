@@ -433,6 +433,10 @@ func safeKeyID(value string) bool {
 	if value == "" || len(value) > 128 {
 		return false
 	}
+	first := value[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9')) {
+		return false
+	}
 	for _, character := range value {
 		if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') &&
 			!(character >= '0' && character <= '9') && character != '-' && character != '_' && character != '.' {

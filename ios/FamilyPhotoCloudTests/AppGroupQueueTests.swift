@@ -59,7 +59,7 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertNil(recovered.serverSessionID)
         XCTAssertNil(recovered.tusUploadID)
         XCTAssertEqual(recovered.state, .queued)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: recovered, in: root).path()))
         XCTAssertTrue(try AppGroupQueue.quarantinedRecords(in: root).isEmpty)
         XCTAssertEqual(try AppGroupQueue.all(in: root).map(\.id), [recovered.id])
@@ -135,7 +135,7 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertEqual(recovered.count, 1)
         let recoveredItem = try XCTUnwrap(recovered.first)
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: recoveredItem, in: root).path()))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
         XCTAssertTrue(FileManager.default.fileExists(atPath: quarantineURL(for: quarantined[0], in: root).path()))
     }
 
@@ -158,6 +158,21 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
         XCTAssertTrue(FileManager.default.fileExists(atPath: duplicate.path()))
         XCTAssertTrue(FileManager.default.fileExists(atPath: corrupt.path()))
+    }
+
+    func testOrphanedPayloadIsRecoveredOnNextQueueRead() throws {
+        let root = temporaryQueueRoot()
+        let orphan = queuedUpload(id: UUID(), state: .queued)
+        let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: payloads, withIntermediateDirectories: true)
+        try Data("payload".utf8).write(to: payloadURL(for: orphan, in: root))
+
+        let recovered = try AppGroupQueue.all(in: root)
+
+        XCTAssertEqual(recovered.count, 1)
+        XCTAssertNotEqual(recovered[0].id, orphan.id)
+        XCTAssertEqual(recovered[0].payloadFilename, orphan.payloadFilename)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: orphan, in: root).path()))
     }
 
     private func temporaryQueueRoot() -> URL {

@@ -103,8 +103,10 @@ private struct UploadQueueView: View {
                     TextField("Email", text: $email).textInputAutocapitalization(.never).keyboardType(.emailAddress)
                     SecureField("Password", text: $password)
                     Button("Sign in and upload") {
+                        let submittedPassword = password
+                        password = ""
                         Task {
-                            await coordinator.login(email: email, password: password)
+                            await coordinator.login(email: email, password: submittedPassword)
                             await library.reload()
                         }
                     }
@@ -281,7 +283,7 @@ private struct UploadQueueView: View {
                 Section("Upload queue") {
                     Button("Resume and check status") {
                         Task {
-                            await coordinator.startQueuedUploads()
+                            await coordinator.startQueuedUploads(retryFailed: true)
                             await library.reload()
                         }
                     }

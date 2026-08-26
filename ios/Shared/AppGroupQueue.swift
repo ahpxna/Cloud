@@ -121,6 +121,7 @@ enum AppGroupQueue {
                 try? FileManager.default.moveItem(at: file, to: quarantine.appending(path: file.lastPathComponent + ".corrupt"))
             }
         }
+        try recoverOrphanedPayloads(in: root, records: records, existing: &items)
         return items.sorted { $0.createdAt < $1.createdAt }
     }
 
@@ -236,14 +237,15 @@ enum AppGroupQueue {
         }
 
         let newID = UUID()
-        let newPayload = payloads.appending(path: "\(newID.uuidString).\(oldPayload.pathExtension.lowercased())")
         let newRecord = recordURL(for: newID, in: root)
-        try FileManager.default.moveItem(at: oldPayload, to: newPayload)
         do {
+            // The queue ID is deliberately independent from the payload name.
+            // Publishing a new record around the existing bytes avoids the
+            // crash window created by moving the payload before record commit.
             try hooks.afterPayloadMove()
             let item = QueuedUpload(
                 id: newID,
-                payloadFilename: newPayload.lastPathComponent,
+                payloadFilename: oldPayload.lastPathComponent,
                 originalFilename: "Recovered-\(oldPayload.lastPathComponent)",
                 typeIdentifier: type.identifier,
                 createdAt: .now,
@@ -260,23 +262,10 @@ enum AppGroupQueue {
             try FileManager.default.removeItem(at: sourceRecord)
             return item
         } catch {
-            // Roll back only when the newly committed record is definitely gone.
-            // If record cleanup itself fails, keep the new payload beside its
-            // valid record rather than restoring the old payload and leaving a
-            // dangling record that points at missing bytes.
-            var newRecordRemoved = false
             do {
                 try hooks.beforeRollbackRecordRemoval()
                 try removeIfPresent(newRecord)
-                newRecordRemoved = !FileManager.default.fileExists(atPath: newRecord.path())
-            } catch {
-                newRecordRemoved = false
-            }
-            if newRecordRemoved
-                && FileManager.default.fileExists(atPath: newPayload.path())
-                && !FileManager.default.fileExists(atPath: oldPayload.path()) {
-                try? FileManager.default.moveItem(at: newPayload, to: oldPayload)
-            }
+            } catch {}
             throw error
         }
     }
@@ -338,6 +327,45 @@ enum AppGroupQueue {
         root
             .appending(path: "records", directoryHint: .isDirectory)
             .appending(path: "\(id.uuidString).json")
+    }
+
+    /// A process can die after publishing bytes but before the record's atomic
+    /// rename. Rebuild a fresh record at the next launch without moving the
+    /// payload. Quarantined corrupt records reserve their original filename so
+    /// the explicit recovery UI remains authoritative for those bytes.
+    private static func recoverOrphanedPayloads(
+        in root: URL,
+        records: URL,
+        existing: inout [QueuedUpload]
+    ) throws {
+        let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
+        guard FileManager.default.fileExists(atPath: payloads.path()) else { return }
+        let claimed = Set(existing.map(\.payloadFilename))
+        let quarantine = records.appending(path: "quarantine", directoryHint: .isDirectory)
+        let quarantinedIDs = Set(((try? FileManager.default.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
+            .compactMap { UUID(uuidString: $0.lastPathComponent.replacingOccurrences(of: ".json.corrupt", with: "")) })
+        for payload in try FileManager.default.contentsOfDirectory(at: payloads, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            guard !claimed.contains(payload.lastPathComponent),
+                  let oldID = UUID(uuidString: payload.deletingPathExtension().lastPathComponent),
+                  !quarantinedIDs.contains(oldID),
+                  let type = UTType(filenameExtension: payload.pathExtension),
+                  type.conforms(to: .image) || type.conforms(to: .movie) else { continue }
+            let item = QueuedUpload(
+                id: UUID(),
+                payloadFilename: payload.lastPathComponent,
+                originalFilename: "Recovered-\(payload.lastPathComponent)",
+                typeIdentifier: type.identifier,
+                createdAt: .now,
+                state: .queued,
+                byteCount: nil,
+                sha256: nil,
+                serverSessionID: nil,
+                tusUploadID: nil,
+                lastError: "Recovered payload bytes after an interrupted queue write; upload will restart from byte zero."
+            )
+            try save(item, in: records)
+            existing.append(item)
+        }
     }
 
     private static func removeIfPresent(_ url: URL) throws {

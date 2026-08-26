@@ -11,6 +11,9 @@ networks:
     name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-tunnel-egress
   notification-egress:
     name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-notification-egress
+  observability:
+    name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-observability
+    internal: true
   protocol-lab:
     name: ${COMPOSE_PROJECT_NAME:-family-photo-cloud}-protocol-lab
     internal: true
@@ -355,7 +358,7 @@ services:
       METRICS_ADDR: :9090
     ports:
       - "127.0.0.1:${METRICS_DEV_PORT:-9091}:9090"
-    networks: [database]
+    networks: [database, observability]
     volumes:
       - ./.data/media:/srv/media:ro
     depends_on:
@@ -386,7 +389,7 @@ services:
       - --web.enable-lifecycle
     ports:
       - "127.0.0.1:${PROMETHEUS_DEV_PORT:-9092}:9090"
-    networks: [database]
+    networks: [observability]
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
@@ -410,7 +413,7 @@ services:
       - --storage.path=/alertmanager
     ports:
       - "127.0.0.1:${ALERTMANAGER_DEV_PORT:-9093}:9093"
-    networks: [database, notification-egress]
+    networks: [observability, notification-egress]
     volumes:
       - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
@@ -433,7 +436,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin-password
     ports:
       - "127.0.0.1:${GRAFANA_DEV_PORT:-3000}:3000"
-    networks: [database]
+    networks: [observability]
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro

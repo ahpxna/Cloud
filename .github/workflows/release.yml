@@ -142,7 +142,7 @@ jobs:
           cosign attest --yes --predicate sbom.cdx.json --type cyclonedx "$IMAGE_REF"
           cosign attest --yes --predicate provenance.json --type slsaprovenance "$IMAGE_REF"
           cosign verify "$IMAGE_REF" \
-            --certificate-identity-regexp "^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/" \
+            --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
       - name: Upload release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

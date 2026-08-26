@@ -282,10 +282,31 @@ final class UploadCoordinator: ObservableObject {
         catch { lastError = error.localizedDescription }
     }
 
-    func startQueuedUploads() async {
+    func startQueuedUploads(retryFailed: Bool = false) async {
         reload()
-        transport.resumeStoredUploads()
+        let failedTUSUploads = transport.resumeStoredUploads()
+        for index in uploads.indices {
+            guard let tusID = uploads[index].tusUploadID, failedTUSUploads.contains(tusID) else { continue }
+            uploads[index].state = .failed
+            uploads[index].lastError = "Upload paused after its network retry limit. Tap Resume and check status to retry it."
+            try? AppGroupQueue.save(uploads[index])
+        }
         for item in uploads where item.state != .available && item.state != .quarantined {
+            if item.state == .failed {
+                guard retryFailed, let tusID = item.tusUploadID, failedTUSUploads.contains(tusID) else { continue }
+                do {
+                    guard try transport.retryFailedUpload(id: tusID) else {
+                        throw URLError(.cannotResume)
+                    }
+                    var retrying = item
+                    retrying.state = .transferring
+                    retrying.lastError = nil
+                    try AppGroupQueue.save(retrying)
+                } catch {
+                    lastError = error.localizedDescription
+                }
+                continue
+            }
             if item.serverSessionID == nil {
                 await begin(item)
             } else if item.tusUploadID == nil {
