@@ -51,15 +51,9 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         // every stored upload here can schedule a duplicate task after relaunch.
         _ = client.start()
 
-        // Failed uploads are not part of start()'s normal continuation set.
-        // Retry only the IDs TUSKit explicitly marks failed; this follows the
-        // library's new-session contract without blindly rescheduling every
-        // persisted upload.
-        if let failedIDs = try? client.failedUploadIds() {
-            for id in failedIDs {
-                _ = try? client.retry(id: id)
-            }
-        }
+        // TUSKit 3.7.1 has no separate failed-upload enumeration. Keep
+        // relaunch recovery delegated to start() so we do not schedule
+        // duplicate background tasks; explicit retry stays user initiated.
     }
 
     func storedUploadID(forSessionID sessionID: String) -> UUID? {
