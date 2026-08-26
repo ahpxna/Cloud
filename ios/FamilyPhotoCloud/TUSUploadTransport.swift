@@ -61,7 +61,7 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
            let sessionID = upload.context?["session_id"] {
             headerProvider.register(id: id, sessionID: sessionID)
         }
-        try client.retry(id: id)
+        return try client.retry(id: id)
     }
 
     func storedUploadID(forSessionID sessionID: String) -> UUID? {
