@@ -353,7 +353,7 @@ final class UploadCoordinator: ObservableObject {
             let accessToken = try await auth.accessToken(api: api)
             let session = try await api.createUploadSession(
                 CreateUploadRequest(
-                    clientAssetID: original.id.uuidString,
+                    clientAssetID: original.clientAssetID.uuidString,
                     originalFilename: original.originalFilename,
                     mediaType: mediaType(for: original),
                     expectedSize: size.int64Value,

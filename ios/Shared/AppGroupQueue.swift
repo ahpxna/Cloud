@@ -209,9 +209,9 @@ enum AppGroupQueue {
         .sorted { ($0.modifiedAt ?? .distantPast) < ($1.modifiedAt ?? .distantPast) }
     }
 
-    /// Rebuilds a corrupt queue record as a brand-new upload identity while
-    /// preserving the payload bytes. A fresh UUID avoids colliding with any
-    /// server session whose immutable metadata was lost with the corrupt JSON.
+    /// Rebuilds corrupt queue metadata without renaming the durable payload.
+    /// The local queue UUID stays canonical to the payload basename while a
+    /// fresh clientAssetID prevents collision with any lost server session.
     static func recoverQuarantinedRecord(_ record: QuarantinedQueueRecord) throws -> QueuedUpload {
         try recoverQuarantinedRecord(record, in: rootURL())
     }

@@ -20,7 +20,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/session-maintenance ./cmd/session-maintenance
 
 FROM ${RUNTIME_IMAGE} AS runtime-base
-RUN apk add --no-cache ca-certificates \
+# Pull security-fixed packages from the selected Alpine release before adding
+# runtime dependencies. Security CI scans every final target built from this
+# shared stage, so a single patched runtime base protects all service images.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
     && addgroup -S -g 10001 photo \
     && adduser -S -D -H -u 10001 -G photo photo
 USER 10001:10001

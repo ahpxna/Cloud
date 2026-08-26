@@ -54,7 +54,6 @@ func (api *API) issueMFAChallenge(w http.ResponseWriter, ctx context.Context, us
 func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
-		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
 	if api.mfaRepo == nil || api.mfaCipher == nil {
@@ -129,7 +128,6 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 func (api *API) mfaConfirm(w http.ResponseWriter, r *http.Request) {
 	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
-		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
 	if api.mfaRepo == nil || api.mfaCipher == nil {
@@ -203,6 +201,7 @@ func (api *API) mfaVerify(w http.ResponseWriter, r *http.Request) {
 
 	var user User
 	var deviceName string
+	var authEpoch int64
 	if request.TOTPCode != "" {
 		secret, decryptErr := api.mfaCipher.decrypt(challenge.User.ID, challenge.EncryptedSecret, challenge.Nonce)
 		if decryptErr != nil {
@@ -217,9 +216,9 @@ func (api *API) mfaVerify(w http.ResponseWriter, r *http.Request) {
 			api.rejectMFAAttempt(w, r, hash, now)
 			return
 		}
-		user, deviceName, err = api.mfaRepo.CompleteMFATOTPChallenge(r.Context(), hash, now, counter)
+		user, deviceName, authEpoch, err = api.mfaRepo.CompleteMFATOTPChallenge(r.Context(), hash, now, counter)
 	} else {
-		user, deviceName, err = api.mfaRepo.CompleteMFARecoveryChallenge(r.Context(), hash, recoveryCodeHash(request.RecoveryCode), now)
+		user, deviceName, authEpoch, err = api.mfaRepo.CompleteMFARecoveryChallenge(r.Context(), hash, recoveryCodeHash(request.RecoveryCode), now)
 	}
 	if err != nil {
 		if errors.Is(err, ErrMFAInvalid) || errors.Is(err, ErrMFAReplay) {
@@ -234,7 +233,7 @@ func (api *API) mfaVerify(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	api.createTokenPair(w, r.Context(), user, deviceName, true)
+	api.createTokenPair(w, r.Context(), user, deviceName, &authEpoch)
 }
 
 func (api *API) rejectMFAAttempt(w http.ResponseWriter, r *http.Request, hash [32]byte, now time.Time) {
@@ -254,7 +253,6 @@ func (api *API) rejectMFAAttempt(w http.ResponseWriter, r *http.Request, hash [3
 func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
-		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
 	if api.mfaRepo == nil || api.mfaCipher == nil {
@@ -294,7 +292,6 @@ func (api *API) mfaRecovery(w http.ResponseWriter, r *http.Request) {
 func (api *API) mfaDisable(w http.ResponseWriter, r *http.Request) {
 	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
-		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
 	if api.mfaRepo == nil || api.mfaCipher == nil {

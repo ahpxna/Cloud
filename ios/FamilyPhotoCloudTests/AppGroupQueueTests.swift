@@ -42,7 +42,7 @@ final class AppGroupQueueTests: XCTestCase {
     }
 
 
-    func testCorruptRecordIsIsolatedAndCanBeRecoveredAsFreshIdentity() throws {
+    func testCorruptRecordIsIsolatedAndCanBeRecoveredWithFreshServerIdentity() throws {
         let root = temporaryQueueRoot()
         let original = queuedUpload(id: UUID(), state: .queued)
         try write(original, in: root)
@@ -55,7 +55,8 @@ final class AppGroupQueueTests: XCTestCase {
 
         let recovered = try AppGroupQueue.recoverQuarantinedRecord(quarantined[0], in: root)
 
-        XCTAssertNotEqual(recovered.id, original.id)
+        XCTAssertEqual(recovered.id, original.id)
+        XCTAssertNotEqual(recovered.clientAssetID, original.clientAssetID)
         XCTAssertNil(recovered.serverSessionID)
         XCTAssertNil(recovered.tusUploadID)
         XCTAssertEqual(recovered.state, .queued)
@@ -175,7 +176,8 @@ final class AppGroupQueueTests: XCTestCase {
         let recovered = try AppGroupQueue.all(in: root)
 
         XCTAssertEqual(recovered.count, 1)
-        XCTAssertNotEqual(recovered[0].id, orphan.id)
+        XCTAssertEqual(recovered[0].id, orphan.id)
+        XCTAssertNotEqual(recovered[0].clientAssetID, orphan.id)
         XCTAssertEqual(recovered[0].payloadFilename, orphan.payloadFilename)
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: orphan, in: root).path()))
     }

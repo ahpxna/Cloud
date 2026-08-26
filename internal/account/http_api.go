@@ -206,7 +206,6 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (api *API) listSessions(w http.ResponseWriter, r *http.Request) {
 	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
-		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
 	sessions, err := api.repository.ListDeviceSessions(r.Context(), principal.UserID)
@@ -228,7 +227,6 @@ func (api *API) revokeSession(w http.ResponseWriter, r *http.Request, sessionID 
 	}
 	principal, ok := api.authenticateAccess(w, r)
 	if !ok {
-		accountProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
 	}
 	if err := api.repository.RevokeDeviceSession(r.Context(), principal.UserID, sessionID); err != nil {
@@ -344,7 +342,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	} else {
 		api.limiter.Reset(email)
 	}
-	api.createTokenPair(w, r.Context(), user, request.DeviceName, false)
+	api.createTokenPair(w, r.Context(), user, request.DeviceName, nil)
 }
 
 func (api *API) refresh(w http.ResponseWriter, r *http.Request) {
@@ -439,17 +437,21 @@ func (api *API) logout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (api *API) createTokenPair(w http.ResponseWriter, ctx context.Context, user User, deviceName string, mfaSatisfied bool) {
+func (api *API) createTokenPair(w http.ResponseWriter, ctx context.Context, user User, deviceName string, mfaAuthEpoch *int64) {
 	rawRefresh, refreshDigest, err := newRefreshToken()
 	if err != nil {
 		accountProblem(w, http.StatusInternalServerError, "token_issue_failed", "could not issue token")
 		return
 	}
 	now := api.now().UTC()
-	sessionID, err := api.repository.CreateRefreshSession(ctx, user.ID, deviceName, refreshDigest, now.Add(refreshTokenTTL), mfaSatisfied)
+	sessionID, err := api.repository.CreateRefreshSession(ctx, user.ID, deviceName, refreshDigest, now.Add(refreshTokenTTL), mfaAuthEpoch)
 	if err != nil {
-		if errors.Is(err, ErrMFARequired) && !mfaSatisfied {
+		if errors.Is(err, ErrMFARequired) && mfaAuthEpoch == nil {
 			api.issueMFAChallenge(w, ctx, user, deviceName)
+			return
+		}
+		if errors.Is(err, ErrMFAChallenge) && mfaAuthEpoch != nil {
+			accountProblem(w, http.StatusUnauthorized, "invalid_mfa_challenge", "authentication state changed; sign in again")
 			return
 		}
 		api.logger.Error("create refresh session", "user_id", user.ID, "error", err)

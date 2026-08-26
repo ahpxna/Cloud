@@ -51,7 +51,7 @@ func (repository *memoryAccountRepository) ActiveUserByEmail(_ context.Context, 
 }
 
 func (repository *memoryAccountRepository) CreateRefreshSession(
-	_ context.Context, _ string, _ string, hash [32]byte, _ time.Time,
+	_ context.Context, _ string, _ string, hash [32]byte, _ time.Time, _ *int64,
 ) (string, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -255,6 +255,49 @@ func TestLoginLimiterLocksAccountWithinWindow(t *testing.T) {
 	if limiter.Allow("parent@example.com", now) {
 		t.Fatal("expected account limiter to reject third attempt")
 	}
+}
+
+func TestAuthenticateAccessFailureWritesExactlyOneProblem(t *testing.T) {
+	repository := &memoryAccountRepository{sessions: make(map[[32]byte]string)}
+	tokens, err := auth.NewAccessTokenManager([]byte(strings.Repeat("k", 32)), auth.DefaultIssuer, auth.DefaultAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(repository, tokens, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequest(http.MethodGet, "/v1/auth/sessions", nil)
+	writer := &countingResponseWriter{header: make(http.Header)}
+
+	api.listSessions(writer, request)
+
+	if writer.status != http.StatusUnauthorized {
+		t.Fatalf("status=%d want %d", writer.status, http.StatusUnauthorized)
+	}
+	if writer.writeHeaderCalls != 1 {
+		t.Fatalf("WriteHeader calls=%d want 1", writer.writeHeaderCalls)
+	}
+}
+
+type countingResponseWriter struct {
+	header           http.Header
+	status           int
+	writeHeaderCalls int
+	body             bytes.Buffer
+}
+
+func (writer *countingResponseWriter) Header() http.Header { return writer.header }
+
+func (writer *countingResponseWriter) WriteHeader(status int) {
+	writer.writeHeaderCalls++
+	if writer.status == 0 {
+		writer.status = status
+	}
+}
+
+func (writer *countingResponseWriter) Write(payload []byte) (int, error) {
+	if writer.status == 0 {
+		writer.WriteHeader(http.StatusOK)
+	}
+	return writer.body.Write(payload)
 }
 
 func postAccountJSON(t *testing.T, server *httptest.Server, path, body string) *http.Response {

@@ -43,7 +43,7 @@ type RefreshRotation struct {
 
 type Repository interface {
 	ActiveUserByEmail(context.Context, string) (User, error)
-	CreateRefreshSession(context.Context, string, string, [32]byte, time.Time, bool) (string, error)
+	CreateRefreshSession(context.Context, string, string, [32]byte, time.Time, *int64) (string, error)
 	RotateRefreshSession(context.Context, [32]byte, [32]byte, [32]byte, time.Time, []byte, []byte, time.Time) (RefreshRotation, error)
 	RevokeRefreshSession(context.Context, [32]byte) error
 	ListDeviceSessions(context.Context, string) ([]DeviceSession, error)
@@ -62,6 +62,15 @@ type LoginThrottleRepository interface {
 type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
+
+// Keep production interface drift a compile-time failure. Several security
+// features are discovered through narrow interfaces, so a signature change
+// must never silently disable them until runtime construction.
+var (
+	_ Repository              = (*PostgresRepository)(nil)
+	_ LoginThrottleRepository = (*PostgresRepository)(nil)
+	_ MFARepository           = (*PostgresRepository)(nil)
+)
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
@@ -104,7 +113,7 @@ func (r *PostgresRepository) CreateRefreshSession(
 	userID, deviceName string,
 	tokenHash [32]byte,
 	expiresAt time.Time,
-	mfaSatisfied bool,
+	expectedMFAAuthEpoch *int64,
 ) (string, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -121,7 +130,11 @@ func (r *PostgresRepository) CreateRefreshSession(
 		}
 		return "", err
 	}
-	if !mfaSatisfied {
+	if expectedMFAAuthEpoch != nil {
+		if authEpoch != *expectedMFAAuthEpoch {
+			return "", ErrMFAChallenge
+		}
+	} else {
 		var required bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (
             SELECT 1 FROM user_mfa_totp
@@ -600,19 +613,20 @@ func (r *PostgresRepository) FailMFAChallenge(ctx context.Context, hash [32]byte
 	return remaining, err
 }
 
-func (r *PostgresRepository) CompleteMFATOTPChallenge(ctx context.Context, hash [32]byte, now time.Time, counter int64) (User, string, error) {
+func (r *PostgresRepository) CompleteMFATOTPChallenge(ctx context.Context, hash [32]byte, now time.Time, counter int64) (User, string, int64, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	defer tx.Rollback(ctx)
 
 	var user User
 	var deviceName string
+	var authEpoch int64
 	var lastCounter *int64
 	err = tx.QueryRow(ctx, `
         SELECT account.id::text, account.email, account.password_hash, account.role,
-               challenge.device_name, mfa.last_used_counter
+               challenge.device_name, challenge.auth_epoch, mfa.last_used_counter
         FROM mfa_challenges AS challenge
         JOIN users AS account ON account.id = challenge.user_id
         JOIN user_mfa_totp AS mfa ON mfa.user_id = challenge.user_id
@@ -624,39 +638,40 @@ func (r *PostgresRepository) CompleteMFATOTPChallenge(ctx context.Context, hash 
           AND mfa.confirmed_at IS NOT NULL
           AND account.state = 'active' AND account.deleted_at IS NULL
         FOR UPDATE OF challenge, mfa`, hash[:], now,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &lastCounter)
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &authEpoch, &lastCounter)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return User{}, "", ErrMFAChallenge
+		return User{}, "", 0, ErrMFAChallenge
 	}
 	if err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	if lastCounter != nil && counter <= *lastCounter {
-		return User{}, "", ErrMFAReplay
+		return User{}, "", 0, ErrMFAReplay
 	}
 	if _, err := tx.Exec(ctx, `UPDATE user_mfa_totp SET last_used_counter = $2, updated_at = $3 WHERE user_id = $1::uuid`, user.ID, counter, now); err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = $2 WHERE challenge_hash = $1`, hash[:], now); err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
-	return user, deviceName, nil
+	return user, deviceName, authEpoch, nil
 }
 
-func (r *PostgresRepository) CompleteMFARecoveryChallenge(ctx context.Context, challengeHash, recoveryHash [32]byte, now time.Time) (User, string, error) {
+func (r *PostgresRepository) CompleteMFARecoveryChallenge(ctx context.Context, challengeHash, recoveryHash [32]byte, now time.Time) (User, string, int64, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	defer tx.Rollback(ctx)
 
 	var user User
 	var deviceName string
+	var authEpoch int64
 	err = tx.QueryRow(ctx, `
-        SELECT account.id::text, account.email, account.password_hash, account.role, challenge.device_name
+        SELECT account.id::text, account.email, account.password_hash, account.role, challenge.device_name, challenge.auth_epoch
         FROM mfa_challenges AS challenge
         JOIN users AS account ON account.id = challenge.user_id
         JOIN user_mfa_totp AS mfa ON mfa.user_id = challenge.user_id
@@ -668,30 +683,30 @@ func (r *PostgresRepository) CompleteMFARecoveryChallenge(ctx context.Context, c
           AND mfa.confirmed_at IS NOT NULL
           AND account.state = 'active' AND account.deleted_at IS NULL
         FOR UPDATE OF challenge`, challengeHash[:], now,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName)
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.Role, &deviceName, &authEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return User{}, "", ErrMFAChallenge
+		return User{}, "", 0, ErrMFAChallenge
 	}
 	if err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	command, err := tx.Exec(ctx, `
         UPDATE user_mfa_recovery_codes
         SET used_at = $3
         WHERE user_id = $1::uuid AND code_hash = $2 AND used_at IS NULL`, user.ID, recoveryHash[:], now)
 	if err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	if command.RowsAffected() != 1 {
-		return User{}, "", ErrMFAInvalid
+		return User{}, "", 0, ErrMFAInvalid
 	}
 	if _, err := tx.Exec(ctx, `UPDATE mfa_challenges SET consumed_at = $2 WHERE challenge_hash = $1`, challengeHash[:], now); err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return User{}, "", err
+		return User{}, "", 0, err
 	}
-	return user, deviceName, nil
+	return user, deviceName, authEpoch, nil
 }
 
 func (r *PostgresRepository) RecordMFAActionAttempt(

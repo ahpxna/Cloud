@@ -49,7 +49,7 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 	}
 
 	preMFARefresh := sha256.Sum256([]byte("pre-mfa-refresh-token"))
-	preMFASessionID, err := repository.CreateRefreshSession(ctx, userID, "Pre-MFA iPhone", preMFARefresh, now.Add(30*24*time.Hour), false)
+	preMFASessionID, err := repository.CreateRefreshSession(ctx, userID, "Pre-MFA iPhone", preMFARefresh, now.Add(30*24*time.Hour), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,15 +138,26 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 	if err := repository.CreateMFAChallenge(ctx, userID, "Integration iPhone", challengeHash, now, now.Add(mfaChallengeTTL), mfaChallengeAttempts); err != nil {
 		t.Fatal(err)
 	}
-	user, device, err := repository.CompleteMFARecoveryChallenge(ctx, challengeHash, rotated[0], now.Add(time.Minute))
+	user, device, authenticatedEpoch, err := repository.CompleteMFARecoveryChallenge(ctx, challengeHash, rotated[0], now.Add(time.Minute))
 	if err != nil || user.ID != userID || device != "Integration iPhone" {
 		t.Fatalf("recovery challenge user=%#v device=%q err=%v", user, device, err)
+	}
+	validRefresh := sha256.Sum256([]byte("valid-mfa-refresh"))
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Verified MFA iPhone", validRefresh, now.Add(30*24*time.Hour), &authenticatedEpoch); err != nil {
+		t.Fatalf("verified MFA epoch should create session: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET auth_epoch = auth_epoch + 1 WHERE id = $1::uuid`, userID); err != nil {
+		t.Fatal(err)
+	}
+	staleRefresh := sha256.Sum256([]byte("stale-mfa-refresh"))
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Stale MFA iPhone", staleRefresh, now.Add(30*24*time.Hour), &authenticatedEpoch); !errors.Is(err, ErrMFAChallenge) {
+		t.Fatalf("stale MFA epoch session error=%v want %v", err, ErrMFAChallenge)
 	}
 	secondChallenge := sha256.Sum256([]byte("recovery-challenge-two"))
 	if err := repository.CreateMFAChallenge(ctx, userID, "Integration iPhone", secondChallenge, now.Add(2*time.Minute), now.Add(7*time.Minute), mfaChallengeAttempts); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := repository.CompleteMFARecoveryChallenge(ctx, secondChallenge, rotated[0], now.Add(3*time.Minute)); !errors.Is(err, ErrMFAInvalid) {
+	if _, _, _, err := repository.CompleteMFARecoveryChallenge(ctx, secondChallenge, rotated[0], now.Add(3*time.Minute)); !errors.Is(err, ErrMFAInvalid) {
 		t.Fatalf("used recovery code error=%v want %v", err, ErrMFAInvalid)
 	}
 
@@ -175,7 +186,7 @@ func TestPostgresRefreshRotationRetryGraceIsBoundToRequestID(t *testing.T) {
 	newHash := sha256.Sum256([]byte("refresh-new"))
 	requestA := sha256.Sum256([]byte("rotation-request-a"))
 	requestB := sha256.Sum256([]byte("rotation-request-b"))
-	if _, err := repository.CreateRefreshSession(ctx, userID, "Retry iPhone", oldHash, now.Add(30*24*time.Hour), false); err != nil {
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Retry iPhone", oldHash, now.Add(30*24*time.Hour), nil); err != nil {
 		t.Fatal(err)
 	}
 	ciphertext := []byte("authenticated-ciphertext")
@@ -235,7 +246,7 @@ func TestPostgresRefreshRotationRetryGraceExpires(t *testing.T) {
 	oldHash := sha256.Sum256([]byte("refresh-expiry-old"))
 	newHash := sha256.Sum256([]byte("refresh-expiry-new"))
 	requestID := sha256.Sum256([]byte("rotation-request-expiry"))
-	if _, err := repository.CreateRefreshSession(ctx, userID, "Expiry iPhone", oldHash, now.Add(30*24*time.Hour), false); err != nil {
+	if _, err := repository.CreateRefreshSession(ctx, userID, "Expiry iPhone", oldHash, now.Add(30*24*time.Hour), nil); err != nil {
 		t.Fatal(err)
 	}
 	first, err := repository.RotateRefreshSession(ctx, oldHash, newHash, requestID, now.Add(30*24*time.Hour), []byte("authenticated-ciphertext"), []byte("123456789012"), now)
@@ -302,7 +313,7 @@ func TestPostgresDeviceRevokeRevokesRefreshFamilyAfterRotation(t *testing.T) {
 	}
 	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
 	parentHash := sha256.Sum256([]byte("device-family-parent"))
-	parentID, err := repository.CreateRefreshSession(ctx, userID, "Family iPhone", parentHash, now.Add(30*24*time.Hour), false)
+	parentID, err := repository.CreateRefreshSession(ctx, userID, "Family iPhone", parentHash, now.Add(30*24*time.Hour), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

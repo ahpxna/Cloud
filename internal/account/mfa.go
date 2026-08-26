@@ -69,8 +69,8 @@ type MFARepository interface {
 	CreateMFAChallenge(context.Context, string, string, [32]byte, time.Time, time.Time, int) error
 	MFAChallengeByHash(context.Context, [32]byte, time.Time) (MFAChallenge, error)
 	FailMFAChallenge(context.Context, [32]byte, time.Time) (int, error)
-	CompleteMFATOTPChallenge(context.Context, [32]byte, time.Time, int64) (User, string, error)
-	CompleteMFARecoveryChallenge(context.Context, [32]byte, [32]byte, time.Time) (User, string, error)
+	CompleteMFATOTPChallenge(context.Context, [32]byte, time.Time, int64) (User, string, int64, error)
+	CompleteMFARecoveryChallenge(context.Context, [32]byte, [32]byte, time.Time) (User, string, int64, error)
 	RecordMFAActionAttempt(context.Context, string, string, time.Time, time.Duration, int) (bool, time.Duration, error)
 	ClearMFAActionAttempts(context.Context, string, string) error
 	RotateRecoveryCodes(context.Context, string, int64, [][32]byte) error
