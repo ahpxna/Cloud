@@ -119,17 +119,18 @@ final class LibraryStore: ObservableObject {
             return cached
         }
         let temporaryURL = try await originalDownloader(asset)
-        do {
-            // Verification can read multi-gigabyte videos. Reuse the detached
-            // uploader hash worker rather than monopolising MainActor.
-            let digest = try await HashWorker.sha256(of: temporaryURL)
-            guard revision == requestRevision else { throw CancellationError() }
-            guard digest.caseInsensitiveCompare(asset.contentSHA256) == .orderedSame else {
-                throw APIProblem(status: 409, code: "download_integrity_mismatch", detail: "Downloaded original does not match the server's verified SHA-256.")
-            }
-        } catch {
-            try? FileManager.default.removeItem(at: temporaryURL)
-            throw error
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        // Verification can read multi-gigabyte videos. Reuse the detached
+        // uploader hash worker rather than monopolising MainActor.
+        let digest = try await HashWorker.sha256(of: temporaryURL)
+        guard revision == requestRevision else { throw CancellationError() }
+        guard digest.caseInsensitiveCompare(asset.contentSHA256) == .orderedSame else {
+            throw APIProblem(status: 409, code: "download_integrity_mismatch", detail: "Downloaded original does not match the server's verified SHA-256.")
+        }
+        // Another request may have completed while this request downloaded or
+        // hashed. Reuse its file instead of deleting a URL already in use.
+        if let cached = cachedURLs[asset.id], FileManager.default.fileExists(atPath: cached.path()) {
+            return cached
         }
         let caches = try FileManager.default.url(
             for: .cachesDirectory,
@@ -188,18 +189,19 @@ struct LibraryView: View {
 private struct AssetDetailView: View {
     let asset: LibraryAsset
     @ObservedObject var store: LibraryStore
-    @State private var localURL: URL?
     @State private var error: String?
+    @State private var image: UIImage?
+    @State private var player: AVPlayer?
 
     var body: some View {
         Group {
-            if let localURL, asset.mediaType.hasPrefix("image/"), let image = UIImage(contentsOfFile: localURL.path()) {
+            if let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
                     .accessibilityLabel(asset.originalFilename)
-            } else if let localURL, asset.mediaType.hasPrefix("video/") {
-                VideoPlayer(player: AVPlayer(url: localURL))
+            } else if let player {
+                VideoPlayer(player: player)
             } else if let error {
                 ContentUnavailableView("Could not open original", systemImage: "exclamationmark.triangle", description: Text(error))
             } else {
@@ -209,8 +211,20 @@ private struct AssetDetailView: View {
         .navigationTitle(asset.originalFilename)
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            do { localURL = try await store.localURL(for: asset) }
+            do {
+                let url = try await store.localURL(for: asset)
+                try Task.checkCancellation()
+                if asset.mediaType.hasPrefix("image/") {
+                    image = UIImage(contentsOfFile: url.path())
+                    if image == nil { error = "This image format could not be displayed." }
+                } else if asset.mediaType.hasPrefix("video/") {
+                    player = AVPlayer(url: url)
+                } else {
+                    error = "This media format could not be displayed."
+                }
+            }
             catch { self.error = error.localizedDescription }
         }
+        .onDisappear { player?.pause() }
     }
 }

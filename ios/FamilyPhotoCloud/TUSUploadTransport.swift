@@ -29,7 +29,7 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         )
         super.init()
         client.delegate = self
-        restoreStoredContexts()
+        try restoreStoredContexts()
     }
 
     func enqueue(item: QueuedUpload, endpoint: URL, uploadToken: String) throws -> UUID {
@@ -56,12 +56,13 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
                 try discardStoredUpload(id: upload.id)
             }
         }
-        restoreStoredContexts()
+        try restoreStoredContexts()
         // Let TUSKit reconcile persisted metadata with any background
         // URLSession tasks from the previous process. Calling resume(id:) for
         // every stored upload here can schedule a duplicate task after relaunch.
+        let failedIDs = Set(try client.failedUploadIDs())
         _ = client.start()
-        return Set((try? client.failedUploadIDs()) ?? [])
+        return failedIDs
     }
 
     func pauseForAuthenticationChange() {
@@ -76,12 +77,12 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         return try client.retry(id: id)
     }
 
-    func storedUploadID(forSessionID sessionID: String) -> UUID? {
-        (try? client.getStoredUploads())?.first(where: { $0.context?["session_id"] == sessionID })?.id
+    func storedUploadID(forSessionID sessionID: String) throws -> UUID? {
+        try client.getStoredUploads().first(where: { $0.context?["session_id"] == sessionID })?.id
     }
 
-    func isFailedStoredUpload(id: UUID) -> Bool {
-        (try? client.failedUploadIDs().contains(id)) ?? false
+    func isFailedStoredUpload(id: UUID) throws -> Bool {
+        try client.failedUploadIDs().contains(id)
     }
 
     /// A terminal server-side session must not leave a persisted TUSKit task
@@ -145,8 +146,8 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
         uploadFailed?(id, context, error)
     }
 
-    private func restoreStoredContexts() {
-        for upload in (try? client.getStoredUploads()) ?? [] {
+    private func restoreStoredContexts() throws {
+        for upload in try client.getStoredUploads() {
             if let sessionID = upload.context?["session_id"] {
                 headerProvider.register(id: upload.id, sessionID: sessionID)
             }

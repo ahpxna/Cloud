@@ -470,14 +470,14 @@ final class UploadCoordinator: ObservableObject {
             // TUSKit can publish its metadata before this queue record's
             // tusUploadID is atomically saved. Reattach that task after a
             // crash instead of scheduling a second upload for the session.
-            if let storedID = transport.storedUploadID(forSessionID: sessionID) {
+            if let storedID = try transport.storedUploadID(forSessionID: sessionID) {
                 item.tusUploadID = storedID
-                if retryFailed && transport.isFailedStoredUpload(id: storedID) {
+                if try retryFailed && transport.isFailedStoredUpload(id: storedID) {
                     guard try transport.retryFailedUpload(id: storedID) else {
                         throw URLError(.cannotLoadFromNetwork)
                     }
                 }
-                item.state = transport.isFailedStoredUpload(id: storedID) ? .failed : .transferring
+                item.state = try transport.isFailedStoredUpload(id: storedID) ? .failed : .transferring
                 item.lastError = item.state == .failed
                     ? "Upload paused after its network retry limit. Tap Resume and check status to retry it."
                     : nil
@@ -655,7 +655,7 @@ final class UploadCoordinator: ObservableObject {
         var ids = Set<UUID>()
         if let id = item.tusUploadID { ids.insert(id) }
         if let sessionID = item.serverSessionID,
-           let id = transport.storedUploadID(forSessionID: sessionID) { ids.insert(id) }
+           let id = try transport.storedUploadID(forSessionID: sessionID) { ids.insert(id) }
         for id in ids { try transport.discardStoredUpload(id: id) }
     }
 
