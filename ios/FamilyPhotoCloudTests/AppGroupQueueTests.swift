@@ -1,5 +1,6 @@
 import Foundation
 import UniformTypeIdentifiers
+import UniformTypeIdentifiers
 import XCTest
 @testable import FamilyPhotoCloud
 
@@ -159,6 +160,24 @@ final class AppGroupQueueTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL(for: original, in: root).path()))
         XCTAssertTrue(FileManager.default.fileExists(atPath: duplicate.path()))
         XCTAssertTrue(FileManager.default.fileExists(atPath: corrupt.path()))
+    }
+
+    func testImportOfOldPhotoCannotBeRecoveredBeforeItsQueueRecordIsPublished() throws {
+        let root = temporaryQueueRoot()
+        let source = root.appending(path: "old-photo.heic")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let bytes = Data("original bytes".utf8)
+        try bytes.write(to: source)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: source.path())
+        let item = try AppGroupQueue.enqueue(ephemeralSource: source, type: .image, in: root) {
+            // Simulate the main app scanning while the Share Extension is
+            // between publishing payload bytes and atomically saving metadata.
+            XCTAssertTrue(try AppGroupQueue.all(in: root).isEmpty)
+        }
+        let records = try AppGroupQueue.all(in: root)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records[0].clientAssetID, item.clientAssetID)
+        XCTAssertEqual(try Data(contentsOf: AppGroupQueue.payloadURL(for: item, in: root)), bytes)
     }
 
     func testOrphanedPayloadIsRecoveredOnNextQueueRead() throws {

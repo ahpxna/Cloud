@@ -61,10 +61,18 @@ enum AppGroupQueue {
     private static let orphanRecoveryMinimumAge: TimeInterval = 5 * 60
 
     static func enqueue(ephemeralSource: URL, type: UTType) throws -> QueuedUpload {
+        try enqueue(ephemeralSource: ephemeralSource, type: type, in: rootURL())
+    }
+
+    static func enqueue(
+        ephemeralSource: URL,
+        type: UTType,
+        in root: URL,
+        afterPayloadPublication: () throws -> Void = {}
+    ) throws -> QueuedUpload {
         guard type.conforms(to: .image) || type.conforms(to: .movie) else {
             throw AppGroupQueueError.unsupportedPayload
         }
-        let root = try rootURL()
         let payloads = root.appending(path: "payloads", directoryHint: .isDirectory)
         let records = root.appending(path: "records", directoryHint: .isDirectory)
         try createProtectedDirectory(payloads)
@@ -80,8 +88,15 @@ enum AppGroupQueue {
 
         do {
             try FileManager.default.copyItem(at: ephemeralSource, to: staging)
+            // copyItem preserves an old photo's filesystem timestamp. Refresh
+            // the local staging timestamp before publication so another process
+            // cannot immediately mistake the new payload for a crash orphan.
+            try FileManager.default.setAttributes(
+                [.protectionKey: backgroundProtection, .modificationDate: Date.now],
+                ofItemAtPath: staging.path()
+            )
             try FileManager.default.moveItem(at: staging, to: payload)
-            try FileManager.default.setAttributes([.protectionKey: backgroundProtection], ofItemAtPath: payload.path())
+            try afterPayloadPublication()
             let item = QueuedUpload(
                 id: id,
                 payloadFilename: filename,
@@ -439,7 +454,8 @@ enum AppGroupQueue {
             sha256: item.sha256,
             serverSessionID: item.serverSessionID,
             tusUploadID: item.tusUploadID,
-            lastError: item.lastError
+            lastError: item.lastError,
+            ownerUserID: item.ownerUserID
         )
         let destination = records.appending(path: "\(payloadID.uuidString).json")
         if FileManager.default.fileExists(atPath: destination.path()) {

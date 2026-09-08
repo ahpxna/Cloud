@@ -23,6 +23,7 @@ struct QueuedUpload: Codable, Identifiable, Sendable {
     let originalFilename: String
     let typeIdentifier: String
     let createdAt: Date
+    var ownerUserID: String?
     var state: UploadState
     var byteCount: Int64?
     var sha256: String?
@@ -32,7 +33,7 @@ struct QueuedUpload: Codable, Identifiable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, clientAssetID, payloadFilename, originalFilename, typeIdentifier, createdAt
-        case state, byteCount, sha256, serverSessionID, tusUploadID, lastError
+        case ownerUserID, state, byteCount, sha256, serverSessionID, tusUploadID, lastError
     }
 
     init(
@@ -47,7 +48,8 @@ struct QueuedUpload: Codable, Identifiable, Sendable {
         sha256: String?,
         serverSessionID: String?,
         tusUploadID: UUID?,
-        lastError: String?
+        lastError: String?,
+        ownerUserID: String? = nil
     ) {
         self.id = id
         self.clientAssetID = clientAssetID ?? id
@@ -55,6 +57,7 @@ struct QueuedUpload: Codable, Identifiable, Sendable {
         self.originalFilename = originalFilename
         self.typeIdentifier = typeIdentifier
         self.createdAt = createdAt
+        self.ownerUserID = ownerUserID
         self.state = state
         self.byteCount = byteCount
         self.sha256 = sha256
@@ -71,6 +74,7 @@ struct QueuedUpload: Codable, Identifiable, Sendable {
         originalFilename = try container.decode(String.self, forKey: .originalFilename)
         typeIdentifier = try container.decode(String.self, forKey: .typeIdentifier)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
+        ownerUserID = try container.decodeIfPresent(String.self, forKey: .ownerUserID)
         state = try container.decode(UploadState.self, forKey: .state)
         byteCount = try container.decodeIfPresent(Int64.self, forKey: .byteCount)
         sha256 = try container.decodeIfPresent(String.self, forKey: .sha256)
@@ -79,7 +83,25 @@ struct QueuedUpload: Codable, Identifiable, Sendable {
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
     }
 
+    mutating func claim(for userID: String) throws {
+        guard !userID.isEmpty, ownerUserID == nil || ownerUserID == userID else {
+            throw QueueOwnershipError.differentAccount
+        }
+        ownerUserID = userID
+    }
+
+    func acceptsTransferCallback(id: UUID, sessionID: String?) -> Bool {
+        guard state != .available, state != .quarantined,
+              let serverSessionID, let sessionID else { return false }
+        return tusUploadID == id && serverSessionID == sessionID
+    }
+
     var contentType: UTType {
         UTType(typeIdentifier) ?? .data
     }
+}
+
+enum QueueOwnershipError: LocalizedError {
+    case differentAccount
+    var errorDescription: String? { "Sign in with the account that first started this upload." }
 }

@@ -29,7 +29,7 @@ final class AppEnvironment: ObservableObject {
 
     private init() {
         guard let rawURL = Bundle.main.object(forInfoDictionaryKey: "PhotoCloudAPIBaseURL") as? String,
-              let url = URL(string: rawURL), url.scheme == "https", url.host != "photos.example.com"
+              let url = try? PhotoCloudAPI.configuredBaseURL(rawURL)
         else {
             coordinator = nil
             library = nil
@@ -73,6 +73,8 @@ struct ContentView: View {
                             .tabItem { Label("Library", systemImage: "photo.on.rectangle") }
                         UploadQueueView(coordinator: coordinator, library: library, email: $email, password: $password)
                             .tabItem { Label("Uploads", systemImage: "arrow.up.circle") }
+                        HelpView()
+                            .tabItem { Label("Help", systemImage: "questionmark.circle") }
                     }
                 }
             }
@@ -99,6 +101,9 @@ private struct UploadQueueView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Add photos and videos") {
+                    MediaImportView(coordinator: coordinator)
+                }
                 Section("Sign in") {
                     TextField("Email", text: $email).textInputAutocapitalization(.never).keyboardType(.emailAddress)
                     SecureField("Password", text: $password)

@@ -53,7 +53,7 @@ final class UploadDiagnostics {
             bytesUploaded: bytesUploaded,
             totalBytes: totalBytes,
             appState: Self.appStateName(UIApplication.shared.applicationState),
-            error: Self.safeErrorDescription(error)
+            error: DiagnosticErrorSummary.describe(error)
         )
         do {
             let directory = try AppGroupQueue.diagnosticsDirectory()
@@ -108,24 +108,6 @@ final class UploadDiagnostics {
             try FileManager.default.removeItem(at: rotated)
         }
         try FileManager.default.moveItem(at: url, to: rotated)
-    }
-
-    private static func safeErrorDescription(_ error: Error?) -> String? {
-        guard let error else { return nil }
-        var value = error.localizedDescription
-        let patterns = [
-            #"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+"#,
-            #"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#
-        ]
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(value.startIndex..<value.endIndex, in: value)
-            value = regex.stringByReplacingMatches(in: value, range: range, withTemplate: "[REDACTED]")
-        }
-        if value.count > 512 {
-            value = String(value.prefix(512)) + "…"
-        }
-        return value
     }
 
     private static func appStateName(_ state: UIApplication.State) -> String {

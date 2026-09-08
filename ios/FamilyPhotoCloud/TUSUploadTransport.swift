@@ -47,13 +47,25 @@ final class TUSUploadTransport: NSObject, TUSClientDelegate {
     /// Starts normal persisted work and returns uploads that exhausted
     /// TUSKit's retry budget. Callers must surface those as retryable instead
     /// of claiming they are actively transferring.
-    func resumeStoredUploads() -> Set<UUID> {
+    func resumeStoredUploads(excludingQueueIDs: Set<UUID> = []) throws -> Set<UUID> {
+        // Retire only TUSKit's cache for another account. App Group originals
+        // remain intact; the owner can reconcile/restart after signing back in.
+        for upload in try client.getStoredUploads() {
+            if let raw = upload.context?["queue_id"], let id = UUID(uuidString: raw),
+               excludingQueueIDs.contains(id) {
+                try discardStoredUpload(id: upload.id)
+            }
+        }
         restoreStoredContexts()
         // Let TUSKit reconcile persisted metadata with any background
         // URLSession tasks from the previous process. Calling resume(id:) for
         // every stored upload here can schedule a duplicate task after relaunch.
         _ = client.start()
         return Set((try? client.failedUploadIDs()) ?? [])
+    }
+
+    func pauseForAuthenticationChange() {
+        client.stopAndCancelAll()
     }
 
     func retryFailedUpload(id: UUID) throws -> Bool {

@@ -24,6 +24,9 @@ targets:
     platform: iOS
     sources:
       - path: FamilyPhotoCloud
+        excludes: [PrivacyInfo.xcprivacy]
+      - path: FamilyPhotoCloud/PrivacyInfo.xcprivacy
+        buildPhase: resources
       - path: Shared
     settings:
       base:
@@ -34,8 +37,11 @@ targets:
         INFOPLIST_KEY_CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ""
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_PhotoCloudAPIBaseURL: https://photos.example.com
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: FamilyPhotoCloud/Info.plist
+        PHOTO_CLOUD_API_BASE_URL: https://photos.example.com
+        PHOTO_CLOUD_PRIVACY_POLICY_URL: ""
+        PHOTO_CLOUD_SUPPORT_URL: ""
     entitlements:
       path: FamilyPhotoCloud/FamilyPhotoCloud.entitlements
     dependencies:
@@ -51,6 +57,9 @@ targets:
     platform: iOS
     sources:
       - path: ShareExtension
+        excludes: [PrivacyInfo.xcprivacy]
+      - path: ShareExtension/PrivacyInfo.xcprivacy
+        buildPhase: resources
       - path: Shared
     settings:
       base:

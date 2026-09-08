@@ -21,6 +21,7 @@ jobs:
       - run: find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
       - run: go test -race ./...
       - run: go vet ./...
+      - run: python3 -m unittest discover -s scripts/tests -v
 
   postgres-integration:
     runs-on: ubuntu-24.04

@@ -1,4 +1,5 @@
 import AVKit
+import Combine
 import SwiftUI
 import UIKit
 
@@ -28,25 +29,58 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var isLoadingMore = false
     @Published private(set) var hasMore = false
 
-    private let coordinator: UploadCoordinator
+    private let pageLoader: (String?, Int) async throws -> LibraryPage
+    private let originalDownloader: (LibraryAsset) async throws -> URL
+    private var authenticationObserver: AnyCancellable?
+    @Published private(set) var revision = UUID()
     private var cachedURLs: [String: URL] = [:]
     private var pagination = LibraryPagination()
     private let pageSize = 50
 
-    init(coordinator: UploadCoordinator) {
-        self.coordinator = coordinator
+    init(
+        pageLoader: @escaping (String?, Int) async throws -> LibraryPage,
+        originalDownloader: @escaping (LibraryAsset) async throws -> URL
+    ) {
+        self.pageLoader = pageLoader
+        self.originalDownloader = originalDownloader
+    }
+
+    convenience init(coordinator: UploadCoordinator) {
+        self.init(
+            pageLoader: { try await coordinator.libraryPage(cursor: $0, limit: $1) },
+            originalDownloader: { try await coordinator.downloadOriginal($0) }
+        )
+        authenticationObserver = coordinator.$authenticationRevision.sink { [weak self] _ in
+            self?.clearForAuthenticationChange()
+        }
+    }
+
+    func clearForAuthenticationChange() {
+        revision = UUID()
+        for url in cachedURLs.values { try? FileManager.default.removeItem(at: url) }
+        cachedURLs = [:]
+        pagination = LibraryPagination()
+        applyPaginationState()
+        isLoading = false
+        isLoadingMore = false
+        error = nil
     }
 
     func reload() async {
         guard !isLoading, !isLoadingMore else { return }
+        let requestRevision = revision
         isLoading = true
-        defer { isLoading = false }
+        defer { if revision == requestRevision { isLoading = false } }
         do {
-            let page = try await coordinator.libraryPage(cursor: nil, limit: pageSize)
+            let page = try await pageLoader(nil, pageSize)
+            guard revision == requestRevision else { return }
             pagination.replace(with: page)
             applyPaginationState()
             error = nil
         } catch {
+            guard revision == requestRevision else { return }
+            pagination = LibraryPagination()
+            applyPaginationState()
             self.error = error.localizedDescription
         }
     }
@@ -58,14 +92,17 @@ final class LibraryStore: ObservableObject {
 
     func loadMore() async {
         guard !isLoading, !isLoadingMore, let cursor = pagination.nextCursor else { return }
+        let requestRevision = revision
         isLoadingMore = true
-        defer { isLoadingMore = false }
+        defer { if revision == requestRevision { isLoadingMore = false } }
         do {
-            let page = try await coordinator.libraryPage(cursor: cursor, limit: pageSize)
+            let page = try await pageLoader(cursor, pageSize)
+            guard revision == requestRevision else { return }
             pagination.append(page, requestedCursor: cursor)
             applyPaginationState()
             error = nil
         } catch {
+            guard revision == requestRevision else { return }
             self.error = error.localizedDescription
         }
     }
@@ -76,14 +113,17 @@ final class LibraryStore: ObservableObject {
     }
 
     func localURL(for asset: LibraryAsset) async throws -> URL {
+        let requestRevision = revision
+        guard assets.contains(where: { $0.id == asset.id }) else { throw CancellationError() }
         if let cached = cachedURLs[asset.id], FileManager.default.fileExists(atPath: cached.path()) {
             return cached
         }
-        let temporaryURL = try await coordinator.downloadOriginal(asset)
+        let temporaryURL = try await originalDownloader(asset)
         do {
             // Verification can read multi-gigabyte videos. Reuse the detached
             // uploader hash worker rather than monopolising MainActor.
             let digest = try await HashWorker.sha256(of: temporaryURL)
+            guard revision == requestRevision else { throw CancellationError() }
             guard digest.caseInsensitiveCompare(asset.contentSHA256) == .orderedSame else {
                 throw APIProblem(status: 409, code: "download_integrity_mismatch", detail: "Downloaded original does not match the server's verified SHA-256.")
             }
@@ -141,6 +181,7 @@ struct LibraryView: View {
             .toolbar { Button("Refresh") { Task { await store.reload() } } }
             .task { await store.reload() }
         }
+        .id(store.revision)
     }
 }
 

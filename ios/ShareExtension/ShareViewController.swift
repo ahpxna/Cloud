@@ -2,9 +2,20 @@ import Social
 import UniformTypeIdentifiers
 
 final class ShareViewController: SLComposeServiceViewController {
-    override func isContentValid() -> Bool { true }
+    private var isImporting = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Add to Family Photo Cloud"
+        placeholder = "Images and videos are saved to the upload queue. Open Family Photo Cloud to finish backing them up."
+    }
+
+    override func isContentValid() -> Bool { !isImporting }
 
     override func didSelectPost() {
+        guard !isImporting else { return }
+        isImporting = true
+        validateContent()
         let providers: [(NSItemProvider, UTType)] = (extensionContext?.inputItems ?? [])
             .compactMap { $0 as? NSExtensionItem }
             .flatMap { $0.attachments ?? [] }
@@ -30,18 +41,14 @@ final class ShareViewController: SLComposeServiceViewController {
                 }
             }
             guard let self else { return }
-            if failures.isEmpty {
-                self.extensionContext?.completeRequest(returningItems: nil)
-            } else if succeeded > 0 {
-                // Queue writes are already durable, so do not discard the
-                // successful originals. However, completion would falsely
-                // imply every selected item was backed up; return an explicit
-                // receipt the share sheet can show instead of silently omitting
-                // failed providers.
-                self.cancel(with: "\(succeeded) item(s) queued; \(failures.count) could not be imported. Keep the originals and try sharing the failed item(s) again.")
-            } else {
-                self.cancel(with: failures.first ?? "Could not add the selected items to the queue.")
-            }
+            let title = failures.isEmpty ? "Added to upload queue" : "Import finished with errors"
+            let message = "\(succeeded) item(s) queued. \(failures.count) item(s) could not be imported. " +
+                "Open Family Photo Cloud to upload the queued items. Keep your originals until they appear in Library."
+            let receipt = UIAlertController(title: title, message: message, preferredStyle: .alert)
+            receipt.addAction(UIAlertAction(title: "Done", style: .default) { [weak self] _ in
+                self?.extensionContext?.completeRequest(returningItems: nil)
+            })
+            self.present(receipt, animated: true)
         }
     }
 

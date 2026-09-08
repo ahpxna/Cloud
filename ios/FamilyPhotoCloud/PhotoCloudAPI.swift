@@ -306,8 +306,19 @@ struct PhotoCloudAPI: Sendable {
         return temporaryURL
     }
 
+    static func configuredBaseURL(_ raw: String) throws -> URL {
+        guard let url = URL(string: raw), url.scheme == "https",
+              let host = url.host, !host.isEmpty,
+              host != "example.com", !host.hasSuffix(".example.com"),
+              url.user == nil, url.password == nil,
+              url.path.isEmpty || url.path == "/",
+              url.query == nil, url.fragment == nil else { throw URLError(.badURL) }
+        return url
+    }
+
     func absoluteURL(for relativePath: String) throws -> URL {
-        guard let url = URL(string: relativePath, relativeTo: baseURL), url.host == baseURL.host, url.scheme == baseURL.scheme else {
+        guard let url = URL(string: relativePath, relativeTo: baseURL), url.host == baseURL.host, url.scheme == baseURL.scheme,
+              (url.port ?? 443) == (baseURL.port ?? 443), url.user == nil, url.password == nil else {
             throw URLError(.badURL)
         }
         return url
@@ -330,7 +341,7 @@ struct PhotoCloudAPI: Sendable {
     }
 
     private func request<Body: Encodable, Response: Decodable>(path: String, method: String, queryItems: [URLQueryItem] = [], body: Body?, bearer: String?, response: Response.Type) async throws -> Response {
-        var components = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
+        var components = URLComponents(url: try absoluteURL(for: path), resolvingAgainstBaseURL: true)
         components?.queryItems = queryItems.isEmpty ? nil : queryItems
         guard let url = components?.url else { throw URLError(.badURL) }
         var request = URLRequest(url: url)
@@ -347,7 +358,19 @@ struct PhotoCloudAPI: Sendable {
             throw (try? JSONDecoder().decode(APIProblem.self, from: data)) ?? URLError(.badServerResponse)
         }
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        // Go's time.Time JSON includes fractional seconds for PostgreSQL
+        // timestamps. Older supported iOS runtimes reject those with .iso8601.
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            if let date = try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(value) {
+                return date
+            }
+            if let date = try? Date.ISO8601FormatStyle().parse(value) {
+                return date
+            }
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid RFC 3339 timestamp")
+        }
         return try decoder.decode(Response.self, from: data)
     }
 }
@@ -404,58 +427,93 @@ private struct CredentialResponse: Codable {
     }
 }
 
+struct UploadIdentity: Sendable {
+    let accessToken: String
+    let userID: String
+    fileprivate let generation: UUID
+}
+
+struct CredentialPersistence: Sendable {
+    let load: @Sendable () throws -> Credential?
+    let save: @Sendable (Credential) throws -> Void
+    let delete: @Sendable () throws -> Void
+
+    static let keychain = CredentialPersistence(
+        load: { try KeychainStore.loadCredential() },
+        save: { try KeychainStore.save($0) },
+        delete: { try KeychainStore.deleteCredential() }
+    )
+}
+
 actor AuthenticationStore {
+    private let persistence: CredentialPersistence
     private var credential: Credential?
     private var refreshTask: Task<Credential, Error>?
+    private var credentialGeneration = UUID()
+
+    init(persistence: CredentialPersistence = .keychain) {
+        self.persistence = persistence
+    }
 
     func login(email: String, password: String, deviceName: String, api: PhotoCloudAPI) async throws -> LoginResult {
+        try invalidateCredential()
+        let generation = credentialGeneration
         let result = try await api.login(email: email, password: password, deviceName: deviceName)
+        try requireGeneration(generation)
         if case .authenticated(let newCredential) = result {
-            try KeychainStore.save(newCredential)
+            try persistence.save(newCredential)
             credential = newCredential
         }
         return result
     }
 
     func verifyMFA(challenge: String, totpCode: String?, recoveryCode: String?, api: PhotoCloudAPI) async throws {
+        let generation = credentialGeneration
         let newCredential = try await api.verifyMFA(challenge: challenge, totpCode: totpCode, recoveryCode: recoveryCode)
-        try KeychainStore.save(newCredential)
+        try requireGeneration(generation)
+        try persistence.save(newCredential)
         credential = newCredential
     }
 
+    private func requireGeneration(_ generation: UUID) throws {
+        guard generation == credentialGeneration else { throw CancellationError() }
+    }
 
     func invalidateCredential() throws {
+        credentialGeneration = UUID()
         refreshTask?.cancel()
         refreshTask = nil
         credential = nil
-        try KeychainStore.deleteCredential()
+        try persistence.delete()
     }
 
     func signOut(api: PhotoCloudAPI) async throws {
-        let current = try credential ?? KeychainStore.loadCredential()
-        refreshTask?.cancel()
-        refreshTask = nil
+        let current = try credential ?? persistence.load()
+        // Clear before the network await. A late refresh/login response must
+        // never restore a signed-out account or overwrite a newer sign-in.
+        try invalidateCredential()
+        if let current { try await api.logout(refreshToken: current.refreshToken) }
+    }
 
-        var remoteError: (any Error)?
-        if let current {
-            do {
-                try await api.logout(refreshToken: current.refreshToken)
-            } catch {
-                remoteError = error
-            }
-        }
+    func uploadIdentity(api: PhotoCloudAPI) async throws -> UploadIdentity {
+        let generation = credentialGeneration
+        let token = try await accessToken(api: api)
+        try requireGeneration(generation)
+        guard let current = try credential ?? persistence.load() else { throw CancellationError() }
+        return UploadIdentity(accessToken: token, userID: current.userID, generation: generation)
+    }
 
-        credential = nil
-        try KeychainStore.deleteCredential()
-        if let remoteError { throw remoteError }
+    func requireCurrent(_ identity: UploadIdentity) throws {
+        try requireGeneration(identity.generation)
     }
 
     func accessToken(api: PhotoCloudAPI) async throws -> String {
-        let storedCredential = try credential ?? KeychainStore.loadCredential()
+        let generation = credentialGeneration
+        let storedCredential = try credential ?? persistence.load()
         guard var current = storedCredential else { throw APIProblem(status: 401, code: "not_signed_in", detail: "Sign in before uploading.") }
         if current.accessExpiresAt > Date.now.addingTimeInterval(60) { return current.accessToken }
         guard current.refreshExpiresAt > .now else {
-            try KeychainStore.deleteCredential()
+            try persistence.delete()
             credential = nil
             throw APIProblem(status: 401, code: "session_expired", detail: "Sign in again to continue uploads.")
         }
@@ -467,7 +525,7 @@ actor AuthenticationStore {
             // the next attempt reuses the same ID with the same old token.
             let rotationRequestID = current.pendingRefreshRequestID ?? UUID().uuidString
             current.pendingRefreshRequestID = rotationRequestID
-            try KeychainStore.save(current)
+            try persistence.save(current)
             credential = current
 
             let refreshToken = current.refreshToken
@@ -476,22 +534,26 @@ actor AuthenticationStore {
             do {
                 current = try await task.value
             } catch let problem as APIProblem where problem.status == 401 {
+                try requireGeneration(generation)
                 refreshTask = nil
                 credential = nil
-                try? KeychainStore.deleteCredential()
+                try? persistence.delete()
                 throw APIProblem(
                     status: 401,
                     code: "session_expired",
                     detail: "Your session is no longer valid. Sign in again to continue."
                 )
             } catch {
+                try requireGeneration(generation)
                 refreshTask = nil
                 throw error
             }
+            try requireGeneration(generation)
             refreshTask = nil
         }
+        try requireGeneration(generation)
         current.pendingRefreshRequestID = nil
-        try KeychainStore.save(current)
+        try persistence.save(current)
         credential = current
         return current.accessToken
     }

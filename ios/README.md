@@ -7,16 +7,17 @@ account, queue, or integrity code.
 
 ## Before generating Xcode project
 
-1. Install full Xcode (Command Line Tools alone cannot build iOS targets).
+1. Install full Xcode 26 or later (Command Line Tools alone cannot build iOS targets).
 2. Install XcodeGen, then run `xcodegen generate` inside `ios/`.
 3. Replace both bundle IDs and the App Group in `project.yml` / entitlements
    with identifiers registered to the Apple Developer team.
 4. Set `DEVELOPMENT_TEAM`, choose signing, and replace
-   `PhotoCloudAPIBaseURL` with the HTTPS hostname configured in Cloudflare.
+   `PHOTO_CLOUD_API_BASE_URL` with the HTTPS origin configured in Cloudflare.
+   Set `PHOTO_CLOUD_PRIVACY_POLICY_URL` and `PHOTO_CLOUD_SUPPORT_URL` to published HTTPS pages.
 5. Add the App Group capability to both targets in the Apple Developer portal.
 6. Run `make ios-parse` for a fast local syntax/configuration check, then use
    `make ios-test` from full Xcode for a real SDK/package build and XCTest on
-   an iPhone 16 simulator. This command does not sign, archive, upload, or
+   an available iPhone simulator. This command does not sign, archive, upload, or
    require paid Apple Developer membership.
 
 The Share Extension appears in Photos' system Share Sheet because it declares
@@ -77,3 +78,10 @@ an excuse to log bearer tokens, filenames, EXIF/GPS, or media bytes.
 The generated project still requires a physical-device acceptance test for
 Share Sheet import, background URLSession wakeup, app termination, airplane
 mode, Wi-Fi/cellular switches, and an integrity mismatch response.
+
+The Uploads tab also offers the system Photos picker. Both import paths queue
+selected files without claiming a complete Photos-library backup. Help & privacy
+explains queueing, server verification, and the original-file metadata model.
+
+For the submission gaps and actual archive check, read
+[`2026-09-07-app-store-readiness.md`](../docs/audits/2026-09-07-app-store-readiness.md).
