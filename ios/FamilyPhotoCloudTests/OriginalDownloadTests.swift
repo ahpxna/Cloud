@@ -15,8 +15,9 @@ final class OriginalDownloadTests: XCTestCase {
             let range = try XCTUnwrap(request.value(forHTTPHeaderField: "Range"))
             XCTAssertEqual(request.value(forHTTPHeaderField: "If-Range"), "\"sha256-abc123\"")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token-\(log.count + 1)")
-            // The first attempt at the second segment loses the connection.
-            if log.record(range) == 3 {
+            // Request 2 is the first attempt at the second segment; it loses
+            // the connection and must be retried with the same range.
+            if log.record(range) == 2 {
                 throw URLError(.networkConnectionLost)
             }
             let bounds = range.dropFirst("bytes=".count).split(separator: "-").compactMap { Int($0) }
