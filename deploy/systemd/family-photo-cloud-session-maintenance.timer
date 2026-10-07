@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Family Photo Cloud session history pruning
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

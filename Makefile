@@ -10,6 +10,10 @@ help: ## Show available commands
 env: ## Create .env from the safe example when absent
 	@test -f .env || cp .env.example .env
 
+.PHONY: secrets
+secrets: env ## Generate missing/placeholder secrets in .env (never prints or rotates them)
+	bash scripts/generate-secrets.sh
+
 .PHONY: config
 config: env ## Validate the Compose model without starting containers
 	docker compose $(ALL_PROFILES) config --quiet
@@ -47,6 +51,24 @@ observability-up: env ## Start private metrics, Prometheus, Alertmanager, and Gr
 create-user: ## Create an invite-only family user in the running stack
 	@test -n "$(EMAIL)" || (echo "usage: make create-user EMAIL=name@example.com [ROLE=member]"; exit 1)
 	docker compose --profile admin run --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
+
+.PHONY: list-users
+list-users: ## List accounts with state, MFA and active device count
+	docker compose --profile admin run --rm admin list-users
+
+ACCOUNT_ACTIONS := disable-user enable-user reset-password revoke-sessions reset-mfa
+.PHONY: account-actions $(ACCOUNT_ACTIONS)
+account-actions: ## make disable-user|enable-user|reset-password|revoke-sessions|reset-mfa EMAIL=...
+	@echo "usage: make <$(ACCOUNT_ACTIONS)> EMAIL=name@example.com (see docs/runbooks/account-lifecycle.md)"
+
+$(ACCOUNT_ACTIONS):
+	@test -n "$(EMAIL)" || (echo "usage: make $@ EMAIL=name@example.com"; exit 1)
+	docker compose --profile admin run --rm admin $@ -email "$(EMAIL)"
+
+.PHONY: delete-user
+delete-user: ## Start account deletion (see docs/runbooks/account-lifecycle.md)
+	@test -n "$(EMAIL)" || (echo "usage: make delete-user EMAIL=name@example.com CONFIRM=name@example.com"; exit 1)
+	docker compose --profile admin run --rm admin delete-user -email "$(EMAIL)" -confirm "$(CONFIRM)"
 
 .PHONY: scrub
 scrub: env ## Re-read and SHA-256 every committed original
@@ -111,8 +133,10 @@ install-systemd: ## Install backup/integrity timers on a Linux host
 	install -m 0644 deploy/systemd/family-photo-cloud-integrity.timer /etc/systemd/system/
 	install -m 0644 deploy/systemd/family-photo-cloud-backup.service /etc/systemd/system/
 	install -m 0644 deploy/systemd/family-photo-cloud-backup.timer /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-session-maintenance.service /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-session-maintenance.timer /etc/systemd/system/
 	systemctl daemon-reload
-	@echo "Review unit paths/environment, then enable explicitly: systemctl enable --now family-photo-cloud-{integrity,backup}.timer"
+	@echo "Review unit paths/environment, then enable explicitly: systemctl enable --now family-photo-cloud-{integrity,backup,session-maintenance}.timer"
 
 .PHONY: status
 status: ## Show local container state across all profiles

@@ -78,10 +78,15 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 
 func (r *PostgresRepository) SessionActive(ctx context.Context, userID, sessionID string) (bool, error) {
 	var active bool
+	// Account state is checked on every request so a disabled or deleting
+	// account loses access immediately, not when its access token expires.
 	err := r.pool.QueryRow(ctx, `SELECT EXISTS (
         SELECT 1
         FROM device_sessions AS device
+        JOIN users AS account ON account.id = device.user_id
         WHERE device.user_id = $2::uuid
+          AND account.state = 'active'
+          AND account.deleted_at IS NULL
           AND device.revoked_at IS NULL
           AND device.expires_at > now()
           AND (

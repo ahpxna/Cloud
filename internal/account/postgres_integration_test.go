@@ -32,7 +32,7 @@ func TestPostgresMFAAndDurableThrottleLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second) // the database compares against its own now()
 	identity := sha256.Sum256([]byte("login-identity"))
 	for attempt := 0; attempt < 5; attempt++ {
 		allowed, _, err := repository.RecordLoginAttempt(ctx, identity, now.Add(time.Duration(attempt)*time.Second), 10*time.Minute, 5)
@@ -181,7 +181,7 @@ func TestPostgresRefreshRotationRetryGraceIsBoundToRequestID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second) // the database compares against its own now()
 	oldHash := sha256.Sum256([]byte("refresh-old"))
 	newHash := sha256.Sum256([]byte("refresh-new"))
 	requestA := sha256.Sum256([]byte("rotation-request-a"))
@@ -200,7 +200,8 @@ func TestPostgresRefreshRotationRetryGraceIsBoundToRequestID(t *testing.T) {
 	}
 
 	retryCandidate := sha256.Sum256([]byte("ignored-retry-candidate"))
-	retried, err := repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestA, now.Add(30*24*time.Hour), []byte("ignored"), nonce, now.Add(5*time.Second))
+	// The app may only retry when it next wakes, hours after the lost response.
+	retried, err := repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestA, now.Add(30*24*time.Hour), []byte("ignored"), nonce, now.Add(6*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +218,7 @@ func TestPostgresRefreshRotationRetryGraceIsBoundToRequestID(t *testing.T) {
 
 	// Possession of the old token alone is not a grace-period bypass. A retry
 	// with a different request ID is a real replay and revokes the live family.
-	_, err = repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestB, now.Add(30*24*time.Hour), []byte("ignored"), nonce, now.Add(6*time.Second))
+	_, err = repository.RotateRefreshSession(ctx, oldHash, retryCandidate, requestB, now.Add(30*24*time.Hour), []byte("ignored"), nonce, now.Add(6*time.Hour+time.Second))
 	if !errors.Is(err, ErrRefreshReplay) {
 		t.Fatalf("mismatched retry request error=%v want %v", err, ErrRefreshReplay)
 	}
@@ -242,7 +243,7 @@ func TestPostgresRefreshRotationRetryGraceExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second) // the database compares against its own now()
 	oldHash := sha256.Sum256([]byte("refresh-expiry-old"))
 	newHash := sha256.Sum256([]byte("refresh-expiry-new"))
 	requestID := sha256.Sum256([]byte("rotation-request-expiry"))
@@ -286,7 +287,7 @@ func TestPostgresMFAChallengeIssuanceLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second) // the database compares against its own now()
 	for index := 0; index < mfaChallengeIssueLimit; index++ {
 		hash := sha256.Sum256([]byte{byte(index), 0x7f})
 		createdAt := now.Add(time.Duration(index) * time.Second)
@@ -311,7 +312,7 @@ func TestPostgresDeviceRevokeRevokesRefreshFamilyAfterRotation(t *testing.T) {
         RETURNING id::text`).Scan(&userID); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second) // the database compares against its own now()
 	parentHash := sha256.Sum256([]byte("device-family-parent"))
 	parentID, err := repository.CreateRefreshSession(ctx, userID, "Family iPhone", parentHash, now.Add(30*24*time.Hour), nil)
 	if err != nil {
