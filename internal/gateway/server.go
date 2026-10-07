@@ -101,7 +101,13 @@ func New(config Config) (*Server, error) {
 	store := filestore.New(processor.StagingDirectory())
 	store.DirModePerm = 0o700
 	store.FileModePerm = 0o600
+	// tusd's lock is the single per-upload mutex for PATCH, restart and expiry.
+	// A new request asks the current holder to release it, so a PATCH stranded
+	// by a phone changing networks is interrupted within about a second instead
+	// of pinning the upload until the HTTP read timeout.
 	locker := filelocker.New(processor.StagingDirectory())
+	locker.HolderPollInterval = time.Second
+	locker.AcquirerPollInterval = 250 * time.Millisecond
 	composer := tusd.NewStoreComposer()
 	store.UseIn(composer)
 	locker.UseIn(composer)
@@ -170,7 +176,9 @@ func New(config Config) (*Server, error) {
 		return nil, fmt.Errorf("create verifier identity: %w", err)
 	}
 	workerID = "gateway-" + workerID
-	resourceLocks := newResourceLocks()
+	lockUpload := func(ctx context.Context, id string) (func(), error) {
+		return lockTusResource(ctx, locker, id)
+	}
 	wake := func() {
 		for range config.VerificationJobs {
 			select {
@@ -240,8 +248,14 @@ func New(config Config) (*Server, error) {
 				return
 			}
 			for _, session := range expired {
-				unlock := resourceLocks.lock(session.ID)
-				err := processor.Expire(ctx, session)
+				unlock, err := lockUpload(ctx, session.ID)
+				if err != nil {
+					// Leave it for the next reconcile pass rather than stalling
+					// recovery, verification wake-ups and other expiries.
+					config.Logger.Warn("defer expiry of busy upload", "upload_id", session.ID, "error", err)
+					continue
+				}
+				err = processor.Expire(ctx, session)
 				unlock()
 				if err != nil && !errors.Is(err, upload.ErrInvalidState) {
 					config.Logger.Error("expire stale upload", "upload_id", session.ID, "error", err)
@@ -327,7 +341,10 @@ func New(config Config) (*Server, error) {
 	// than liveness and is the endpoint used by Compose.
 	mux.Handle("GET /healthz", readyHandler)
 	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, config.MaxActiveUploadSessions, config.UploadSessionCreateWindow, config.MaxUploadCreatesPerWindow, func(requestContext context.Context, id, ownerID string) (upload.Session, error) {
-		unlock := resourceLocks.lock(id)
+		unlock, err := lockUpload(requestContext, id)
+		if err != nil {
+			return upload.Session{}, err
+		}
 		defer unlock()
 		return processor.ResetForRetry(requestContext, id, ownerID)
 	})
@@ -359,61 +376,37 @@ func New(config Config) (*Server, error) {
 
 	strippedTus := http.StripPrefix(strings.TrimSuffix(tusBasePath, "/"), tusHandler)
 	limiter := newPatchLimiter(config.MaxConcurrentPatches, config.MaxPatchesPerUser)
-	protectedTus := lockPatches(resourceLocks, authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus))
+	protectedTus := authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus)
 	mux.Handle(strings.TrimSuffix(tusBasePath, "/"), protectedTus)
 	mux.Handle(tusBasePath, protectedTus)
 	server.handler = securityHeaders(mux)
 	return server, nil
 }
 
-type resourceLocks struct {
-	mu      sync.Mutex
-	entries map[string]*resourceLock
-}
-type resourceLock struct {
-	mu   sync.Mutex
-	refs int
-}
+// tusResourceLockTimeout bounds how long restart/expiry wait for an active
+// PATCH to honour tusd's release request.
+const tusResourceLockTimeout = 15 * time.Second
 
-func newResourceLocks() *resourceLocks {
-	return &resourceLocks{entries: make(map[string]*resourceLock)}
-}
-func (locks *resourceLocks) lock(id string) func() {
-	locks.mu.Lock()
-	entry := locks.entries[id]
-	if entry == nil {
-		entry = &resourceLock{}
-		locks.entries[id] = entry
+// lockTusResource takes the same lock tusd uses for an upload. Restart and
+// expiry hold it only briefly, so they ignore release requests; a PATCH that
+// arrives meanwhile waits for tusd's AcquireLockTimeout and then proceeds.
+func lockTusResource(ctx context.Context, locker filelocker.FileLocker, id string) (func(), error) {
+	if id == "" || strings.ContainsAny(id, `/\`) {
+		return nil, upload.ErrNotFound
 	}
-	entry.refs++
-	locks.mu.Unlock()
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		locks.mu.Lock()
-		entry.refs--
-		if entry.refs == 0 {
-			delete(locks.entries, id)
-		}
-		locks.mu.Unlock()
+	lock, err := locker.NewLock(id)
+	if err != nil {
+		return nil, err
 	}
-}
-
-func lockPatches(locks *resourceLocks, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch {
-			next.ServeHTTP(w, r)
-			return
+	lockContext, cancel := context.WithTimeout(ctx, tusResourceLockTimeout)
+	defer cancel()
+	if err := lock.Lock(lockContext, func() {}); err != nil {
+		if errors.Is(err, tusd.ErrLockTimeout) {
+			return nil, upload.ErrUploadBusy
 		}
-		id := strings.Trim(strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(tusBasePath, "/")), "/")
-		if id == "" || strings.Contains(id, "/") {
-			next.ServeHTTP(w, r)
-			return
-		}
-		unlock := locks.lock(id)
-		defer unlock()
-		next.ServeHTTP(w, r)
-	})
+		return nil, fmt.Errorf("lock upload resource: %w", err)
+	}
+	return func() { _ = lock.Unlock() }, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

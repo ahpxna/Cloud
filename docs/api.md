@@ -26,7 +26,7 @@ and a 30-day opaque refresh token. When confirmed MFA is enabled, a correct
 password returns `202` with a one-time 5-minute `challenge` and **no access or
 refresh token**. Complete `/v1/auth/mfa/verify` with either a current TOTP code
 or one unused recovery code before tokens are issued. Store the refresh token
-in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 30 seconds the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried; `REFRESH_RETRY_ENCRYPTION_KEY_BASE64` is a dedicated persistent 32-byte key so that retry capsule remains decryptable across a gateway crash/restart; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes the entire refresh-token family for that device and is idempotent.
+in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 7 days (a phone often retries only when the app next wakes) the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried and that successor is still live; `REFRESH_RETRY_ENCRYPTION_KEY_BASE64` is a dedicated persistent 32-byte key so that retry capsule remains decryptable across a gateway crash/restart; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes the entire refresh-token family for that device and is idempotent.
 
 
 ### MFA lifecycle
@@ -126,13 +126,16 @@ TUSKit persists its applied custom headers. Therefore it must persist this
 scoped upload capability, never the general 15-minute access token. If the app
 has lost its local TUS metadata while an incomplete server resource is still
 `uploading`, it calls `POST /v1/upload-sessions/{id}/restart` with its access
-token. The gateway rejects stale PATCH requests, removes only that incomplete
-staging resource, and returns the session in `created` state; the client starts
-the same idempotent upload from byte zero. A complete resource is never
-restartable.
+token. The gateway takes tusd's per-upload lock (interrupting a stalled PATCH
+for that upload), removes only the incomplete staging resource, and returns the
+session in `created` state; the client starts the same idempotent upload from
+byte zero. A complete resource is never restartable. `409 upload_busy` with
+`Retry-After` means another request still held the upload; retry shortly.
 
 On connection loss, keep the returned `Location`, issue authenticated `HEAD`,
-read `Upload-Offset`, and resume exactly there. Do not mark the local queue item
+read `Upload-Offset`, and resume exactly there. A new `HEAD` or `PATCH` for the
+same upload asks a stalled earlier PATCH to release its lock, so resuming after
+a network change takes about a second rather than waiting for a server timeout. Do not mark the local queue item
 complete after the last `204`: poll `GET /v1/upload-sessions/{id}` until it is
 `available`. `quarantined` means the origin's byte count or SHA-256 did not
 match and the client must not delete its source copy.

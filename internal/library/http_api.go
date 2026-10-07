@@ -20,11 +20,20 @@ import (
 const (
 	defaultPageSize = 50
 	maximumPageSize = 100
+
+	// Originals can be multi-gigabyte videos served over a home uplink, so the
+	// server-wide absolute HTTP_WRITE_TIMEOUT would cut them off. Downloads
+	// instead get an idle deadline that moves with progress, bounded by an
+	// overall ceiling so a trickling client cannot hold a connection forever.
+	originalWriteIdleTimeout = 2 * time.Minute
+	originalWriteMaxDuration = 12 * time.Hour
 )
 
 type API struct {
-	repository upload.AssetRepository
-	mediaRoot  string
+	repository       upload.AssetRepository
+	mediaRoot        string
+	writeIdleTimeout time.Duration
+	writeMaxDuration time.Duration
 }
 
 func NewAPI(repository upload.AssetRepository, mediaRoot string) (*API, error) {
@@ -35,7 +44,12 @@ func NewAPI(repository upload.AssetRepository, mediaRoot string) (*API, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve media root: %w", err)
 	}
-	return &API{repository: repository, mediaRoot: root}, nil
+	return &API{
+		repository:       repository,
+		mediaRoot:        root,
+		writeIdleTimeout: originalWriteIdleTimeout,
+		writeMaxDuration: originalWriteMaxDuration,
+	}, nil
 }
 
 type assetResponse struct {
@@ -153,7 +167,47 @@ func (api *API) original(w http.ResponseWriter, r *http.Request, principal auth.
 	w.Header().Set("Content-Disposition", "inline; filename=\"original\"")
 	w.Header().Set("ETag", `"sha256-`+hex.EncodeToString(asset.ContentSHA256[:])+`"`)
 	w.Header().Set("Cache-Control", "private, no-store")
-	http.ServeContent(w, r, "original", asset.CreatedAt, file)
+	http.ServeContent(api.progressDeadlineWriter(w, time.Now()), r, "original", asset.CreatedAt, file)
+}
+
+// progressDeadlineWriter extends the connection write deadline before every
+// write. Only the ResponseWriter methods are exposed, so io.Copy feeds it in
+// bounded buffers and each buffer renews the idle deadline.
+type progressDeadlineWriter struct {
+	http.ResponseWriter
+	controller *http.ResponseController
+	idle       time.Duration
+	ceiling    time.Time
+}
+
+func (api *API) progressDeadlineWriter(w http.ResponseWriter, start time.Time) *progressDeadlineWriter {
+	writer := &progressDeadlineWriter{
+		ResponseWriter: w,
+		controller:     http.NewResponseController(w),
+		idle:           api.writeIdleTimeout,
+		ceiling:        start.Add(api.writeMaxDuration),
+	}
+	writer.extend()
+	return writer
+}
+
+func (w *progressDeadlineWriter) extend() {
+	deadline := time.Now().Add(w.idle)
+	if deadline.After(w.ceiling) {
+		deadline = w.ceiling
+	}
+	// Unsupported writers (for example test recorders) keep the server default.
+	_ = w.controller.SetWriteDeadline(deadline)
+}
+
+func (w *progressDeadlineWriter) Write(p []byte) (int, error) {
+	w.extend()
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap lets http.ResponseController reach the underlying connection.
+func (w *progressDeadlineWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (api *API) originalPath(storageKey string) (string, error) {

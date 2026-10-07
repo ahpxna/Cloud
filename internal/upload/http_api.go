@@ -109,6 +109,11 @@ func (api *API) restartSession(w http.ResponseWriter, r *http.Request, principal
 		writeProblem(w, http.StatusConflict, "upload_resource_inconsistent", "server upload bytes and TUS metadata disagree; data was preserved for recovery")
 		return
 	}
+	if errors.Is(err, ErrUploadBusy) {
+		w.Header().Set("Retry-After", "5")
+		writeProblem(w, http.StatusConflict, "upload_busy", "another request is still writing this upload; retry shortly")
+		return
+	}
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "upload_restart_failed", "could not reset the server upload resource")
 		return

@@ -30,10 +30,13 @@ type CompletedTusUpload struct {
 	Offset int64
 }
 
+// tusFileInfo is the subset of tusd's sidecar the gateway trusts. tusd's
+// filestore writes the sidecar once at creation and never rewrites its Offset:
+// the durable offset is the payload file size, exactly as filestore.GetUpload
+// derives it. The sidecar Offset field is therefore deliberately not read.
 type tusFileInfo struct {
-	ID     string `json:"ID"`
-	Size   int64  `json:"Size"`
-	Offset int64  `json:"Offset"`
+	ID   string `json:"ID"`
+	Size int64  `json:"Size"`
 }
 
 // TusResourceState is derived only from tusd's durable payload and sidecar.
@@ -106,16 +109,12 @@ func (p *Processor) InspectTusResource(id string, expectedSize int64) (TusResour
 	if err := json.Unmarshal(contents, &info); err != nil {
 		return TusResourceInspection{State: TusInconsistent}, nil
 	}
-	inspection := TusResourceInspection{Offset: info.Offset, Size: info.Size}
-	if info.ID != id || info.Size != expectedSize || info.Size < 0 || info.Offset < 0 || info.Offset > info.Size {
+	inspection := TusResourceInspection{Offset: payloadStat.Size(), Size: info.Size}
+	if info.ID != id || info.Size != expectedSize || info.Size < 0 || inspection.Offset > info.Size {
 		inspection.State = TusInconsistent
 		return inspection, nil
 	}
-	if payloadStat.Size() != info.Offset {
-		inspection.State = TusInconsistent
-		return inspection, nil
-	}
-	if info.Offset == info.Size {
+	if inspection.Offset == info.Size {
 		inspection.State = TusComplete
 		return inspection, nil
 	}
@@ -143,7 +142,7 @@ func (p *Processor) CompletedTusUploads() ([]CompletedTusUpload, error) {
 			p.quarantineBadSidecar(entry.Name())
 			continue
 		}
-		if !safeID.MatchString(info.ID) || info.ID+".info" != entry.Name() || info.Size < 0 || info.Offset != info.Size {
+		if !safeID.MatchString(info.ID) || info.ID+".info" != entry.Name() || info.Size <= 0 {
 			continue
 		}
 		stat, err := os.Stat(filepath.Join(p.StagingDirectory(), info.ID))
@@ -153,10 +152,10 @@ func (p *Processor) CompletedTusUploads() ([]CompletedTusUpload, error) {
 			}
 			return nil, fmt.Errorf("stat completed tus object %q: %w", info.ID, err)
 		}
-		if stat.Size() != info.Size {
+		if !stat.Mode().IsRegular() || stat.Size() != info.Size {
 			continue
 		}
-		completed = append(completed, CompletedTusUpload{ID: info.ID, Offset: info.Offset})
+		completed = append(completed, CompletedTusUpload{ID: info.ID, Offset: stat.Size()})
 	}
 	return completed, nil
 }
@@ -302,19 +301,6 @@ func finalStorageKey(session Session) string {
 	// contain a client-supplied extension. Database uniqueness is per owner and
 	// digest, so extension-based paths would otherwise create orphan duplicates.
 	return filepath.ToSlash(filepath.Join("originals", session.OwnerID, hash[:2], hash))
-}
-
-func safeExtension(filename string) string {
-	extension := strings.ToLower(filepath.Ext(filename))
-	if len(extension) < 2 || len(extension) > 11 {
-		return ""
-	}
-	for _, character := range extension[1:] {
-		if (character < 'a' || character > 'z') && (character < '0' || character > '9') {
-			return ""
-		}
-	}
-	return extension
 }
 
 // Expire deletes only a durably incomplete TUS resource. A complete final

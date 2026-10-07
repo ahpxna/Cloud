@@ -296,14 +296,81 @@ struct PhotoCloudAPI: Sendable {
         )
     }
 
-    func downloadOriginal(_ asset: LibraryAsset, accessToken: String) async throws -> URL {
-        var request = URLRequest(url: try absoluteURL(for: asset.originalURL))
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (temporaryURL, response) = try await session.download(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+    /// Downloads an original in bounded HTTP Range segments. A dropped
+    /// connection costs at most one segment instead of restarting a
+    /// multi-gigabyte video from byte zero, and each segment asks for a current
+    /// access token so a long download outlives the 15-minute token lifetime.
+    func downloadOriginal(
+        _ asset: LibraryAsset,
+        accessToken: @Sendable () async throws -> String,
+        segmentBytes: Int64 = 32 << 20,
+        maxAttemptsPerSegment: Int = 4,
+        retryDelay: Duration = .seconds(1)
+    ) async throws -> URL {
+        guard asset.byteSize > 0, segmentBytes > 0, maxAttemptsPerSegment > 0 else {
             throw URLError(.badServerResponse)
         }
-        return temporaryURL
+        let url = try absoluteURL(for: asset.originalURL)
+        let destination = FileManager.default.temporaryDirectory
+            .appending(path: "original-\(UUID().uuidString)", directoryHint: .notDirectory)
+        guard FileManager.default.createFile(atPath: destination.path(), contents: nil) else {
+            throw URLError(.cannotCreateFile)
+        }
+        var finished = false
+        defer { if !finished { try? FileManager.default.removeItem(at: destination) } }
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+
+        var offset: Int64 = 0
+        var failures = 0
+        while offset < asset.byteSize {
+            try Task.checkCancellation()
+            let end = min(offset + segmentBytes, asset.byteSize) - 1
+            let token = try await accessToken()
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
+            // Originals are immutable. If-Range makes the server answer 200
+            // instead of splicing bytes from a different representation.
+            request.setValue("\"sha256-\(asset.contentSHA256.lowercased())\"", forHTTPHeaderField: "If-Range")
+            do {
+                let (partURL, response) = try await session.download(for: request)
+                defer { try? FileManager.default.removeItem(at: partURL) }
+                guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                let expected: Int64
+                switch http.statusCode {
+                case 206:
+                    expected = end - offset + 1
+                case 200 where offset == 0:
+                    expected = asset.byteSize
+                default:
+                    throw APIProblem(status: http.statusCode, code: "original_download_failed", detail: "The original could not be downloaded.")
+                }
+                let part = try Data(contentsOf: partURL, options: .alwaysMapped)
+                guard Int64(part.count) == expected else { throw URLError(.networkConnectionLost) }
+                try output.write(contentsOf: part)
+                offset += expected
+                failures = 0
+            } catch let error as URLError where Self.isTransientDownloadError(error) {
+                failures += 1
+                guard failures < maxAttemptsPerSegment else { throw error }
+                try await Task.sleep(for: retryDelay * failures)
+            }
+        }
+        try output.synchronize()
+        finished = true
+        return destination
+    }
+
+    static func isTransientDownloadError(_ error: URLError) -> Bool {
+        switch error.code {
+        case .networkConnectionLost, .timedOut, .notConnectedToInternet, .cannotConnectToHost,
+             .cannotFindHost, .dnsLookupFailed, .dataNotAllowed, .internationalRoamingOff,
+             .callIsActive, .backgroundSessionWasDisconnected:
+            return true
+        default:
+            return false
+        }
     }
 
     static func configuredBaseURL(_ raw: String) throws -> URL {

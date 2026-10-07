@@ -5,8 +5,10 @@ import "testing"
 func TestPatchLimiterEnforcesGlobalAndPerUserLimits(t *testing.T) {
 	t.Parallel()
 	limiter := newPatchLimiter(3, 2)
-	if !limiter.Acquire("user-a") || !limiter.Acquire("user-a") {
-		t.Fatal("user-a should receive two slots")
+	for slot := 1; slot <= 2; slot++ {
+		if !limiter.Acquire("user-a") {
+			t.Fatalf("user-a should receive slot %d", slot)
+		}
 	}
 	if limiter.Acquire("user-a") {
 		t.Fatal("user-a exceeded per-user limit")

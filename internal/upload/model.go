@@ -35,6 +35,7 @@ var (
 	ErrSessionLimit               = errors.New("too many active upload sessions")
 	ErrCreateRateLimit            = errors.New("upload session creation rate limited")
 	ErrUploadResourceInconsistent = errors.New("upload resource metadata is inconsistent")
+	ErrUploadBusy                 = errors.New("upload resource is busy")
 )
 
 type Session struct {
