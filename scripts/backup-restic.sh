@@ -69,7 +69,7 @@ chmod 600 "$dump"
   printf 'audit_root=%s\n' "$audit_root"
 	printf 'manifest_public_keyring=%s\n' "$manifest_keyring_root"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
-  printf 'postgres_image=%s\n' "${POSTGRES_IMAGE:-postgres:18.4-alpine}"
+  printf 'postgres_image=%s\n' "${POSTGRES_IMAGE:-postgres:18.6-alpine}"
 } > "$metadata"
 chmod 600 "$metadata"
 

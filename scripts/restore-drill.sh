@@ -33,7 +33,7 @@ dump="${dumps[0]}"
 
 container="family-photo-cloud-restore-drill-${RANDOM}-${RANDOM}"
 password="restore-drill-${RANDOM}-${RANDOM}-${RANDOM}"
-image="${POSTGRES_IMAGE:-postgres:18.4-alpine}"
+image="${POSTGRES_IMAGE:-postgres:18.6-alpine}"
 cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 

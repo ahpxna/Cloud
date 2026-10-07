@@ -25,7 +25,7 @@ volumes:
 
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
       POSTGRES_USER: ${POSTGRES_USER:-photo_cloud}
@@ -46,7 +46,7 @@ services:
   # Runtime roles are separate from the bootstrap superuser. This runs on every
   # deployment so existing volumes are upgraded without docker-entrypoint hooks.
   db-role-bootstrap:
-    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine}
     command: ["/bin/sh", "/opt/photo-cloud/bootstrap-db-roles.sh", "bootstrap"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
@@ -102,7 +102,7 @@ services:
     cap_drop: ["ALL"]
 
   db-runtime-grants:
-    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine}
     command: ["/bin/sh", "/opt/photo-cloud/bootstrap-db-roles.sh", "finalize"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
@@ -410,7 +410,7 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.4}
     profiles: ["observability"]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -435,7 +435,7 @@ services:
     restart: unless-stopped
 
   alertmanager:
-    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
     profiles: ["observability"]
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
@@ -455,13 +455,21 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: ${GRAFANA_IMAGE:-grafana/grafana:12.1.0}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.4.12}
     profiles: ["observability"]
     environment:
       GF_SERVER_HTTP_ADDR: 0.0.0.0
       GF_SERVER_HTTP_PORT: "3000"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # The observability network has no Internet egress by design; stop
+      # Grafana phoning home (and logging the failures) for updates/telemetry.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin-password
     ports:
       - "127.0.0.1:${GRAFANA_DEV_PORT:-3000}:3000"
@@ -511,7 +519,7 @@ services:
     cap_drop: ["ALL"]
 
   cloudflared:
-    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.7.2}
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.9.3}
     profiles: ["edge"]
     command: ["tunnel", "--no-autoupdate", "run"]
     environment:
@@ -531,7 +539,7 @@ services:
   # Loopback binding prevents accidental Internet exposure while the gateway
   # contract is implemented.
   tusd-lab:
-    image: ${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.0}
+    image: ${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.1}
     profiles: ["protocol-lab"]
     command:
       - -upload-dir=/srv/tus

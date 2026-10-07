@@ -17,10 +17,10 @@ check() {
     failed=1
   fi
 }
-check POSTGRES_IMAGE "${POSTGRES_IMAGE:-postgres:18.4-alpine}"
-check TUSD_IMAGE "${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.0}"
-check CLOUDFLARED_IMAGE "${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.7.2}"
-check PROMETHEUS_IMAGE "${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}"
-check ALERTMANAGER_IMAGE "${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}"
-check GRAFANA_IMAGE "${GRAFANA_IMAGE:-grafana/grafana:12.1.0}"
+check POSTGRES_IMAGE "${POSTGRES_IMAGE:-postgres:18.6-alpine}"
+check TUSD_IMAGE "${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.1}"
+check CLOUDFLARED_IMAGE "${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.9.3}"
+check PROMETHEUS_IMAGE "${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.4}"
+check ALERTMANAGER_IMAGE "${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}"
+check GRAFANA_IMAGE "${GRAFANA_IMAGE:-grafana/grafana:12.4.12}"
 exit "$failed"
