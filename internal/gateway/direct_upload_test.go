@@ -325,3 +325,32 @@ func TestThumbnailAndOriginalTicketsAreNotInterchangeable(t *testing.T) {
 		t.Fatalf("view ticket stored a thumbnail: %d", ticketPut.StatusCode)
 	}
 }
+
+// Parents' Shortcuts may use the web app address for uploads too.
+func TestShortcutCanPostToTheWebAppAddress(t *testing.T) {
+	fixture := newDirectFixture(t)
+	content := []byte("photo sent to /app/#uploads")
+	hash := sha256.Sum256(content)
+	response := fixture.request(http.MethodPost, "/app/#uploads", testUploadKey, bytes.NewReader(content), map[string]string{
+		"X-Content-SHA256": hex.EncodeToString(hash[:]), "X-File-Name": "IMG_2000.JPG",
+	})
+	var created directUploadResponse
+	_ = json.NewDecoder(response.Body).Decode(&created)
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || created.ID == "" {
+		t.Fatalf("POST /app/ = %d %#v", response.StatusCode, created)
+	}
+	fixture.waitForState(created.ID, upload.StateAvailable)
+
+	unauthenticated := fixture.request(http.MethodPost, "/app/", "", bytes.NewReader(content), nil)
+	unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated POST /app/ = %d", unauthenticated.StatusCode)
+	}
+	page := fixture.request(http.MethodGet, "/app/", "", nil, nil)
+	body, _ := io.ReadAll(page.Body)
+	page.Body.Close()
+	if page.StatusCode != http.StatusOK || !strings.Contains(string(body), "<!doctype html>") {
+		t.Fatalf("GET /app/ = %d", page.StatusCode)
+	}
+}

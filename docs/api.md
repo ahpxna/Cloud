@@ -180,7 +180,9 @@ timestamps. The web app's *Tải lên* page polls it.
 
 ## Single-request uploads (iOS Shortcut and web app)
 
-`POST /v1/direct-uploads` takes the whole file as the request body:
+`POST /v1/direct-uploads` takes the whole file as the request body. `POST /app/`
+is an alias, so a Shortcut can use the same address the family opens to watch
+progress (`https://<host>/app/#uploads`; the fragment is never sent):
 
 | Header | Value |
 | --- | --- |

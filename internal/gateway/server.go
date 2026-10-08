@@ -388,7 +388,7 @@ func New(config Config) (*Server, error) {
 	if uploadKeys == nil {
 		uploadKeys, _ = config.Accounts.(UploadKeyVerifier)
 	}
-	mux.Handle(directUploadPath, &directUploader{
+	directUploads := &directUploader{
 		repository:          config.Repository,
 		processor:           processor,
 		store:               store,
@@ -406,15 +406,32 @@ func New(config Config) (*Server, error) {
 		wake:                wake,
 		logger:              config.Logger,
 		readIdleTimeout:     2 * time.Minute,
-	})
+	}
+	mux.Handle(directUploadPath, directUploads)
 	protectedTus := authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus)
 	mux.Handle(strings.TrimSuffix(tusBasePath, "/"), protectedTus)
 	mux.Handle(tusBasePath, protectedTus)
-	mux.Handle(webapp.BasePath, webapp.Handler())
-	mux.Handle(strings.TrimSuffix(webapp.BasePath, "/"), webapp.Handler())
+	// The family uses one address for everything: opening /app/#uploads shows
+	// progress, and a Shortcut POSTing a photo to that same address uploads it.
+	// The fragment never reaches the server, so the POST arrives at /app/.
+	webApp := uploadOrWebApp(directUploads, webapp.Handler())
+	mux.Handle(webapp.BasePath, webApp)
+	mux.Handle(strings.TrimSuffix(webapp.BasePath, "/"), webApp)
 	mux.Handle("/", webapp.RedirectRoot())
 	server.handler = securityHeaders(redirectPlainHTTP(config.CanonicalHost, mux))
 	return server, nil
+}
+
+// uploadOrWebApp routes POST /app/ to the single-request upload handler and
+// everything else to the web app.
+func uploadOrWebApp(uploads, app http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && (r.URL.Path == webapp.BasePath || r.URL.Path == strings.TrimSuffix(webapp.BasePath, "/")) {
+			uploads.ServeHTTP(w, r)
+			return
+		}
+		app.ServeHTTP(w, r)
+	})
 }
 
 // tusResourceLockTimeout bounds how long restart/expiry wait for an active

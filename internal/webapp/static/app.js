@@ -906,7 +906,9 @@ async function createKey() {
     if (!response.ok) throw new Error(await problemText(response));
     const body = await response.json();
     $("new-key-value").textContent = body.upload_key;
-    $("upload-url").textContent = location.origin + "/v1/direct-uploads";
+    // One address for everything: POSTing a photo uploads it, opening it
+    // shows progress.
+    $("upload-url").textContent = location.origin + "/app/#uploads";
     for (const link of document.querySelectorAll(".app-url")) {
       link.textContent = location.origin + "/app/#" + link.dataset.hash;
     }
