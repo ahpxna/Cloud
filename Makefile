@@ -98,7 +98,7 @@ delete-user: ## Start account deletion (see docs/runbooks/account-lifecycle.md)
 
 .PHONY: scrub
 scrub: env ## Re-read and SHA-256 every committed original
-	docker compose --profile integrity run --rm scrub $(SCRUB_ARGS)
+	docker compose --profile integrity run --build --rm scrub $(SCRUB_ARGS)
 
 .PHONY: integrity-cycle
 integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
@@ -107,12 +107,12 @@ integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
 .PHONY: manifest-verify
 manifest-verify: env ## Verify one signed manifest with the public trust key
 	@test -n "$(MANIFEST_FILE)" || (echo "usage: make manifest-verify MANIFEST_FILE=manifest-...json [MANIFEST_ARGS=...]"; exit 1)
-	docker compose --profile integrity run --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
+	docker compose --profile integrity run --build --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
 
 .PHONY: manifest-reconcile
 manifest-reconcile: env ## Repair a verified manifest file -> DB linkage crash window
 	@test -n "$(MANIFEST_FILE)" -a -n "$(OBJECT_KEY)" || (echo "usage: make manifest-reconcile MANIFEST_FILE=manifest-...json OBJECT_KEY=manifests/manifest-...json"; exit 1)
-	docker compose --profile integrity run --rm manifest-verify -mode reconcile -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "$(OBJECT_KEY)"
+	docker compose --profile integrity run --build --rm manifest-verify -mode reconcile -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "$(OBJECT_KEY)"
 
 .PHONY: session-maintenance
 session-maintenance: env ## Prune expired/revoked refresh generations past retention
