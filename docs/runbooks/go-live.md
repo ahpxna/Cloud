@@ -54,9 +54,14 @@ kept outside Git. Details live in the linked runbooks.
 
 ## 6. Public ingress ([cloudflare-mvp](cloudflare-mvp.md), `infra/cloudflare`)
 
-- [ ] Domain on Cloudflare DNS; named Tunnel whose public hostname targets
+- [ ] A domain you control, added to Cloudflare (a `*.workers.dev` or
+      `*.trycloudflare.com` name cannot carry a stable named Tunnel; quick
+      tunnels change URL on every restart, which breaks the app).
+- [ ] Named Tunnel whose public hostname targets
       `http://upload-gateway:8080`; token in `CLOUDFLARE_TUNNEL_TOKEN`.
-- [ ] `terraform plan` reviewed and `terraform apply` done for the WAF and
+- [ ] From any machine with Internet access (not necessarily the server), with a
+      Cloudflare API token scoped to Zone WAF edit: `terraform plan` reviewed
+      and `terraform apply` done in `infra/cloudflare` for the WAF and
       rate-limit rules (import existing rulesets first).
 - [ ] `make edge-up`; `make synthetic-probe BASE_URL=https://<hostname> …`
       passes through Cloudflare.
@@ -70,12 +75,20 @@ kept outside Git. Details live in the linked runbooks.
       picker, airplane-mode interruption, force-quit and relaunch,
       Wi-Fi↔cellular change mid-upload, item reaches *Available*, original
       downloads and its SHA-256 matches. Record iOS version and results.
-- [ ] Family distribution: TestFlight (internal testers) or App Store. For the
-      App Store also publish `docs/legal/privacy-policy.md` and
-      `docs/legal/support.md` with the placeholders filled, set
-      `PHOTO_CLOUD_PRIVACY_POLICY_URL`/`PHOTO_CLOUD_SUPPORT_URL`, complete the
-      privacy labels from the policy, and give App Review a demo account.
-- [ ] Archive passes `python3 scripts/ios-release-check.py <App.app>`.
+- [ ] Family distribution, one of:
+      - **Free (no Apple Developer Program):** sign with your Apple ID's
+        *Personal Team* in Xcode and install over a cable onto each phone. The
+        build stops launching after 7 days and must be reinstalled, every phone
+        must be plugged into your Mac, and full Xcode needs tens of GB free.
+        TestFlight is **not** available on this path. No privacy/support pages
+        are required.
+      - **TestFlight / App Store (Apple Developer Program, paid yearly):**
+        publish `docs/legal/privacy-policy.md` and `docs/legal/support.md` with
+        the placeholders filled (any HTTPS page works, including a
+        `*.workers.dev` site), set `PHOTO_CLOUD_PRIVACY_POLICY_URL` and
+        `PHOTO_CLOUD_SUPPORT_URL`, complete the privacy labels, give App Review
+        a demo account, and check the archive with
+        `python3 scripts/ios-release-check.py <App.app>`.
 
 ## 8. Family onboarding ([account-lifecycle](account-lifecycle.md))
 
