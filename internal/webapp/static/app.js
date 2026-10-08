@@ -134,6 +134,7 @@ function handleError(error, target) {
 const views = ["login", "library", "uploads", "settings"];
 let activeTab = null;
 let uploadsTimer = null;
+let lastAutoRefresh = 0;
 
 function showView(name) {
   for (const view of views) $("view-" + view).hidden = view !== name;
@@ -163,18 +164,34 @@ function openTab(name) {
   closeViewer();
   showView(name);
   clearInterval(uploadsTimer);
-  // Photos arrive from the Shortcut at any time; reopening the tab shows them.
-  if (name === "library") library.reload();
+  // Photos arrive from the Shortcut at any time; every tab switch reloads.
+  lastAutoRefresh = Date.now();
+  loadTabData(name);
   if (name === "uploads") {
-    refreshServerUploads();
     uploadsTimer = setInterval(() => {
       if (!document.hidden) refreshServerUploads();
     }, 5000);
   }
+}
+
+function loadTabData(name, { keepOpenWork = false } = {}) {
+  if (name === "library") library.reload();
+  if (name === "uploads") refreshServerUploads();
   if (name === "settings") {
     refreshKeys();
-    refreshMFA();
+    // Don't wipe an MFA setup or recovery codes the person may be copying
+    // into another app when they come back.
+    if (!keepOpenWork || ($("mfa-setup").hidden && $("mfa-codes").hidden)) refreshMFA();
   }
+}
+
+// Coming back to the page (from the Shortcut, Photos or another app, or when
+// a Shortcut opens the same address) refreshes what is on screen.
+function refreshActiveTab() {
+  if (!activeTab || !currentCredential() || Date.now() - lastAutoRefresh < 1500) return;
+  if (activeTab === "library" && !$("viewer").hidden) return;
+  lastAutoRefresh = Date.now();
+  loadTabData(activeTab, { keepOpenWork: true });
 }
 
 // ---------------------------------------------------------------- sign in
@@ -283,11 +300,6 @@ const library = {
   reload() {
     this.reset();
     this.loadMore();
-  },
-
-  ensureFresh() {
-    // View tickets expire after 10 minutes; reload stale pages.
-    if (!this.loadedAt || Date.now() - this.loadedAt > TICKET_MAX_AGE_MS) this.reload();
   },
 
   async loadMore() {
@@ -645,6 +657,10 @@ async function refreshServerUploads() {
       ).item;
     });
     $("server-uploads").replaceChildren(...rows);
+    const known = new Set(body.uploads.map((upload) => upload.id));
+    for (const local of $("local-uploads").querySelectorAll("li[data-session-id]")) {
+      if (known.has(local.dataset.sessionId)) local.remove();
+    }
     if (!rows.length) {
       const empty = document.createElement("li");
       empty.className = "muted";
@@ -676,11 +692,12 @@ async function uploadFiles(files) {
         row.state.textContent = "Đang chờ máy chủ…";
         await sleep((result.retryAfter || 5) * 1000);
       }
-      if (result.status === 200) {
-        row.state.textContent = "Đã có sẵn ✓";
-        row.state.className = "state ok";
-      } else if (result.status === 202) {
-        row.state.textContent = "Đã gửi, đang kiểm tra";
+      if (result.status === 200 || result.status === 202) {
+        // From here the server's own row under "Gần đây" tracks this file
+        // (checking → Đã sao lưu ✓); the local row is removed once it appears.
+        row.item.dataset.sessionId = result.id;
+        row.state.textContent = result.status === 200 ? "Đã có sẵn ✓" : "Đã gửi, đang kiểm tra";
+        if (result.status === 200) row.state.className = "state ok";
       } else {
         throw new Error(result.detail || "Lỗi " + result.status);
       }
@@ -714,8 +731,11 @@ function sendFile(file, digest, onProgress) {
         });
         request.addEventListener("load", () => {
           let detail = "";
+          let id = "";
           try {
-            detail = JSON.parse(request.responseText).detail || "";
+            const body = JSON.parse(request.responseText);
+            detail = body.detail || "";
+            id = body.id || "";
           } catch {
             // not JSON
           }
@@ -726,6 +746,7 @@ function sendFile(file, digest, onProgress) {
           }
           resolve({
             status: request.status,
+            id,
             detail,
             retryAfter: Number(request.getResponseHeader("Retry-After")) || 0,
           });
@@ -1095,7 +1116,11 @@ document.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("online", () => ($("offline").hidden = true));
   window.addEventListener("offline", () => ($("offline").hidden = false));
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && activeTab === "library") library.ensureFresh();
+    if (!document.hidden) refreshActiveTab();
+  });
+  window.addEventListener("focus", refreshActiveTab);
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) refreshActiveTab();
   });
   $("offline").hidden = navigator.onLine;
   openTab(location.hash.slice(1) || "library");
