@@ -170,22 +170,39 @@ func (m *AccessTokenManager) VerifyUpload(raw string) (Principal, error) {
 	return Principal{UserID: claims.UserID, SessionID: claims.SessionID, UploadID: claims.UploadID}, nil
 }
 
+// View ticket kinds: a ticket for one never opens the other.
+const (
+	ViewOriginal  = "original"
+	ViewThumbnail = "thumbnail"
+)
+
 type ViewClaims struct {
 	UserID    string `json:"uid"`
 	SessionID string `json:"sid"`
 	AssetID   string `json:"aid"`
+	Kind      string `json:"knd"`
 	jwt.RegisteredClaims
 }
 
-func (m *AccessTokenManager) IssueView(principal Principal, assetID string, now time.Time, ttl time.Duration) (string, error) {
+func (m *AccessTokenManager) IssueView(principal Principal, assetID, kind string, now time.Time, ttl time.Duration) (string, error) {
 	if principal.UserID == "" || principal.SessionID == "" || assetID == "" {
 		return "", errors.New("user, session, and asset IDs are required")
 	}
-	if ttl <= 0 || ttl > 30*time.Minute {
-		return "", errors.New("view-ticket TTL must be between zero and 30 minutes")
+	// Original tickets are short-lived. Thumbnail tickets may live a few hours
+	// so they can be issued per hour and cached by the browser.
+	maxTTL := 30 * time.Minute
+	switch kind {
+	case ViewOriginal:
+	case ViewThumbnail:
+		maxTTL = 3 * time.Hour
+	default:
+		return "", errors.New("unknown view-ticket kind")
+	}
+	if ttl <= 0 || ttl > maxTTL {
+		return "", errors.New("view-ticket TTL exceeds the limit for its kind")
 	}
 	claims := ViewClaims{
-		UserID: principal.UserID, SessionID: principal.SessionID, AssetID: assetID,
+		UserID: principal.UserID, SessionID: principal.SessionID, AssetID: assetID, Kind: kind,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    m.issuer,
 			Subject:   principal.UserID,
@@ -198,8 +215,8 @@ func (m *AccessTokenManager) IssueView(principal Principal, assetID string, now 
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.key)
 }
 
-// VerifyView accepts a view ticket only for the asset it was issued for.
-func (m *AccessTokenManager) VerifyView(raw, assetID string) (Principal, error) {
+// VerifyView accepts a view ticket only for the asset and kind it was issued for.
+func (m *AccessTokenManager) VerifyView(raw, assetID, kind string) (Principal, error) {
 	claims := new(ViewClaims)
 	token, err := jwt.ParseWithClaims(
 		raw,
@@ -220,7 +237,8 @@ func (m *AccessTokenManager) VerifyView(raw, assetID string) (Principal, error) 
 	if err != nil || !token.Valid {
 		return Principal{}, errors.New("invalid view ticket")
 	}
-	if claims.UserID == "" || claims.SessionID == "" || claims.Subject != claims.UserID || claims.AssetID == "" || claims.AssetID != assetID {
+	if claims.UserID == "" || claims.SessionID == "" || claims.Subject != claims.UserID || claims.AssetID == "" ||
+		claims.AssetID != assetID || claims.Kind == "" || claims.Kind != kind {
 		return Principal{}, errors.New("invalid view-ticket scope")
 	}
 	return Principal{UserID: claims.UserID, SessionID: claims.SessionID}, nil

@@ -185,6 +185,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.refresh(w, r)
 	case r.URL.Path == "/v1/auth/logout" && r.Method == http.MethodPost:
 		api.logout(w, r)
+	case r.URL.Path == "/v1/auth/mfa" && r.Method == http.MethodGet:
+		api.mfaStatus(w, r)
 	case r.URL.Path == "/v1/auth/mfa/enroll" && r.Method == http.MethodPost:
 		api.mfaEnroll(w, r)
 	case r.URL.Path == "/v1/auth/mfa/confirm" && r.Method == http.MethodPost:

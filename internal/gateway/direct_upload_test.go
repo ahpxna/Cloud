@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"image"
+	"image/jpeg"
 	"io"
 	"log/slog"
 	"net/http"
@@ -263,5 +265,63 @@ func TestDirectUploadSniffsExtensionlessShortcutFiles(t *testing.T) {
 		if session.OriginalFilename != testCase.wantName || session.MediaType != testCase.wantMediaType {
 			t.Fatalf("%s: stored as %q %q", testCase.name, session.OriginalFilename, session.MediaType)
 		}
+	}
+}
+
+func TestThumbnailAndOriginalTicketsAreNotInterchangeable(t *testing.T) {
+	fixture := newDirectFixture(t)
+	_, created := fixture.directUpload(testUploadKey, []byte("original bytes"), map[string]string{"X-File-Name": "a.heic"})
+	session := fixture.waitForState(created.ID, upload.StateAvailable)
+	assetID := session.AssetID
+
+	canvas := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	var thumbnail bytes.Buffer
+	if err := jpeg.Encode(&thumbnail, canvas, nil); err != nil {
+		t.Fatal(err)
+	}
+	put := fixture.request(http.MethodPut, "/v1/assets/"+assetID+"/thumbnail", fixture.token(userA), bytes.NewReader(thumbnail.Bytes()), map[string]string{"Content-Type": "image/jpeg"})
+	put.Body.Close()
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("thumbnail upload status = %d", put.StatusCode)
+	}
+	keyPut := fixture.request(http.MethodPut, "/v1/assets/"+assetID+"/thumbnail", testUploadKey, bytes.NewReader(thumbnail.Bytes()), map[string]string{"Content-Type": "image/jpeg"})
+	keyPut.Body.Close()
+	if keyPut.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("upload key stored a thumbnail: %d", keyPut.StatusCode)
+	}
+
+	list := fixture.request(http.MethodGet, "/v1/assets?tickets=1", fixture.token(userA), nil, nil)
+	defer list.Body.Close()
+	var library struct {
+		Assets []struct {
+			ViewURL      string `json:"view_url"`
+			ThumbnailURL string `json:"thumbnail_url"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&library); err != nil || len(library.Assets) != 1 || library.Assets[0].ThumbnailURL == "" {
+		t.Fatalf("library = %#v err=%v", library, err)
+	}
+	thumbnailURL, viewURL := library.Assets[0].ThumbnailURL, library.Assets[0].ViewURL
+	thumbnailTicket := thumbnailURL[strings.Index(thumbnailURL, "?"):]
+	originalTicket := viewURL[strings.Index(viewURL, "?"):]
+	for _, testCase := range []struct {
+		path string
+		want int
+	}{
+		{thumbnailURL, http.StatusOK},
+		{viewURL, http.StatusOK},
+		{"/v1/assets/" + assetID + "/original" + thumbnailTicket, http.StatusUnauthorized},
+		{"/v1/assets/" + assetID + "/thumbnail" + originalTicket, http.StatusUnauthorized},
+	} {
+		response := fixture.request(http.MethodGet, testCase.path, "", nil, nil)
+		response.Body.Close()
+		if response.StatusCode != testCase.want {
+			t.Errorf("%s: status %d, want %d", testCase.path[:strings.Index(testCase.path, "?")], response.StatusCode, testCase.want)
+		}
+	}
+	ticketPut := fixture.request(http.MethodPut, "/v1/assets/"+assetID+"/thumbnail"+thumbnailTicket, "", bytes.NewReader(thumbnail.Bytes()), map[string]string{"Content-Type": "image/jpeg"})
+	ticketPut.Body.Close()
+	if ticketPut.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("view ticket stored a thumbnail: %d", ticketPut.StatusCode)
 	}
 }

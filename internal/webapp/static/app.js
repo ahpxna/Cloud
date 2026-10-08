@@ -12,6 +12,10 @@ const SUBTLE_HASH_LIMIT = 128 * 1024 * 1024;
 // A Live Photo is a still plus a short video with the same base name (for
 // example IMG_1234.HEIC + IMG_1234.MOV); pair them when uploaded close together.
 const LIVE_PAIR_WINDOW_MS = 10 * 60 * 1000;
+// Thumbnails are rendered once by the browser (Safari decodes HEIC and video
+// frames), uploaded, and reused by every device afterwards.
+const THUMBNAIL_MAX_SIDE = 400;
+const THUMBNAIL_CONCURRENCY = 2;
 
 const $ = (id) => document.getElementById(id);
 
@@ -167,7 +171,10 @@ function openTab(name) {
       if (!document.hidden) refreshServerUploads();
     }, 5000);
   }
-  if (name === "settings") refreshKeys();
+  if (name === "settings") {
+    refreshKeys();
+    refreshMFA();
+  }
 }
 
 // ---------------------------------------------------------------- sign in
@@ -264,6 +271,8 @@ const library = {
   reset() {
     // A newer generation makes any in-flight page load discard its result.
     this.generation += 1;
+    thumbnailQueue.length = 0;
+    pendingThumbnailTiles.clear();
     this.loading = false;
     this.assets = [];
     this.cursor = null;
@@ -350,19 +359,35 @@ function tileFor(asset) {
   tile.className = "tile";
   tile.type = "button";
   tile.setAttribute("aria-label", asset.original_filename);
+  const placeholder = document.createElement("span");
+  placeholder.className = "placeholder";
+  placeholder.textContent = isVideo(asset) ? "🎬" : "🖼";
+  // Thumbnails are a few tens of KB; load them eagerly. (A lazy image that
+  // starts hidden would never load.)
+  const image = document.createElement("img");
+  image.decoding = "async";
+  image.alt = "";
+  image.hidden = true;
+  image.addEventListener("load", () => {
+    image.hidden = false;
+    placeholder.hidden = true;
+  });
+  image.addEventListener("error", () => {
+    image.hidden = true;
+  });
+  tile.append(placeholder, image);
+  if (asset.thumbnail_url) {
+    image.src = asset.thumbnail_url;
+  } else {
+    tile.assetRecord = asset;
+    pendingThumbnailTiles.add(tile);
+    scheduleThumbnailScan();
+  }
   if (isVideo(asset)) {
     const play = document.createElement("span");
     play.className = "play";
     play.textContent = "▶";
     tile.append(play);
-  } else {
-    const image = document.createElement("img");
-    image.loading = "lazy";
-    image.decoding = "async";
-    image.alt = "";
-    image.src = asset.view_url;
-    image.addEventListener("error", () => image.remove(), { once: true });
-    tile.append(image);
   }
   if (asset.liveVideo) {
     const live = document.createElement("span");
@@ -376,6 +401,126 @@ function tileFor(asset) {
   tile.append(label);
   tile.addEventListener("click", () => openViewer(asset));
   return tile;
+}
+
+// ---------------------------------------------------------------- thumbnails
+
+const thumbnailQueue = [];
+const pendingThumbnailTiles = new Set();
+let thumbnailsActive = 0;
+let thumbnailScanScheduled = false;
+
+// Queue tiles near the viewport. A plain geometry check on scroll/resize works
+// everywhere, including views where IntersectionObserver is throttled.
+function scheduleThumbnailScan() {
+  if (thumbnailScanScheduled) return;
+  thumbnailScanScheduled = true;
+  setTimeout(() => {
+    thumbnailScanScheduled = false;
+    const bottom = window.innerHeight + 600;
+    for (const tile of pendingThumbnailTiles) {
+      if (!tile.isConnected) {
+        pendingThumbnailTiles.delete(tile);
+        continue;
+      }
+      const rect = tile.getBoundingClientRect();
+      if (rect.bottom >= -300 && rect.top <= bottom) {
+        pendingThumbnailTiles.delete(tile);
+        thumbnailQueue.push(tile);
+      }
+    }
+    pumpThumbnails();
+  }, 100);
+}
+
+window.addEventListener("scroll", scheduleThumbnailScan, { passive: true });
+window.addEventListener("resize", scheduleThumbnailScan);
+
+function pumpThumbnails() {
+  while (thumbnailsActive < THUMBNAIL_CONCURRENCY && thumbnailQueue.length) {
+    const tile = thumbnailQueue.shift();
+    thumbnailsActive += 1;
+    makeThumbnail(tile).finally(() => {
+      thumbnailsActive -= 1;
+      pumpThumbnails();
+    });
+  }
+}
+
+async function makeThumbnail(tile) {
+  const asset = tile.assetRecord;
+  if (!asset || !tile.isConnected) return;
+  let source = null;
+  try {
+    source = isVideo(asset) ? await videoFrame(asset.view_url) : await decodedImage(asset.view_url);
+    const blob = await renderThumbnail(source);
+    const image = tile.querySelector("img");
+    image.src = URL.createObjectURL(blob);
+    const token = await accessToken();
+    await fetch("/v1/assets/" + encodeURIComponent(asset.id) + "/thumbnail", {
+      method: "PUT",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "image/jpeg" },
+      body: blob,
+    });
+  } catch {
+    // This browser cannot decode the format (for example HEIC outside Safari);
+    // keep the placeholder and let another device create the thumbnail.
+  } finally {
+    if (source instanceof HTMLVideoElement) {
+      source.removeAttribute("src");
+      source.load();
+    } else if (source) {
+      source.src = "";
+    }
+  }
+}
+
+function decodedImage(url) {
+  const image = new Image();
+  image.decoding = "async";
+  image.src = url;
+  return image.decode().then(() => image);
+}
+
+function videoFrame(url) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    const timer = setTimeout(() => reject(new Error("video frame timeout")), 20000);
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.addEventListener("error", () => reject(new Error("video decode failed")), { once: true });
+    video.addEventListener(
+      "loadeddata",
+      () => {
+        video.currentTime = Math.min(0.5, (video.duration || 1) / 2);
+      },
+      { once: true },
+    );
+    video.addEventListener(
+      "seeked",
+      () => {
+        clearTimeout(timer);
+        resolve(video);
+      },
+      { once: true },
+    );
+    video.src = url;
+  });
+}
+
+function renderThumbnail(source) {
+  const width = source.naturalWidth || source.videoWidth;
+  const height = source.naturalHeight || source.videoHeight;
+  if (!width || !height) return Promise.reject(new Error("no dimensions"));
+  const scale = Math.min(1, THUMBNAIL_MAX_SIDE / Math.max(width, height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  canvas.getContext("2d").drawImage(source, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("encode failed"))), "image/jpeg", 0.8),
+  );
 }
 
 async function openViewer(asset) {
@@ -803,6 +948,118 @@ async function copyText(elementID, button) {
   }
 }
 
+// ---------------------------------------------------------------- MFA settings
+
+function showMFASection(name) {
+  for (const section of ["mfa-off", "mfa-setup", "mfa-codes", "mfa-on"]) $(section).hidden = section !== name;
+}
+
+async function refreshMFA() {
+  $("mfa-settings-error").textContent = "";
+  try {
+    const response = await api("/v1/auth/mfa");
+    if (!response.ok) throw new Error(await problemText(response));
+    const status = await response.json();
+    if (!status.available) {
+      $("mfa-settings-status").textContent = "Máy chủ chưa bật tính năng này.";
+      showMFASection(null);
+      return;
+    }
+    $("mfa-settings-status").textContent = status.enabled ? "" : "Đang tắt.";
+    showMFASection(status.enabled ? "mfa-on" : "mfa-off");
+  } catch (error) {
+    handleError(error, $("mfa-settings-error"));
+  }
+}
+
+async function postMFA(path, body) {
+  const response = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (response.status === 429) throw new Error("Thử quá nhiều lần. Đợi vài phút rồi thử lại.");
+  if (!response.ok) throw new Error(await mfaProblemText(response));
+  return response.status === 204 ? {} : response.json();
+}
+
+async function mfaProblemText(response) {
+  try {
+    const body = await response.json();
+    return (
+      {
+        recent_auth_required: "Mật khẩu không đúng.",
+        invalid_mfa_code: "Mã không đúng. Dùng mã đang hiện trong app Mật khẩu.",
+        mfa_already_enabled: "Xác thực 2 bước đã được bật.",
+        mfa_enrollment_missing: "Hãy bấm 'Bắt đầu bật' lại.",
+      }[body.code] || body.detail || "Lỗi " + response.status
+    );
+  } catch {
+    return "Lỗi " + response.status;
+  }
+}
+
+async function startMFA() {
+  $("mfa-settings-error").textContent = "";
+  try {
+    const enrollment = await postMFA("/v1/auth/mfa/enroll", { password: $("mfa-password").value });
+    $("mfa-password").value = "";
+    $("mfa-otpauth").href = enrollment.otpauth_uri;
+    $("mfa-secret").textContent = enrollment.secret;
+    $("mfa-qr").hidden = !enrollment.qr_png_base64;
+    if (enrollment.qr_png_base64) $("mfa-qr").src = "data:image/png;base64," + enrollment.qr_png_base64;
+    showMFASection("mfa-setup");
+  } catch (error) {
+    handleError(error, $("mfa-settings-error"));
+  }
+}
+
+function showRecoveryCodes(codes, signedOut) {
+  $("mfa-codes-list").textContent = codes.join("\n");
+  $("mfa-relogin-note").hidden = !signedOut;
+  $("mfa-relogin").hidden = !signedOut;
+  showMFASection("mfa-codes");
+}
+
+async function confirmMFA() {
+  $("mfa-settings-error").textContent = "";
+  try {
+    const result = await postMFA("/v1/auth/mfa/confirm", { totp_code: $("mfa-confirm-code").value.trim() });
+    $("mfa-confirm-code").value = "";
+    // Enabling MFA signs out every device, including this one, so the
+    // recovery codes are shown before asking for a new sign-in.
+    credentials.clear();
+    $("mfa-settings-status").textContent = "Đã bật ✓";
+    showRecoveryCodes(result.recovery_codes, true);
+  } catch (error) {
+    handleError(error, $("mfa-settings-error"));
+  }
+}
+
+async function rotateRecoveryCodes() {
+  $("mfa-settings-error").textContent = "";
+  try {
+    const result = await postMFA("/v1/auth/mfa/recovery", { totp_code: $("mfa-manage-code").value.trim() });
+    $("mfa-manage-code").value = "";
+    showRecoveryCodes(result.recovery_codes, false);
+  } catch (error) {
+    handleError(error, $("mfa-settings-error"));
+  }
+}
+
+async function disableMFA() {
+  if (!confirm("Tắt xác thực 2 bước? Mọi thiết bị sẽ bị đăng xuất.")) return;
+  $("mfa-settings-error").textContent = "";
+  try {
+    await postMFA("/v1/auth/mfa/disable", { totp_code: $("mfa-manage-code").value.trim() });
+    credentials.clear();
+    showLogin();
+    $("login-error").textContent = "Đã tắt xác thực 2 bước. Hãy đăng nhập lại.";
+  } catch (error) {
+    handleError(error, $("mfa-settings-error"));
+  }
+}
+
 // ---------------------------------------------------------------- wiring
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -819,6 +1076,16 @@ document.addEventListener("DOMContentLoaded", () => {
   $("copy-key").addEventListener("click", (event) => copyText("new-key-value", event.currentTarget));
   $("copy-url").addEventListener("click", (event) => copyText("upload-url", event.currentTarget));
   $("logout").addEventListener("click", logout);
+  $("mfa-start").addEventListener("click", startMFA);
+  $("mfa-confirm").addEventListener("click", confirmMFA);
+  $("mfa-new-codes").addEventListener("click", rotateRecoveryCodes);
+  $("mfa-disable").addEventListener("click", disableMFA);
+  $("mfa-copy-secret").addEventListener("click", (event) => copyText("mfa-secret", event.currentTarget));
+  $("mfa-copy-codes").addEventListener("click", (event) => copyText("mfa-codes-list", event.currentTarget));
+  $("mfa-relogin").addEventListener("click", () => {
+    showMFASection(null);
+    showLogin();
+  });
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => openTab(tab.dataset.tab));
   }

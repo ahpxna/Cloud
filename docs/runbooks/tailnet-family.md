@@ -47,6 +47,15 @@ app with three free pieces:
 5. Test: Photos → select a photo → Share → **Ảnh nhà**, then open the
    **Tải lên** tab and wait for **Đã sao lưu ✓**.
 
+## Two-step sign-in (optional, recommended for the operator)
+
+In the web app: **Cài đặt → Xác thực 2 bước → Bắt đầu bật**, enter the current
+password, then on the same iPhone tap **Thêm vào app Mật khẩu** (no QR scan
+needed; the QR is for enrolling from a computer), enter the 6-digit code, and
+save the recovery codes. Every device is then signed out; sign in again and
+Safari fills the code from the Passwords app. Tailnet-only access already keeps
+strangers out, so MFA is optional for parents.
+
 ## What is and is not an original
 
 - The server never resizes, transcodes or recompresses anything. Every upload

@@ -206,6 +206,27 @@ progress {
   -webkit-user-select: all;
 }
 
+.qr {
+  display: block;
+  width: 220px;
+  height: 220px;
+  margin: 8px auto 12px;
+  image-rendering: pixelated;
+  background: #fff;
+  border-radius: 8px;
+}
+#mfa-setup .button, #mfa-relogin, #mfa-start, #mfa-confirm { margin-bottom: 12px; }
+#mfa-on button { width: 100%; margin-bottom: 10px; }
+.tile .placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  opacity: 0.35;
+}
+
 .steps { padding-left: 22px; }
 .steps li { margin-bottom: 10px; }
 .steps code { font-size: 15px; }

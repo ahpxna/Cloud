@@ -1,16 +1,21 @@
 package library
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,5 +269,103 @@ func TestOriginalDownloadOutlivesServerWriteTimeoutWhileProgressing(t *testing.T
 	}
 	if received != len(content) {
 		t.Fatalf("received %d of %d bytes", received, len(content))
+	}
+}
+
+func jpegBytes(t *testing.T, width, height int) []byte {
+	t.Helper()
+	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
+	for x := 0; x < width; x++ {
+		for y := 0; y < height; y++ {
+			canvas.Set(x, y, color.RGBA{uint8(x), uint8(y), 128, 255})
+		}
+	}
+	var buffer bytes.Buffer
+	if err := jpeg.Encode(&buffer, canvas, &jpeg.Options{Quality: 95}); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func (f *libraryFixture) put(target, owner, contentType string, body []byte) *httptest.ResponseRecorder {
+	f.t.Helper()
+	request := httptest.NewRequest(http.MethodPut, target, bytes.NewReader(body))
+	request.Header.Set("Content-Type", contentType)
+	request = request.WithContext(auth.WithPrincipal(request.Context(), auth.Principal{
+		UserID: owner, SessionID: "90000000-0000-4000-8000-000000000009",
+	}))
+	recorder := httptest.NewRecorder()
+	f.api.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func TestThumbnailIsValidatedReencodedAndListed(t *testing.T) {
+	fixture := newLibraryFixture(t)
+	tokens, err := auth.NewAccessTokenManager([]byte(strings.Repeat("t", 32)), auth.DefaultIssuer, auth.DefaultAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.api.EnableViewTickets(tokens)
+	fixture.addAsset("a1", ownerA, []byte("an original HEIC the server cannot decode"), time.Now())
+
+	listed := func() string {
+		response := fixture.serve(http.MethodGet, "/v1/assets?tickets=1", ownerA, nil)
+		var page struct {
+			Assets []struct {
+				ThumbnailURL string `json:"thumbnail_url"`
+			} `json:"assets"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&page); err != nil || len(page.Assets) != 1 {
+			t.Fatalf("list = %s err=%v", response.Body, err)
+		}
+		return page.Assets[0].ThumbnailURL
+	}
+	if listed() != "" {
+		t.Fatal("thumbnail_url listed before one exists")
+	}
+	if response := fixture.serve(http.MethodGet, "/v1/assets/a1/thumbnail", ownerA, nil); response.Code != http.StatusNotFound {
+		t.Fatalf("missing thumbnail status = %d", response.Code)
+	}
+
+	cases := []struct {
+		name        string
+		owner       string
+		contentType string
+		body        []byte
+		want        int
+	}{
+		{"wrong content type", ownerA, "image/png", jpegBytes(t, 10, 10), http.StatusUnsupportedMediaType},
+		{"not a JPEG", ownerA, "image/jpeg", []byte("\x89PNG\r\n\x1a\nnot really"), http.StatusUnprocessableEntity},
+		{"too many pixels", ownerA, "image/jpeg", jpegBytes(t, 641, 100), http.StatusUnprocessableEntity},
+		{"too many bytes", ownerA, "image/jpeg", bytes.Repeat([]byte{0xFF}, 513<<10), http.StatusRequestEntityTooLarge},
+		{"another owner", ownerB, "image/jpeg", jpegBytes(t, 10, 10), http.StatusNotFound},
+	}
+	for _, testCase := range cases {
+		if response := fixture.put("/v1/assets/a1/thumbnail", testCase.owner, testCase.contentType, testCase.body); response.Code != testCase.want {
+			t.Errorf("%s: status %d, want %d", testCase.name, response.Code, testCase.want)
+		}
+	}
+
+	sent := jpegBytes(t, 320, 240)
+	if response := fixture.put("/v1/assets/a1/thumbnail", ownerA, "image/jpeg", sent); response.Code != http.StatusNoContent {
+		t.Fatalf("store status = %d: %s", response.Code, response.Body)
+	}
+	if listed() == "" {
+		t.Fatal("thumbnail_url missing after upload")
+	}
+	served := fixture.serve(http.MethodGet, "/v1/assets/a1/thumbnail", ownerA, nil)
+	if served.Code != http.StatusOK || served.Header().Get("Content-Type") != "image/jpeg" ||
+		served.Header().Get("Cache-Control") != thumbnailCacheControl {
+		t.Fatalf("served thumbnail = %d %v", served.Code, served.Header())
+	}
+	if bytes.Equal(served.Body.Bytes(), sent) {
+		t.Fatal("thumbnail bytes were stored as sent instead of re-encoded")
+	}
+	config, format, err := image.DecodeConfig(bytes.NewReader(served.Body.Bytes()))
+	if err != nil || format != "jpeg" || config.Width != 320 || config.Height != 240 {
+		t.Fatalf("served thumbnail config = %#v %q err=%v", config, format, err)
+	}
+	if response := fixture.serve(http.MethodGet, "/v1/assets/a1/thumbnail", ownerB, nil); response.Code != http.StatusNotFound {
+		t.Fatalf("cross-owner thumbnail status = %d", response.Code)
 	}
 }

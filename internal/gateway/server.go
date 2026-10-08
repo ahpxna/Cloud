@@ -512,8 +512,9 @@ func authenticate(tokens *auth.AccessTokenManager, accounts account.Repository, 
 }
 
 // authenticateLibrary also accepts an asset-scoped view ticket in the query
-// string, but only for GET/HEAD of that asset's original and only while the
-// issuing device session is still active.
+// string, but only for GET/HEAD of that asset's original or thumbnail (each
+// needs its own ticket kind) and only while the issuing device session is
+// still active.
 func authenticateLibrary(tokens *auth.AccessTokenManager, accounts account.Repository, next http.Handler) http.Handler {
 	withHeader := authenticate(tokens, accounts, next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -523,12 +524,22 @@ func authenticateLibrary(tokens *auth.AccessTokenManager, accounts account.Repos
 			withHeader.ServeHTTP(w, r)
 			return
 		}
-		assetID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/assets/"), "/original")
-		if assetID == "" || strings.Contains(assetID, "/") || !strings.HasSuffix(r.URL.Path, "/original") {
+		var kind, suffix string
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/original"):
+			kind, suffix = auth.ViewOriginal, "/original"
+		case strings.HasSuffix(r.URL.Path, "/thumbnail"):
+			kind, suffix = auth.ViewThumbnail, "/thumbnail"
+		default:
 			writeAuthError(w)
 			return
 		}
-		principal, err := tokens.VerifyView(ticket, assetID)
+		assetID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/assets/"), suffix)
+		if assetID == "" || strings.Contains(assetID, "/") {
+			writeAuthError(w)
+			return
+		}
+		principal, err := tokens.VerifyView(ticket, assetID, kind)
 		if err != nil {
 			writeAuthError(w)
 			return

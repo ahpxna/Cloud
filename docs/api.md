@@ -159,6 +159,19 @@ asset, or act as an access or upload token, and it stops working when the
 device session is revoked. Originals are served byte-for-byte; nothing is
 resized, transcoded or recompressed.
 
+## Thumbnails
+
+iPhone originals are mostly HEIC, which the server cannot decode in pure Go,
+so the owner's browser renders a preview (Safari decodes HEIC and video
+frames) and uploads it once with `PUT /v1/assets/{id}/thumbnail`
+(`Content-Type: image/jpeg`, access token, at most 512 KiB and 640×640). The
+server decodes and re-encodes it, dropping any metadata, and stores it under
+`thumbnails/<owner>/` on the media volume. `GET /v1/assets?tickets=1` then adds
+a `thumbnail_url` whose ticket is identical for an hour so browsers cache it.
+Thumbnail and original tickets are separate kinds: neither opens the other.
+Thumbnails are derived data, outside the signed integrity manifest, and can be
+deleted and regenerated at any time.
+
 ## Upload progress
 
 `GET /v1/upload-sessions?limit=50` (access token) lists the caller's most
@@ -190,6 +203,14 @@ library, list uploads or change the account. Manage them with an access token:
 (returns the key once), `DELETE /v1/auth/upload-keys/{id}`. At most 10 are
 active per account. `revoke-sessions`, `reset-password`, `reset-mfa`,
 `disable-user` and `delete-user` revoke them too.
+
+## MFA status
+
+`GET /v1/auth/mfa` (access token) returns `{"available", "enabled", "pending"}`.
+`POST /v1/auth/mfa/enroll` now also returns `qr_png_base64`, a QR code of the
+`otpauth://` URI for enrolling from a computer. On an iPhone, opening the
+`otpauth://` link adds the code to the built-in Passwords app, which then
+autofills it in Safari. Confirming or disabling MFA signs out every device.
 
 ## Web app
 

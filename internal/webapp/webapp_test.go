@@ -1,8 +1,10 @@
 package webapp
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -80,5 +82,28 @@ func TestStaticFilesRevalidateWithETag(t *testing.T) {
 	}
 	if serve(handler, http.MethodGet, "/app/").Header().Get("ETag") == "" {
 		t.Fatal("index has no ETag")
+	}
+}
+
+func TestEmbeddedAppIsCompleteAndConsistent(t *testing.T) {
+	read := func(name string) string {
+		contents, err := fs.ReadFile(static, "static/"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(contents)
+	}
+	minimums := map[string]int{"index.html": 2000, "app.js": 20000, "app.css": 2000, "manifest.webmanifest": 100}
+	for name, minimum := range minimums {
+		if size := len(read(name)); size < minimum {
+			t.Fatalf("%s is %d bytes; an empty or truncated file would ship a blank app", name, size)
+		}
+	}
+	script := read("app.js")
+	page := read("index.html")
+	for _, match := range regexp.MustCompile(`\$\("([A-Za-z0-9-]+)"\)`).FindAllStringSubmatch(script, -1) {
+		if !strings.Contains(page, `id="`+match[1]+`"`) {
+			t.Errorf("app.js uses #%s but index.html has no such element", match[1])
+		}
 	}
 }

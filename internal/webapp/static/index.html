@@ -115,6 +115,46 @@
         <p id="key-error" class="error" role="alert"></p>
       </div>
       <div class="card">
+        <h2>Xác thực 2 bước</h2>
+        <p id="mfa-settings-status" class="muted">Đang kiểm tra…</p>
+        <div id="mfa-off" hidden>
+          <p>Khi bật, mỗi lần đăng nhập cần thêm mã 6 số từ app <b>Mật khẩu</b> có sẵn trên iPhone. Safari sẽ tự điền mã nên không phải gõ.</p>
+          <label>Mật khẩu hiện tại
+            <input id="mfa-password" type="password" autocomplete="current-password">
+          </label>
+          <button id="mfa-start" class="primary">Bắt đầu bật</button>
+        </div>
+        <div id="mfa-setup" hidden>
+          <p><b>Đang dùng iPhone này?</b> Bấm nút dưới → app Mật khẩu mở ra → chọn mục đăng nhập của trang này (hoặc tạo mục mới) → Lưu. Không cần quét gì.</p>
+          <a id="mfa-otpauth" class="primary button">Thêm vào app Mật khẩu</a>
+          <p><b>Đang dùng máy tính?</b> Trên iPhone mở app <b>Mật khẩu</b> → chọn mục đăng nhập → <b>Thiết lập mã xác minh</b> → quét mã QR này:</p>
+          <img id="mfa-qr" class="qr" alt="Mã QR thiết lập xác thực 2 bước">
+          <p>Hoặc chọn <b>Nhập khoá thiết lập</b> và dán khoá:</p>
+          <code id="mfa-secret" class="secret"></code>
+          <button id="mfa-copy-secret" class="secondary">Sao chép khoá</button>
+          <label>Mã 6 số đang hiện trong app Mật khẩu
+            <input id="mfa-confirm-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+          </label>
+          <button id="mfa-confirm" class="primary">Xác nhận và bật</button>
+        </div>
+        <div id="mfa-codes" hidden>
+          <p class="warn-text">Lưu các mã khôi phục này (ghi ra giấy, cất kỹ). Mỗi mã dùng được một lần nếu mất điện thoại.</p>
+          <pre id="mfa-codes-list" class="secret"></pre>
+          <button id="mfa-copy-codes" class="secondary">Sao chép mã khôi phục</button>
+          <p id="mfa-relogin-note" class="muted" hidden>Vì lý do an toàn, mọi thiết bị đã được đăng xuất. Đăng nhập lại kèm mã 6 số.</p>
+          <button id="mfa-relogin" class="primary" hidden>Tôi đã lưu mã · Đăng nhập lại</button>
+        </div>
+        <div id="mfa-on" hidden>
+          <p class="state ok">Đang bật ✓</p>
+          <label>Mã 6 số hiện tại
+            <input id="mfa-manage-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+          </label>
+          <button id="mfa-new-codes" class="secondary">Tạo mã khôi phục mới</button>
+          <button id="mfa-disable" class="danger">Tắt xác thực 2 bước</button>
+        </div>
+        <p id="mfa-settings-error" class="error" role="alert"></p>
+      </div>
+      <div class="card">
         <h2>Khoá đang dùng</h2>
         <ul id="key-list" class="list"></ul>
       </div>

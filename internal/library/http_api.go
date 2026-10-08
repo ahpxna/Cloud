@@ -72,6 +72,7 @@ type assetResponse struct {
 	CreatedAt        time.Time `json:"created_at"`
 	OriginalURL      string    `json:"original_url"`
 	ViewURL          string    `json:"view_url,omitempty"`
+	ThumbnailURL     string    `json:"thumbnail_url,omitempty"`
 }
 
 type listResponse struct {
@@ -102,6 +103,21 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		api.original(w, r, principal, assetID)
+	case strings.HasSuffix(path, "/thumbnail"):
+		assetID := strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/thumbnail")
+		if assetID == "" || strings.Contains(assetID, "/") {
+			writeProblem(w, http.StatusNotFound, "not_found", "asset not found")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			api.serveThumbnail(w, r, principal, assetID)
+		case http.MethodPut:
+			api.storeThumbnail(w, r, principal, assetID)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, PUT")
+			writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		}
 	default:
 		w.Header().Set("Allow", "GET, HEAD")
 		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -131,12 +147,18 @@ func (api *API) list(w http.ResponseWriter, r *http.Request, principal auth.Prin
 	for _, asset := range assets[:min(limit, len(assets))] {
 		item := assetForResponse(asset)
 		if withTickets {
-			ticket, err := api.viewTickets.IssueView(principal, asset.ID, now, viewTicketTTL)
+			ticket, err := api.viewTickets.IssueView(principal, asset.ID, auth.ViewOriginal, now, viewTicketTTL)
 			if err != nil {
 				writeProblem(w, http.StatusInternalServerError, "view_ticket_failed", "could not list assets")
 				return
 			}
 			item.ViewURL = item.OriginalURL + "?ticket=" + url.QueryEscape(ticket)
+			if api.hasThumbnail(asset) {
+				if item.ThumbnailURL, err = api.thumbnailURL(principal, asset.ID, now); err != nil {
+					writeProblem(w, http.StatusInternalServerError, "view_ticket_failed", "could not list assets")
+					return
+				}
+			}
 		}
 		response.Assets = append(response.Assets, item)
 	}
