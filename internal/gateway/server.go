@@ -51,6 +51,11 @@ type Config struct {
 	// CanonicalHost is the HTTPS name plain-HTTP requests are redirected to,
 	// e.g. family-photos.<tailnet>.ts.net. Empty keeps the request's host.
 	CanonicalHost string
+	// Library enables albums, sharing, Recently Deleted, places and
+	// background metadata. When nil only the basic library list is served.
+	Library library.Store
+	// PhotoTimezone interprets capture times written without an offset.
+	PhotoTimezone *time.Location
 	Logger        *slog.Logger
 }
 
@@ -196,6 +201,67 @@ func New(config Config) (*Server, error) {
 		}
 	}
 
+	// Library background work: capture metadata and previews for new items,
+	// the 30-day Recently Deleted retention, and recovery of interrupted
+	// permanent deletions.
+	purgeStore, canPurge := config.Repository.(upload.PurgeStore)
+	wakeLibrary := make(chan struct{}, 1)
+	notifyLibrary := func() {
+		select {
+		case wakeLibrary <- struct{}{}:
+		default:
+		}
+	}
+	if config.Library != nil {
+		maintenance := &library.Maintenance{Store: config.Library, MediaRoot: processor.MediaRoot(), Location: config.PhotoTimezone, Logger: config.Logger}
+		server.wg.Add(1)
+		go func() {
+			defer server.wg.Done()
+			if canPurge {
+				if err := processor.SweepPurging(ctx, purgeStore); err != nil {
+					config.Logger.Error("finish interrupted deletions", "error", err)
+				}
+			}
+			ticker := time.NewTicker(config.ReconcileInterval)
+			defer ticker.Stop()
+			lastRetention := time.Time{}
+			for {
+				for {
+					done, err := maintenance.ProcessPending(ctx, 20)
+					if err != nil {
+						if ctx.Err() == nil {
+							config.Logger.Error("read library metadata", "error", err)
+						}
+						break
+					}
+					if done < 20 {
+						break
+					}
+				}
+				if canPurge && time.Since(lastRetention) >= time.Hour {
+					lastRetention = time.Now()
+					cutoff := time.Now().Add(-library.TrashRetention)
+					for {
+						purged, err := processor.PurgeExpiredTrash(ctx, purgeStore, cutoff, 100)
+						if err != nil {
+							config.Logger.Error("purge expired Recently Deleted items", "error", err)
+							break
+						}
+						if purged < 100 {
+							break
+						}
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				case <-wakeLibrary:
+				}
+			}
+		}()
+	}
+
 	server.wg.Add(3)
 	go func() {
 		defer server.wg.Done()
@@ -311,6 +377,8 @@ func New(config Config) (*Server, error) {
 						}
 						if err := processWithLease(ctx, config.Repository, processor, claimed[0], workerID, config.VerificationLease, config.Logger); err != nil && !errors.Is(err, upload.ErrChecksumMismatch) {
 							config.Logger.Error("verify and commit upload", "upload_id", claimed[0].ID, "error", err)
+						} else if err == nil {
+							notifyLibrary()
 						}
 					}
 				}
@@ -355,6 +423,28 @@ func New(config Config) (*Server, error) {
 		defer unlock()
 		return processor.ResetForRetry(requestContext, id, ownerID)
 	})
+	extras := upload.SessionExtras{
+		Cancel: func(requestContext context.Context, id, ownerID string) error {
+			// Check ownership before taking the lock: asking for the lock
+			// interrupts whoever is uploading.
+			session, err := config.Repository.SessionByID(requestContext, id)
+			if err != nil || subtle.ConstantTimeCompare([]byte(session.OwnerID), []byte(ownerID)) != 1 {
+				return upload.ErrNotFound
+			}
+			unlock, err := lockUpload(requestContext, id)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			return processor.Cancel(requestContext, id, ownerID)
+		},
+		Staged:   processor.StagedBytes,
+		Location: config.PhotoTimezone,
+	}
+	if config.Library != nil {
+		extras.MatchAsset = config.Library.MatchAsset
+	}
+	uploadAPI.EnableExtras(extras)
 	if config.Accounts != nil {
 		accountAPI, err := account.NewSecureAPI(config.Accounts, config.Tokens, config.Logger, account.SecurityConfig{
 			LoginThrottleHMACKey:      config.LoginThrottleHMACKey,
@@ -377,10 +467,25 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	libraryAPI.EnableViewTickets(config.Tokens)
+	if config.Library != nil {
+		var purger library.Purger
+		if canPurge {
+			purger = purgeFunc(func(ctx context.Context, ownerID, assetID string) error {
+				return processor.Purge(ctx, purgeStore, ownerID, assetID, nil, "owner")
+			})
+		}
+		libraryAPI.UseStore(config.Library, purger)
+	}
 	mux.Handle("/v1/assets", authenticate(config.Tokens, config.Accounts, libraryAPI))
 	mux.Handle("/v1/assets/", authenticateLibrary(config.Tokens, config.Accounts, libraryAPI))
+	for _, prefix := range []string{"/v1/albums", "/v1/album-folders", "/v1/places", "/v1/people"} {
+		mux.Handle(prefix, authenticate(config.Tokens, config.Accounts, libraryAPI))
+		mux.Handle(prefix+"/", authenticate(config.Tokens, config.Accounts, libraryAPI))
+	}
+	mux.Handle("/v1/library/", authenticate(config.Tokens, config.Accounts, libraryAPI))
+	mux.Handle("/v1/activity", authenticate(config.Tokens, config.Accounts, libraryAPI))
 	mux.Handle("/v1/upload-sessions", authenticate(config.Tokens, config.Accounts, uploadAPI))
-	mux.Handle("/v1/upload-sessions/", authenticate(config.Tokens, config.Accounts, uploadAPI))
+	mux.Handle("/v1/upload-sessions/", authenticateUploadPreview(config.Tokens, config.Accounts, uploadAPI))
 
 	strippedTus := http.StripPrefix(strings.TrimSuffix(tusBasePath, "/"), tusHandler)
 	limiter := newPatchLimiter(config.MaxConcurrentPatches, config.MaxPatchesPerUser)
@@ -442,6 +547,13 @@ const tusResourceLockTimeout = 15 * time.Second
 // expiry hold it only briefly, so they ignore release requests; a PATCH that
 // arrives meanwhile waits for tusd's AcquireLockTimeout and then proceeds.
 func lockTusResource(ctx context.Context, locker filelocker.FileLocker, id string) (func(), error) {
+	return lockTusResourceReleasable(ctx, locker, id, func() {})
+}
+
+// lockTusResourceReleasable is lockTusResource for a long-running holder that
+// gives the upload up (by calling requestRelease's effect and unlocking) when
+// another request asks for it.
+func lockTusResourceReleasable(ctx context.Context, locker filelocker.FileLocker, id string, requestRelease func()) (func(), error) {
 	if id == "" || strings.ContainsAny(id, `/\`) {
 		return nil, upload.ErrNotFound
 	}
@@ -451,7 +563,7 @@ func lockTusResource(ctx context.Context, locker filelocker.FileLocker, id strin
 	}
 	lockContext, cancel := context.WithTimeout(ctx, tusResourceLockTimeout)
 	defer cancel()
-	if err := lock.Lock(lockContext, func() {}); err != nil {
+	if err := lock.Lock(lockContext, requestRelease); err != nil {
 		if errors.Is(err, tusd.ErrLockTimeout) {
 			return nil, upload.ErrUploadBusy
 		}
@@ -544,17 +656,22 @@ func authenticateLibrary(tokens *auth.AccessTokenManager, accounts account.Repos
 			withHeader.ServeHTTP(w, r)
 			return
 		}
-		var kind, suffix string
+		var kind, assetID string
+		path := strings.TrimPrefix(r.URL.Path, "/v1/assets/")
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/original"):
-			kind, suffix = auth.ViewOriginal, "/original"
-		case strings.HasSuffix(r.URL.Path, "/thumbnail"):
-			kind, suffix = auth.ViewThumbnail, "/thumbnail"
+		case strings.HasSuffix(path, "/original"):
+			kind, assetID = auth.ViewOriginal, strings.TrimSuffix(path, "/original")
+		case strings.HasSuffix(path, "/clip"):
+			// A clip is cut from the original, so the original's ticket opens it.
+			kind, assetID = auth.ViewOriginal, strings.TrimSuffix(path, "/clip")
+		case strings.HasSuffix(path, "/thumbnail"):
+			kind, assetID = auth.ViewThumbnail, strings.TrimSuffix(path, "/thumbnail")
+		case strings.HasPrefix(path, "download/"):
+			kind, assetID = auth.ViewDownload, strings.TrimPrefix(path, "download/")
 		default:
 			writeAuthError(w)
 			return
 		}
-		assetID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/assets/"), suffix)
 		if assetID == "" || strings.Contains(assetID, "/") {
 			writeAuthError(w)
 			return
@@ -573,6 +690,46 @@ func authenticateLibrary(tokens *auth.AccessTokenManager, accounts account.Repos
 		}
 		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
 	})
+}
+
+// authenticateUploadPreview accepts an upload-preview ticket in the query
+// string for GET/HEAD of /v1/upload-sessions/{id}/preview, so an <img> or
+// <video> can show what a stuck upload contains.
+func authenticateUploadPreview(tokens *auth.AccessTokenManager, accounts account.Repository, next http.Handler) http.Handler {
+	withHeader := authenticate(tokens, accounts, next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ticket := r.URL.Query().Get("ticket")
+		if r.Header.Get("Authorization") != "" || ticket == "" ||
+			(r.Method != http.MethodGet && r.Method != http.MethodHead) ||
+			!strings.HasSuffix(r.URL.Path, "/preview") {
+			withHeader.ServeHTTP(w, r)
+			return
+		}
+		sessionID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/upload-sessions/"), "/preview")
+		if sessionID == "" || strings.Contains(sessionID, "/") {
+			writeAuthError(w)
+			return
+		}
+		principal, err := tokens.VerifyView(ticket, sessionID, auth.ViewUploadPreview)
+		if err != nil {
+			writeAuthError(w)
+			return
+		}
+		if accounts != nil {
+			active, err := accounts.SessionActive(r.Context(), principal.UserID, principal.SessionID)
+			if err != nil || !active {
+				writeAuthError(w)
+				return
+			}
+		}
+		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
+	})
+}
+
+type purgeFunc func(ctx context.Context, ownerID, assetID string) error
+
+func (f purgeFunc) Purge(ctx context.Context, ownerID, assetID string) error {
+	return f(ctx, ownerID, assetID)
 }
 
 func authenticateTus(

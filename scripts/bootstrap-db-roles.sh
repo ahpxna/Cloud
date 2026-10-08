@@ -99,7 +99,7 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM photo_cloud_gateway, photo_clo
 -- reads. upload_events remains append-only at the privilege layer as well as by
 -- trigger: the gateway can insert events but cannot update or delete them.
 GRANT SELECT ON users TO photo_cloud_gateway;
-GRANT UPDATE (auth_epoch) ON users TO photo_cloud_gateway;
+GRANT UPDATE (auth_epoch, display_name) ON users TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON device_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON user_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE, DELETE ON login_throttles TO photo_cloud_gateway;
@@ -110,12 +110,21 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON mfa_action_throttles TO photo_cloud_gate
 GRANT SELECT, INSERT, UPDATE ON upload_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON upload_session_throttles TO photo_cloud_gateway;
 GRANT SELECT, INSERT ON assets TO photo_cloud_gateway;
-GRANT SELECT, INSERT ON upload_events TO photo_cloud_gateway;
+-- Library curation and extracted capture metadata. Identity, content hash,
+-- storage key and size stay immutable for the gateway; a purge only
+-- tombstones the row (deleted_at) and assets can never be deleted.
+GRANT UPDATE (
+  favorite, hidden, caption, trashed_at, deleted_at,
+  captured_at, width, height, duration_ms, metadata, live_photo_id, subtype,
+  latitude, longitude, metadata_version
+) ON assets TO photo_cloud_gateway;
+GRANT SELECT, INSERT ON upload_events, asset_events TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON device_upload_keys TO photo_cloud_gateway;
+GRANT SELECT, INSERT, UPDATE, DELETE ON album_folders, albums, album_members, album_assets, album_likes, album_comments, place_labels TO photo_cloud_gateway;
 
--- uuidv7() does not require sequence rights, but upload_events uses an identity
--- sequence. Grant only that generated sequence to the gateway.
-GRANT USAGE, SELECT ON SEQUENCE upload_events_sequence_id_seq TO photo_cloud_gateway;
+-- uuidv7() does not require sequence rights, but the append-only event tables
+-- use identity sequences. Grant only those generated sequences to the gateway.
+GRANT USAGE, SELECT ON SEQUENCE upload_events_sequence_id_seq, asset_events_sequence_id_seq TO photo_cloud_gateway;
 
 -- Admin one-shot tooling provisions accounts and runs the account lifecycle
 -- (disable, password/MFA reset, device revocation, deletion). It can overwrite
@@ -144,7 +153,7 @@ GRANT USAGE, SELECT ON SEQUENCE asset_integrity_checks_id_seq TO photo_cloud_int
 -- Metrics/export processes are deliberately read-only and see only the
 -- operational/integrity tables they query; auth secrets and session rows are
 -- not exposed to observability credentials.
-GRANT SELECT ON upload_sessions, assets, upload_events, asset_integrity_checks, signed_manifests TO photo_cloud_readonly;
+GRANT SELECT ON upload_sessions, assets, upload_events, asset_integrity_checks, signed_manifests, asset_events TO photo_cloud_readonly;
 
 -- Backup is a separate one-shot credential. It can read all application data
 -- for pg_dump but cannot write anything or assume a runtime role.
@@ -179,6 +188,17 @@ BEGIN
      OR has_table_privilege('photo_cloud_gateway', 'asset_integrity_checks', 'INSERT')
      OR has_table_privilege('photo_cloud_gateway', 'schema_migrations', 'UPDATE') THEN
     RAISE EXCEPTION 'gateway database role can mutate integrity/migration evidence';
+  END IF;
+  IF has_table_privilege('photo_cloud_gateway', 'assets', 'DELETE')
+     OR has_column_privilege('photo_cloud_gateway', 'assets', 'content_sha256', 'UPDATE')
+     OR has_column_privilege('photo_cloud_gateway', 'assets', 'storage_key', 'UPDATE')
+     OR has_column_privilege('photo_cloud_gateway', 'assets', 'owner_id', 'UPDATE')
+     OR has_column_privilege('photo_cloud_gateway', 'assets', 'byte_size', 'UPDATE')
+     OR has_table_privilege('photo_cloud_gateway', 'asset_events', 'UPDATE')
+     OR has_table_privilege('photo_cloud_gateway', 'asset_events', 'DELETE')
+     OR has_table_privilege('photo_cloud_gateway', 'upload_events', 'UPDATE')
+     OR has_table_privilege('photo_cloud_gateway', 'upload_events', 'DELETE') THEN
+    RAISE EXCEPTION 'gateway database role can rewrite asset identity or audit history';
   END IF;
   IF has_table_privilege('photo_cloud_readonly', 'users', 'SELECT')
      OR has_table_privilege('photo_cloud_readonly', 'user_sessions', 'SELECT')

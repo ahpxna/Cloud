@@ -200,4 +200,4 @@ ios-test: ## Generate the iOS project and run simulator XCTest (requires full Xc
 
 .PHONY: integration-test
 integration-test: ## Run PostgreSQL 18 upload + account/MFA integration tests without Docker
-	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go GOCACHE=$(CURDIR)/.cache/go-build go test -tags=integration -count=1 ./internal/upload ./internal/account
+	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go GOCACHE=$(CURDIR)/.cache/go-build go test -tags=integration -count=1 ./internal/upload ./internal/account ./internal/library

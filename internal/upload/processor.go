@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
@@ -20,6 +22,50 @@ var safeID = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 type Processor struct {
 	repository Repository
 	mediaRoot  string
+	// content serializes, per owner and content hash, committing an upload
+	// and permanently deleting an asset, which touch the same
+	// content-addressed file. The writer lease guarantees a single gateway
+	// process, so an in-process lock is sufficient.
+	content keyedMutex
+}
+
+// keyedMutex hands out one mutex per key and forgets keys nobody holds.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+type keyedLock struct {
+	mu    sync.Mutex
+	users int
+}
+
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = make(map[string]*keyedLock)
+	}
+	entry := k.locks[key]
+	if entry == nil {
+		entry = &keyedLock{}
+		k.locks[key] = entry
+	}
+	entry.users++
+	k.mu.Unlock()
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		k.mu.Lock()
+		entry.users--
+		if entry.users == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
+}
+
+func contentKey(ownerID string, hash [32]byte) string {
+	return ownerID + "/" + hex.EncodeToString(hash[:])
 }
 
 // CompletedTusUpload is reconstructed from tusd's durable FileInfo sidecar.
@@ -65,6 +111,7 @@ func NewProcessor(repository Repository, mediaRoot string) (*Processor, error) {
 	for _, directory := range []string{
 		filepath.Join(absolute, ".staging", "tus"),
 		filepath.Join(absolute, ".quarantine"),
+		filepath.Join(absolute, ".purging"),
 		filepath.Join(absolute, "originals"),
 	} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -182,6 +229,8 @@ func (p *Processor) Process(ctx context.Context, id string) error {
 	if !safeID.MatchString(session.ID) || !safeID.MatchString(session.OwnerID) {
 		return p.fail(ctx, session.ID, "unsafe_storage_identifier", errors.New("unsafe storage identifier"))
 	}
+	unlock := p.content.lock(contentKey(session.OwnerID, session.ClientSHA256))
+	defer unlock()
 
 	storageKey := finalStorageKey(session)
 	stagePath := filepath.Join(p.StagingDirectory(), session.ID)
@@ -538,3 +587,210 @@ func syncDirectory(directory string) error {
 	defer handle.Close()
 	return handle.Sync()
 }
+
+// Cancel stops an unfinished upload at its owner's request: the partial bytes
+// are deleted and the session is marked cancelled. The caller holds the
+// upload's tusd lock, so no request is writing it. An upload whose bytes all
+// arrived is recorded as received instead and ErrAlreadyReceived returned.
+func (p *Processor) Cancel(ctx context.Context, id, ownerID string) error {
+	session, err := p.repository.SessionByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if session.OwnerID != ownerID {
+		return ErrNotFound
+	}
+	switch session.State {
+	case StateExpired:
+		return nil
+	case StateCreated, StateUploading, StateFailed:
+	case StateQuarantining, StateQuarantined:
+		return ErrInvalidState
+	default:
+		return ErrAlreadyReceived
+	}
+	inspection, err := p.InspectTusResource(session.ID, session.ExpectedSize)
+	if err != nil {
+		return err
+	}
+	switch inspection.State {
+	case TusComplete:
+		if session.State == StateUploading {
+			if err := p.repository.MarkReceived(ctx, session.ID, inspection.Offset); err != nil {
+				return err
+			}
+			return ErrAlreadyReceived
+		}
+	case TusInconsistent:
+		return ErrUploadResourceInconsistent
+	}
+	for _, path := range []string{
+		filepath.Join(p.StagingDirectory(), session.ID),
+		filepath.Join(p.StagingDirectory(), session.ID+".info"),
+	} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove cancelled staging data: %w", err)
+		}
+	}
+	if err := syncDirectory(p.StagingDirectory()); err != nil {
+		return fmt.Errorf("sync cancelled staging cleanup: %w", err)
+	}
+	return p.repository.MarkCancelled(ctx, session.ID, ownerID)
+}
+
+// StagedBytes opens the bytes received so far for an upload (for previews).
+func (p *Processor) StagedBytes(id string) (*os.File, int64, error) {
+	if !safeID.MatchString(id) {
+		return nil, 0, ErrNotFound
+	}
+	file, err := os.Open(filepath.Join(p.StagingDirectory(), id))
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		return nil, 0, ErrNotFound
+	}
+	return file, info.Size(), nil
+}
+
+// PurgeStore is the database side of permanent deletion.
+type PurgeStore interface {
+	PurgeCandidate(ctx context.Context, ownerID, assetID string, trashedBefore *time.Time) (PurgeCandidate, error)
+	ExpiredTrash(ctx context.Context, cutoff time.Time, limit int) ([]PurgeCandidate, error)
+	PurgeAsset(ctx context.Context, candidate PurgeCandidate, trashedBefore *time.Time, actor string, moveBytes func() error, restoreBytes func()) error
+	AssetStorage(ctx context.Context, assetID string) (storageKey string, live bool, found bool, err error)
+}
+
+// Purge permanently deletes an asset from Recently Deleted. The original is
+// first renamed into .purging/ inside the database transaction that
+// tombstones the row, and deleted only after that transaction commits, so a
+// crash at any point leaves either the live asset with its bytes or a
+// tombstone whose leftover bytes SweepPurging removes.
+func (p *Processor) Purge(ctx context.Context, store PurgeStore, ownerID, assetID string, trashedBefore *time.Time, actor string) error {
+	candidate, err := store.PurgeCandidate(ctx, ownerID, assetID, trashedBefore)
+	if err != nil {
+		return err
+	}
+	if !safeID.MatchString(candidate.ID) || !safeID.MatchString(candidate.OwnerID) {
+		return ErrUploadResourceInconsistent
+	}
+	unlock := p.content.lock(contentKey(candidate.OwnerID, candidate.ContentSHA256))
+	defer unlock()
+	original, err := p.mediaPath(candidate.StorageKey)
+	if err != nil {
+		return err
+	}
+	holding := filepath.Join(p.mediaRoot, ".purging", candidate.ID)
+	moved := false
+	moveBytes := func() error {
+		if err := os.Rename(original, holding); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("set aside purged original: %w", err)
+		}
+		moved = true
+		_ = syncDirectory(filepath.Dir(original))
+		return syncDirectory(filepath.Dir(holding))
+	}
+	restoreBytes := func() {
+		if moved {
+			if err := os.Rename(holding, original); err == nil {
+				_ = syncDirectory(filepath.Dir(original))
+			}
+		}
+	}
+	if err := store.PurgeAsset(ctx, candidate, trashedBefore, actor, moveBytes, restoreBytes); err != nil {
+		return err
+	}
+	if err := os.Remove(holding); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete purged original: %w", err)
+	}
+	thumbnail := filepath.Join(p.mediaRoot, "thumbnails", candidate.OwnerID, candidate.ID+".jpg")
+	if err := os.Remove(thumbnail); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete purged thumbnail: %w", err)
+	}
+	_ = syncDirectory(filepath.Dir(holding))
+	return nil
+}
+
+// PurgeExpiredTrash permanently deletes assets binned before cutoff.
+func (p *Processor) PurgeExpiredTrash(ctx context.Context, store PurgeStore, cutoff time.Time, limit int) (int, error) {
+	candidates, err := store.ExpiredTrash(ctx, cutoff, limit)
+	if err != nil {
+		return 0, err
+	}
+	purged := 0
+	for _, candidate := range candidates {
+		if err := p.Purge(ctx, store, candidate.OwnerID, candidate.ID, &cutoff, "retention"); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return purged, err
+		}
+		purged++
+	}
+	return purged, nil
+}
+
+// SweepPurging finishes purges interrupted by a crash: leftover bytes of a
+// tombstoned asset are deleted, and bytes of an asset whose purge never
+// committed are put back.
+func (p *Processor) SweepPurging(ctx context.Context, store PurgeStore) error {
+	directory := filepath.Join(p.mediaRoot, ".purging")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !safeID.MatchString(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		key, live, found, err := store.AssetStorage(ctx, entry.Name())
+		if err != nil {
+			return err
+		}
+		if found && live {
+			original, err := p.mediaPath(key)
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(original); errors.Is(err, os.ErrNotExist) {
+				if err := os.MkdirAll(filepath.Dir(original), 0o700); err != nil {
+					return err
+				}
+				if err := os.Rename(path, original); err != nil {
+					return err
+				}
+				_ = syncDirectory(filepath.Dir(original))
+				continue
+			}
+		}
+		// Purged (or unknown, or the live asset already has its bytes).
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return syncDirectory(directory)
+}
+
+func (p *Processor) mediaPath(storageKey string) (string, error) {
+	if storageKey == "" || filepath.IsAbs(storageKey) {
+		return "", ErrUploadResourceInconsistent
+	}
+	candidate := filepath.Join(p.mediaRoot, filepath.FromSlash(storageKey))
+	relative, err := filepath.Rel(p.mediaRoot, candidate)
+	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
+		return "", ErrUploadResourceInconsistent
+	}
+	return candidate, nil
+}
+
+// MediaRoot is the absolute media directory.
+func (p *Processor) MediaRoot() string { return p.mediaRoot }

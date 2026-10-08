@@ -23,6 +23,7 @@ jobs:
       # tusd's lock-release interruption has an upstream data race, so these
       # tests are excluded from -race builds (go:build !race) and run here.
       - run: go test -count=1 -run 'TestStalledPatchDoesNotBlockResumeOrRestart|TestRestartInterruptsStalledPatch' ./internal/gateway
+      - run: node --check internal/webapp/static/app.js
       - run: go vet ./...
       - run: python3 -m unittest discover -s scripts/tests -v
       - name: Test alert rules and Alertmanager config with the pinned releases
