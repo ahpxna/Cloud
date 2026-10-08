@@ -20,7 +20,6 @@ networks:
 
 volumes:
   prometheus-data:
-  alertmanager-data:
   grafana-data:
 
 services:
@@ -195,7 +194,7 @@ services:
     volumes:
       # Staging, quarantine, and originals intentionally share one mount. This
       # is required for no-replace atomic commit semantics.
-      - ./.data/media:/srv/media
+      - ${PHOTO_MEDIA_HOST_ROOT:-./.data/media}:/srv/media
     depends_on:
       postgres:
         condition: service_healthy
@@ -354,7 +353,7 @@ services:
       PHOTO_MEDIA_ROOT: /srv/media
     networks: [database]
     volumes:
-      - ./.data/media:/srv/media:ro
+      - ${PHOTO_MEDIA_HOST_ROOT:-./.data/media}:/srv/media:ro
       - ${INTEGRITY_REPORT_DIR:-./.data/integrity-reports}:/reports
     depends_on:
       postgres:
@@ -385,11 +384,15 @@ services:
       PGPASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
       PHOTO_MEDIA_ROOT: /srv/media
       METRICS_ADDR: :9090
+      # Probed over the private database network so a gateway outage alerts.
+      GATEWAY_READY_URL: http://upload-gateway:8080/readyz
+      BACKUP_STATUS_FILE: /backup-status/last-success
     ports:
       - "127.0.0.1:${METRICS_DEV_PORT:-9091}:9090"
     networks: [database, observability]
     volumes:
-      - ./.data/media:/srv/media:ro
+      - ${PHOTO_MEDIA_HOST_ROOT:-./.data/media}:/srv/media:ro
+      - ${BACKUP_STATUS_DIR:-./.data/backup-status}:/backup-status:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -437,6 +440,9 @@ services:
   alertmanager:
     image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
     profiles: ["observability"]
+    # Runs as the operator so it can read the mode-600 SMTP password rendered by
+    # `make alert-email`; its state lives in a host directory that user owns.
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
@@ -444,8 +450,8 @@ services:
       - "127.0.0.1:${ALERTMANAGER_DEV_PORT:-9093}:9093"
     networks: [observability, notification-egress]
     volumes:
-      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-      - alertmanager-data:/alertmanager
+      - ${ALERTMANAGER_CONFIG_DIR:-./observability/alertmanager}:/etc/alertmanager:ro
+      - ./.data/alertmanager/data:/alertmanager
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

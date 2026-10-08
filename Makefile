@@ -45,7 +45,19 @@ edge-up: env ## Start gateway plus Cloudflare Tunnel after configuring its token
 
 .PHONY: observability-up
 observability-up: env ## Start private metrics, Prometheus, Alertmanager, and Grafana
+	mkdir -p .data/alertmanager/data .data/backup-status
 	docker compose --profile observability up -d --build --wait postgres metrics-exporter prometheus alertmanager grafana
+
+.PHONY: alert-email
+alert-email: env ## Render+validate Alertmanager email config from ALERT_* in .env (prompts for SMTP password)
+	bash scripts/configure-alert-email.sh $(if $(RESET_PASSWORD),--reset-password,)
+
+.PHONY: alert-test
+alert-test: ## Send a synthetic alert through Alertmanager (firing now, resolved ~5 min later)
+	docker compose --profile observability exec -T alertmanager amtool alert add PhotoCloudTestAlert \
+		severity=info --annotation=summary="Test alert from make alert-test; no action needed" \
+		--alertmanager.url=http://127.0.0.1:9093
+	@echo "Sent. Expect a FIRING email within ~1 minute and a RESOLVED email after ~5 minutes."
 
 .PHONY: create-user
 create-user: ## Create an invite-only family user in the running stack

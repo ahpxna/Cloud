@@ -25,6 +25,14 @@ jobs:
       - run: go test -count=1 -run 'TestStalledPatchDoesNotBlockResumeOrRestart|TestRestartInterruptsStalledPatch' ./internal/gateway
       - run: go vet ./...
       - run: python3 -m unittest discover -s scripts/tests -v
+      - name: Test alert rules and Alertmanager config with the pinned releases
+        run: |
+          set -euo pipefail
+          prometheus_image="$(sed -n 's/^PROMETHEUS_IMAGE=//p' .env.example)"
+          alertmanager_image="$(sed -n 's/^ALERTMANAGER_IMAGE=//p' .env.example)"
+          docker run --rm --entrypoint promtool -v "$PWD/observability/prometheus:/etc/prometheus:ro" "$prometheus_image" check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool -v "$PWD/observability/prometheus:/cfg:ro" -w /cfg "$prometheus_image" test rules rules_test.yml
+          docker run --rm --entrypoint amtool -v "$PWD/observability/alertmanager:/cfg:ro" "$alertmanager_image" check-config /cfg/alertmanager.yml
 
   postgres-integration:
     runs-on: ubuntu-24.04
@@ -35,6 +43,21 @@ jobs:
           go-version: "1.26.8"
           cache: true
       - run: make integration-test
+
+  terraform:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: infra/cloudflare
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+      - run: terraform fmt -check -diff
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
 
   ios-test:
     runs-on: macos-26

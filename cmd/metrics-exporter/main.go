@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +23,13 @@ import (
 type exporter struct {
 	pool      *pgxpool.Pool
 	mediaRoot string
+	// gatewayReadyURL, when set, is probed on every scrape so an outage of the
+	// upload gateway itself raises an alert, not only an exporter outage.
+	gatewayReadyURL string
+	// backupStatusFile, when set, holds the Unix time of the last backup that
+	// restic wrote and checked. The host-side backup script maintains it.
+	backupStatusFile string
+	httpClient       *http.Client
 }
 
 func main() {
@@ -41,7 +49,18 @@ func run() error {
 	if err := pool.Ping(ctx); err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	exp := &exporter{pool: pool, mediaRoot: envString("PHOTO_MEDIA_ROOT", "/srv/media")}
+	exp := &exporter{
+		pool:             pool,
+		mediaRoot:        envString("PHOTO_MEDIA_ROOT", "/srv/media"),
+		gatewayReadyURL:  os.Getenv("GATEWAY_READY_URL"),
+		backupStatusFile: os.Getenv("BACKUP_STATUS_FILE"),
+		httpClient: &http.Client{
+			Timeout: 2 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -133,6 +152,8 @@ func (e *exporter) snapshot(ctx context.Context) (string, error) {
 		{"photo_cloud_signed_manifests_total", "Recorded signed integrity manifests.", `SELECT count(*) FROM signed_manifests`},
 		{"photo_cloud_integrity_checks_total", "Append-only integrity check evidence rows.", `SELECT count(*) FROM asset_integrity_checks`},
 		{"photo_cloud_upload_events_last_sequence", "Largest append-only upload event sequence observed.", `SELECT COALESCE(max(sequence_id),0) FROM upload_events`},
+		{"photo_cloud_last_signed_manifest_timestamp_seconds", "Unix time of the newest signed integrity manifest, or 0.", `SELECT COALESCE(EXTRACT(EPOCH FROM max(generated_at)), 0)::bigint FROM signed_manifests`},
+		{"photo_cloud_last_integrity_check_timestamp_seconds", "Unix time of the newest full-byte integrity check, or 0.", `SELECT COALESCE(EXTRACT(EPOCH FROM max(checked_at)), 0)::bigint FROM asset_integrity_checks`},
 	}
 	for _, metric := range scalarQueries {
 		var value int64
@@ -183,7 +204,47 @@ func (e *exporter) snapshot(ctx context.Context) (string, error) {
 		return "", err
 	}
 	fmt.Fprintf(&out, "# HELP photo_cloud_verification_oldest_age_seconds Age of the oldest verification/commit backlog item.\n# TYPE photo_cloud_verification_oldest_age_seconds gauge\nphoto_cloud_verification_oldest_age_seconds %s\n", strconv.FormatFloat(oldestSeconds, 'f', 3, 64))
+
+	if e.gatewayReadyURL != "" {
+		ready := 0
+		if e.gatewayReady(ctx) {
+			ready = 1
+		}
+		fmt.Fprintf(&out, "# HELP photo_cloud_gateway_ready Whether the upload gateway answered /readyz with 200 on this scrape.\n# TYPE photo_cloud_gateway_ready gauge\nphoto_cloud_gateway_ready %d\n", ready)
+	}
+	if e.backupStatusFile != "" {
+		fmt.Fprintf(&out, "# HELP photo_cloud_backup_last_success_timestamp_seconds Unix time of the last checked encrypted backup, or 0 if none is recorded.\n# TYPE photo_cloud_backup_last_success_timestamp_seconds gauge\nphoto_cloud_backup_last_success_timestamp_seconds %d\n", lastBackupSuccess(e.backupStatusFile))
+	}
 	return out.String(), nil
+}
+
+func (e *exporter) gatewayReady(ctx context.Context) bool {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, e.gatewayReadyURL, nil)
+	if err != nil {
+		return false
+	}
+	response, err := e.httpClient.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	return response.StatusCode == http.StatusOK
+}
+
+// lastBackupSuccess reads the status file written by scripts/backup-restic.sh.
+// A missing, unreadable or malformed file reports 0 so the staleness alert
+// fires instead of the metric silently disappearing.
+func lastBackupSuccess(path string) int64 {
+	contents, err := os.ReadFile(path)
+	if err != nil || len(contents) > 64 {
+		return 0
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(contents)), 10, 64)
+	if err != nil || value < 0 {
+		return 0
+	}
+	return value
 }
 
 func prometheusQuote(value string) string {
