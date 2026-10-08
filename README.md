@@ -37,6 +37,15 @@ The accepted direction is:
 For free private family access (Tailscale + web app + iOS Shortcut), see
 [tailnet-family](docs/runbooks/tailnet-family.md).
 
+The web app at `/app/` is modelled on the iPhone Photos app: a timeline by date
+taken with sorting, filters and search; multi-select; albums in folders, smart
+albums, places and "on this day"; albums shared between family accounts with
+likes, comments and contributions; favourites, hidden items and a 30-day
+Recently Deleted; Live Photos; lossless cutting of part of a video; saving to
+the Photos app and ZIP downloads; and uploads you can preview and stop. Capture
+metadata comes from a fuzzed, pure-Go EXIF/HEIF/QuickTime reader
+(`internal/media`); nothing is ever re-encoded.
+
 Read [the architecture](docs/architecture.md), [MVP API contract](docs/api.md),
 [integrity manifest format](docs/integrity-manifest-v1.md), [iOS scaffold
 notes](ios/README.md), [operator runbooks](docs/runbooks/), and

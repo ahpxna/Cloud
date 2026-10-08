@@ -142,14 +142,36 @@ match and the client must not delete its source copy.
 
 ## Library viewing
 
-`GET /v1/assets?limit=50&cursor=<opaque>` returns only the caller's verified,
-non-deleted assets in a stable newest-first order. The response contains each
-original's authenticated URL.
+`GET /v1/assets` lists what the caller may see, with an opaque `next_cursor`:
+
+| Query | Meaning |
+| --- | --- |
+| `view` | `library` (default), `photos`, `videos`, `live`, `selfies`, `screenshots`, `panoramas`, `favorites`, `recent`, `hidden`, `trash`, `on_this_day` (with `month`, `day`, `tzoffset` minutes) |
+| `album`, `place`, `ids` | an album's items, a place cell's items, or up to 200 comma-separated IDs (own items in any state, or items in albums shared with the caller) |
+| `sort` | `taken_desc` (default), `taken_asc`, `added_desc`, `size_desc`, `name_asc`, `favorites_first`; Recently Deleted is ordered by deletion time and an album by its own sort order |
+| `media` | `photo` or `video` |
+| `q` | search file name, caption, place name, camera model or date (`2026-09`) |
+| `limit`, `cursor`, `tickets=1` | page size 1–100, the previous page's `next_cursor`, and view tickets |
+
+The timeline is ordered by **date taken** (`taken_at`: the capture time read
+from EXIF/QuickTime metadata, or the upload time when the file has none).
+Library views exclude hidden and binned items. The motion video of a Live Photo
+is attached to its still as `live_video` instead of being listed separately
+(paired by Apple's content identifier). Each item carries capture metadata
+(`captured_at`, `width`, `height`, `duration_ms`, `subtype`, `latitude`,
+`longitude`, `place_cell`, `place_name`), curation state (`favorite`, `hidden`,
+`trashed_at`, `purge_at`, `caption`), ownership (`owner_id`, `mine`,
+`owner_name`) and, in a shared album, `added_by_name`, `like_count`, `liked`,
+`comment_count`.
+
+`GET /v1/assets/{id}?tickets=1` returns one item with camera `details` (make,
+model, lens, aperture, exposure, ISO, focal length) and the albums it is in.
+`PATCH /v1/assets/{id}` sets `caption`, `favorite` or `hidden` (owner only).
 
 `GET` or `HEAD /v1/assets/{asset_id}/original` supports HTTP byte ranges for
-video seeking and large original downloads. The gateway checks owner ID before
-opening the file and returns `404` to a different account. The original's
-storage path is never exposed in the API.
+video seeking and large original downloads. Only the owner, or a member of an
+album the item is shown in, can open it; everyone else gets `404`. The
+original's storage path is never exposed in the API.
 
 `GET /v1/assets?tickets=1` also returns a `view_url` per asset: the original
 URL plus a 10-minute view ticket scoped to that one asset and to the caller's
@@ -158,6 +180,81 @@ device session. Browser `<img>`/`<video>` elements, which cannot send an
 asset, or act as an access or upload token, and it stops working when the
 device session is revoked. Originals are served byte-for-byte; nothing is
 resized, transcoded or recompressed.
+
+### Recently Deleted
+
+`POST /v1/assets/batch` `{"ids": [...], "action": "favorite" | "unfavorite" |
+"hide" | "unhide" | "trash" | "restore" | "purge"}` changes up to 1000 of the
+caller's own items (the other half of a Live Photo is included) and returns
+`{"changed": n}`. `trash` moves items to Recently Deleted; they disappear from
+the library and albums and are **permanently deleted 30 days later** by the
+gateway (hourly). `purge` deletes binned items now; `POST
+/v1/assets/trash/empty` and `POST /v1/assets/trash/restore` act on the whole
+bin. Uploading a binned photo again restores it.
+
+A purge tombstones the asset row (`deleted_at`), removes it from every album,
+records an append-only `asset_events` entry, and removes the original and its
+preview. The original is first renamed into `.purging/` inside the database
+transaction and deleted only after it commits; on startup the gateway deletes
+leftovers of committed purges and puts back bytes of purges that never
+committed. Purges and upload commits of the same content are serialised, so a
+purge can never delete bytes a concurrent re-upload just committed. Older
+restic snapshots keep purged files until they are pruned.
+
+### Cutting a video and downloading several items
+
+`GET /v1/assets/{id}/clip?start=3.2&end=9.7` (access token, or the item's
+original view ticket) streams part of a QuickTime/MP4 video. The cut is
+lossless: samples from the keyframe at or before `start` are copied unchanged
+and an edit list makes playback begin exactly at `start`, so no frame is
+re-encoded and the original is untouched. The response has an exact
+`Content-Length` and the original's media type. `422 clip_unsupported` is
+returned for layouts the cutter does not handle (for example fragmented MP4).
+
+`POST /v1/assets/download` `{"ids": [...]}` (up to 1000) prepares a ZIP and
+returns `{"url", "count", "total_bytes"}`; `GET` that URL (it carries a
+30-minute download ticket bound to the caller's device session) streams an
+uncompressed ZIP whose entries are the originals byte-for-byte, Live Photo
+videos included.
+
+### Albums, folders and sharing
+
+| Request | Effect |
+| --- | --- |
+| `GET /v1/albums` | own and shared-with-me albums (cover, count, owner, `shared`, `can_add`) plus own folders |
+| `POST /v1/albums` `{"name", "folder_id"?, "asset_ids"?, "member_ids"?}` | create, optionally with items and shared with family members |
+| `GET` / `PATCH` / `DELETE /v1/albums/{id}` | details with members; owner changes `name`, `folder_id`, `cover_asset_id`, `sort_order` (`newest_first`, `oldest_first`, `added`), `members_can_add`; delete keeps the photos |
+| `POST /v1/albums/{id}/assets` and `/assets/remove` `{"ids"}` | add own items (owner, or members when allowed); the owner removes any item, members their own |
+| `PUT /v1/albums/{id}/members` `{"user_ids"}` | owner sets who the album is shared with; removing someone also removes the photos they added |
+| `POST /v1/albums/{id}/leave` | a member leaves (their photos leave with them) |
+| `POST /v1/albums/{id}/likes` `{"asset_id", "liked"}` | like or unlike an item |
+| `GET` / `POST /v1/albums/{id}/comments`, `DELETE /v1/albums/{id}/comments/{comment_id}` | read and write comments; authors and the album owner can delete |
+| `GET /v1/activity` | what others added or commented in shared albums in the last 90 days |
+| `POST /v1/album-folders` `{"name", "parent_id"?}`, `PATCH` / `DELETE /v1/album-folders/{id}` | folders nest up to 5 levels; deleting one moves its contents up |
+| `GET /v1/people`, `PUT /v1/people/me` `{"display_name"}` | family members on this server, and the caller's display name |
+
+An album item is a reference: nobody gets a copy. The database enforces that
+whoever adds an item owns it. Hidden or binned items are not shown to anyone.
+
+### Places and summary
+
+`GET /v1/places` groups the caller's located photos into ~5 km grid cells
+(`cell`, average position, count, cover). `PUT /v1/places/{cell}`
+`{"name": "Nhà bà nội"}` names a cell; `DELETE` removes the name. No location
+ever leaves the server: there is no online reverse geocoding.
+
+`GET /v1/library/summary` returns smart-album counts and covers, storage usage
+(photos, videos, Recently Deleted, quota, free disk) and the available sorts.
+
+### Capture metadata
+
+The gateway reads metadata in the background after each commit (and once for
+existing assets): EXIF/maker notes from JPEG, HEIC/HEIF/AVIF, PNG and TIFF/DNG,
+and `mvhd`/`tkhd`/Apple `mdta` keys and `udta` atoms from QuickTime/MP4. Only
+headers and metadata boxes are read, with bounded reads; the parser is fuzzed.
+`PHOTO_TIMEZONE` (IANA name, default the container's zone) interprets capture
+times written without an offset. JPEG and PNG previews are rendered on the
+server; HEIC and video previews still come from the owner's browser.
 
 ## Thumbnails
 
@@ -175,8 +272,20 @@ deleted and regenerated at any time.
 ## Upload progress
 
 `GET /v1/upload-sessions?limit=50` (access token) lists the caller's most
-recently updated uploads with `state`, `expected_size`, `received_size` and
-timestamps. The web app's *Tải lên* page polls it.
+recently updated uploads with `state`, `expected_size`, `received_size`
+(bytes on disk, also for single-request uploads), timestamps and `asset_id`.
+For an unfinished upload it adds what the bytes received so far reveal:
+`captured_at`, `duration_ms`, `width`, `height`, `camera`, a `preview_url`
+(the first ≤32 MiB, with a 10-minute upload-preview ticket, enough for a
+video's first frame or the top of a photo), a `thumbnail_url` when the JPEG
+embeds an EXIF preview, `same_as_asset_id` when an item with the same capture
+time (or name) is already backed up, and `cancellable`.
+
+`DELETE /v1/upload-sessions/{id}` stops an unfinished upload: a request still
+sending it is interrupted through tusd's lock-release protocol, the partial
+bytes are deleted, and the session becomes `expired` with
+`error_code: "cancelled"`. Sending the same file again restarts it. An upload
+whose bytes all arrived returns `409 upload_already_received`.
 
 ## Single-request uploads (iOS Shortcut and web app)
 
@@ -216,22 +325,31 @@ autofills it in Safari. Confirming or disabling MFA signs out every device.
 
 ## Web app
 
-`/app/` serves a same-origin web app (Vietnamese UI) for sign-in with MFA,
-browsing and downloading originals, Live Photo playback (a still and a video
-with the same base name uploaded within 10 minutes are shown as one item),
-uploads with progress, and upload-key management. It is served with
-`script-src 'self'` and no inline code. Credentials live in the browser's
-local storage, which is acceptable only because the app is reachable solely
-inside the tailnet (or behind Cloudflare) with that strict CSP.
+`/app/` serves a same-origin web app (Vietnamese UI) modelled on the iPhone
+Photos app: a timeline grouped by day with sort, filter, search and grid size;
+multi-select (tap, drag across tiles, per-day and select-all); a viewer with
+swipe, pinch and double-tap zoom, press-and-hold Live Photos, slideshow, info
+panel with camera data, captions and map link; an iPhone-style trimmer (yellow
+handles, filmstrip) to save part of a video; albums in nested folders, smart
+albums, places, memories ("Ngày này năm xưa"), Recently Deleted and Hidden;
+shared albums with likes, comments and an activity feed; saving to the Photos
+app through the share sheet and ZIP downloads; uploads with drag-and-drop,
+folder upload, preview and ✕ to stop a stuck upload; display name, storage
+usage, Shortcut keys and two-step sign-in. It is served with `script-src
+'self'` and no inline code. Credentials live in the browser's local storage,
+which is acceptable only because the app is reachable solely inside the
+tailnet (or behind Cloudflare) with that strict CSP.
 
 ## Current omissions
 
-Thumbnails, EXIF extraction, destructive deletion/retention semantics, external
-alert delivery, and physical-device iOS acceptance remain unimplemented or
-unproven. MFA source and iOS flows are implemented, but a real enrollment,
-recovery-code custody test, and access-review record remain deployment evidence. They remain public launch blockers where marked P0. Scheduled
-full-byte scrubs/signed manifests, encrypted-restic backup tooling, isolated
-restore verification, audit export, private metrics/alerts, and synthetic probes
-now exist as operator source, but they do not count as deployed evidence until
-run against the real host/provider/public path. See `docs/runbooks/` and
+Face recognition, memories beyond "on this day", photo editing and online
+reverse geocoding are intentionally out of scope. External alert delivery and
+physical-device iOS acceptance remain unproven. MFA source and iOS flows are
+implemented, but a real enrollment, recovery-code custody test, and
+access-review record remain deployment evidence. They remain public launch
+blockers where marked P0. Scheduled full-byte scrubs/signed manifests,
+encrypted-restic backup tooling, isolated restore verification, audit export,
+private metrics/alerts, and synthetic probes now exist as operator source, but
+they do not count as deployed evidence until run against the real
+host/provider/public path. See `docs/runbooks/` and
 `docs/audits/2026-08-24-proposal-implementation.md`.
