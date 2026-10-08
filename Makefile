@@ -55,7 +55,7 @@ alert-email: env ## Render+validate Alertmanager email config from ALERT_* in .e
 .PHONY: alert-test
 alert-test: ## Send a synthetic alert through Alertmanager (firing now, resolved ~5 min later)
 	docker compose --profile observability exec -T alertmanager amtool alert add PhotoCloudTestAlert \
-		severity=info --annotation=summary="Test alert from make alert-test; no action needed" \
+		'severity="info"' --annotation='summary="Test alert from make alert-test; no action needed"' \
 		--alertmanager.url=http://127.0.0.1:9093
 	@echo "Sent. Expect a FIRING email within ~1 minute and a RESOLVED email after ~5 minutes."
 
