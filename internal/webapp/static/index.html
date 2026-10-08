@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#2962ff">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Ảnh nhà">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -15,13 +16,15 @@
   <script src="app.js" defer></script>
 </head>
 <body>
-  <header class="topbar">
-    <h1>Ảnh gia đình</h1>
-    <span id="offline" class="badge warn" hidden>Mất kết nối</span>
-  </header>
+  <span id="offline" class="offline" hidden>Mất kết nối</span>
 
   <main>
+    <!-- ============================================================ login -->
     <section id="view-login" class="view" hidden>
+      <div class="login-brand">
+        <img src="icon-192.png" alt="" class="login-icon">
+        <h1>Ảnh gia đình</h1>
+      </div>
       <form id="login-form" class="card" autocomplete="on">
         <h2>Đăng nhập</h2>
         <label>Email
@@ -44,20 +47,104 @@
       </form>
     </section>
 
+    <!-- ========================================================== library -->
     <section id="view-library" class="view" hidden>
-      <p id="library-empty" class="muted" hidden>Chưa có ảnh nào được sao lưu.</p>
-      <div id="grid" class="grid"></div>
-      <button id="load-more" class="secondary" hidden>Xem thêm</button>
+      <div class="view-head">
+        <div class="head-text">
+          <h1>Thư viện</h1>
+          <p id="library-count" class="muted small"></p>
+        </div>
+        <div class="head-actions">
+          <button id="library-search-toggle" class="icon-button" aria-label="Tìm kiếm">⌕</button>
+          <button id="library-sort" class="icon-button" aria-label="Sắp xếp và lọc">⇅</button>
+          <button id="library-select" class="pill">Chọn</button>
+        </div>
+      </div>
+      <div id="library-search-bar" class="search-bar" hidden>
+        <input id="library-search" type="search" placeholder="Tên file, chú thích, địa điểm, ngày (2026-09)…" autocomplete="off">
+      </div>
+      <p id="library-filter-note" class="filter-note" hidden></p>
+      <div id="library-grid" class="timeline"></div>
+      <p id="library-empty" class="empty" hidden>Chưa có ảnh nào. Gửi ảnh từ nút Chia sẻ trong app Ảnh, hoặc mở tab Tải lên.</p>
       <p id="library-error" class="error" role="alert"></p>
+      <div id="library-more" class="load-more" hidden>Đang tải thêm…</div>
     </section>
 
+    <!-- ======================================== album / folder / smart view -->
+    <section id="view-collection" class="view" hidden>
+      <div class="view-head">
+        <button id="collection-back" class="back">‹ Album</button>
+        <div class="head-actions">
+          <button id="collection-add" class="icon-button" aria-label="Thêm ảnh" hidden>＋</button>
+          <button id="collection-select" class="pill" hidden>Chọn</button>
+          <button id="collection-menu" class="icon-button" aria-label="Tuỳ chọn" hidden>⋯</button>
+        </div>
+      </div>
+      <h1 id="collection-title" class="collection-title"></h1>
+      <p id="collection-subtitle" class="muted small"></p>
+      <div id="collection-banner" class="banner" hidden></div>
+      <div id="collection-folders" class="album-grid"></div>
+      <div id="collection-grid" class="timeline"></div>
+      <p id="collection-empty" class="empty" hidden></p>
+      <p id="collection-error" class="error" role="alert"></p>
+      <div id="collection-more" class="load-more" hidden>Đang tải thêm…</div>
+    </section>
+
+    <!-- =========================================================== albums -->
+    <section id="view-albums" class="view" hidden>
+      <div class="view-head">
+        <div class="head-text"><h1>Album</h1></div>
+        <div class="head-actions">
+          <button id="albums-new" class="icon-button" aria-label="Tạo album hoặc thư mục">＋</button>
+        </div>
+      </div>
+      <h2 class="section-title">Album của tôi</h2>
+      <div id="albums-mine" class="album-grid"></div>
+      <div id="albums-memories-section" hidden>
+        <h2 class="section-title">Kỷ niệm</h2>
+        <div id="albums-memories" class="memory-strip"></div>
+      </div>
+      <div id="albums-places-section" hidden>
+        <h2 class="section-title">Địa điểm</h2>
+        <div id="albums-places" class="album-grid"></div>
+      </div>
+      <h2 class="section-title">Loại phương tiện</h2>
+      <ul id="albums-media" class="rows"></ul>
+      <h2 class="section-title">Tiện ích</h2>
+      <ul id="albums-utilities" class="rows"></ul>
+      <p id="albums-error" class="error" role="alert"></p>
+    </section>
+
+    <!-- =========================================================== shared -->
+    <section id="view-shared" class="view" hidden>
+      <div class="view-head">
+        <div class="head-text"><h1>Chia sẻ</h1></div>
+        <div class="head-actions">
+          <button id="shared-new" class="icon-button" aria-label="Album chia sẻ mới">＋</button>
+        </div>
+      </div>
+      <p class="muted small">Album chia sẻ cho người trong nhà cùng xem, thả tim, bình luận và thêm ảnh của mình.</p>
+      <h2 class="section-title">Album chia sẻ</h2>
+      <div id="shared-albums" class="album-grid"></div>
+      <p id="shared-empty" class="empty" hidden>Chưa có album chia sẻ nào. Bấm ＋ để tạo và mời người trong nhà.</p>
+      <h2 class="section-title">Hoạt động</h2>
+      <ul id="shared-activity" class="activity"></ul>
+      <p id="shared-error" class="error" role="alert"></p>
+    </section>
+
+    <!-- ========================================================== uploads -->
     <section id="view-uploads" class="view" hidden>
-      <div class="card">
+      <div class="view-head"><div class="head-text"><h1>Tải lên</h1></div></div>
+      <div id="drop-zone" class="card drop-zone">
         <label class="primary file-button">Chọn ảnh hoặc video để tải lên
           <input id="file-input" type="file" accept="image/heic,image/heif,image/*,video/quicktime,video/*" multiple>
         </label>
-        <p class="muted">Giữ ảnh trong máy cho tới khi thấy dấu "Đã sao lưu ✓".</p>
-        <p class="muted">Lưu ý: khi chọn <b>video</b> từ Thư viện ảnh qua trình duyệt, iPhone có thể tự nén video. Muốn giữ bản gốc, hãy gửi bằng Phím tắt.</p>
+        <label id="folder-button" class="secondary file-button" hidden>Tải cả thư mục (máy tính)
+          <input id="folder-input" type="file" multiple webkitdirectory>
+        </label>
+        <p id="drop-hint" class="muted small" hidden>Hoặc kéo thả ảnh, video vào đây.</p>
+        <p class="muted small">Giữ ảnh trong máy cho tới khi thấy "Đã sao lưu ✓". Ảnh gửi lên giữ nguyên bản gốc, không bị nén.</p>
+        <p class="muted small">Lưu ý: khi chọn <b>video</b> từ Thư viện ảnh qua trình duyệt, iPhone có thể tự nén video. Muốn giữ bản gốc, hãy gửi bằng Phím tắt.</p>
       </div>
       <ul id="local-uploads" class="list"></ul>
       <h2 class="section-title">Gần đây</h2>
@@ -65,7 +152,24 @@
       <p id="uploads-error" class="error" role="alert"></p>
     </section>
 
+    <!-- ========================================================= settings -->
     <section id="view-settings" class="view" hidden>
+      <div class="view-head"><div class="head-text"><h1>Cài đặt</h1></div></div>
+      <div class="card">
+        <h2>Tên của bạn</h2>
+        <p class="muted small">Người trong nhà thấy tên này khi bạn chia sẻ album, thả tim hoặc bình luận.</p>
+        <label>Tên hiển thị
+          <input id="display-name" maxlength="60" autocomplete="nickname">
+        </label>
+        <button id="save-name" class="secondary">Lưu tên</button>
+        <p id="name-error" class="error" role="alert"></p>
+      </div>
+      <div class="card">
+        <h2>Dung lượng</h2>
+        <div id="usage-bar" class="usage-bar"></div>
+        <ul id="usage-list" class="usage-list"></ul>
+        <p id="usage-error" class="error" role="alert"></p>
+      </div>
       <div class="card">
         <h2>Gửi ảnh từ nút Chia sẻ</h2>
         <p>Tạo một khoá cho Phím tắt trên điện thoại này. Khoá chỉ dùng để gửi ảnh lên, không xem được thư viện.</p>
@@ -165,21 +269,78 @@
     </section>
   </main>
 
-  <div id="viewer" class="viewer" hidden>
-    <div class="viewer-bar">
-      <button id="viewer-close" class="secondary">Đóng</button>
-      <span id="viewer-name" class="viewer-name"></span>
-      <button id="viewer-live" class="secondary" hidden>▶ Live</button>
-      <a id="viewer-download" class="secondary button" download>Tải về</a>
-      <a id="viewer-download-live" class="secondary button" download hidden>Tải video Live</a>
+  <!-- ============================================== multi-select actions -->
+  <div id="selectbar" class="selectbar" hidden>
+    <div class="selectbar-head">
+      <button id="select-all" class="text-button">Chọn tất cả</button>
+      <span id="select-count" class="select-count">Chọn mục</span>
+      <button id="select-done" class="text-button strong">Xong</button>
     </div>
-    <div id="viewer-body" class="viewer-body"></div>
+    <div id="select-actions" class="selectbar-actions"></div>
   </div>
 
+  <!-- =========================================================== viewer -->
+  <div id="viewer" class="viewer" hidden>
+    <div class="viewer-top">
+      <button id="viewer-close" class="viewer-icon" aria-label="Đóng">✕</button>
+      <div class="viewer-heading">
+        <span id="viewer-date" class="viewer-date"></span>
+        <span id="viewer-place" class="viewer-place"></span>
+      </div>
+      <button id="viewer-menu" class="viewer-icon" aria-label="Tuỳ chọn">⋯</button>
+    </div>
+    <div id="viewer-stage" class="viewer-stage"></div>
+    <button id="viewer-prev" class="viewer-nav prev" aria-label="Ảnh trước">‹</button>
+    <button id="viewer-next" class="viewer-nav next" aria-label="Ảnh sau">›</button>
+    <button id="viewer-live" class="live-badge" hidden>◎ LIVE</button>
+    <p id="viewer-caption" class="viewer-caption" hidden></p>
+
+    <div id="trimmer" class="trimmer" hidden>
+      <div class="trim-times">
+        <span id="trim-start-label">0:00</span>
+        <span id="trim-length" class="trim-length"></span>
+        <span id="trim-end-label">0:00</span>
+      </div>
+      <div id="trim-track" class="trim-track">
+        <div id="trim-strip" class="trim-strip"></div>
+        <div id="trim-shade-left" class="trim-shade"></div>
+        <div id="trim-shade-right" class="trim-shade"></div>
+        <div id="trim-window" class="trim-window">
+          <div id="trim-handle-start" class="trim-handle start" role="slider" aria-label="Điểm bắt đầu" tabindex="0">‹</div>
+          <div id="trim-handle-end" class="trim-handle end" role="slider" aria-label="Điểm kết thúc" tabindex="0">›</div>
+        </div>
+        <div id="trim-playhead" class="trim-playhead"></div>
+      </div>
+      <div class="trim-buttons">
+        <button id="trim-cancel" class="viewer-text">Huỷ</button>
+        <button id="trim-play" class="viewer-round" aria-label="Phát đoạn đã chọn">▶</button>
+        <button id="trim-save" class="viewer-text strong">Lưu đoạn</button>
+      </div>
+      <p id="trim-status" class="trim-status" role="status"></p>
+    </div>
+
+    <div id="viewer-actions" class="viewer-actions"></div>
+  </div>
+
+  <!-- ============================================================ sheet -->
+  <div id="sheet-backdrop" class="sheet-backdrop" hidden>
+    <div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <div class="sheet-head">
+        <h2 id="sheet-title"></h2>
+        <button id="sheet-close" class="sheet-close" aria-label="Đóng">✕</button>
+      </div>
+      <div id="sheet-body" class="sheet-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
   <nav id="tabs" class="tabs" hidden>
-    <button data-tab="library" class="tab">Thư viện</button>
-    <button data-tab="uploads" class="tab">Tải lên</button>
-    <button data-tab="settings" class="tab">Cài đặt</button>
+    <button data-tab="library" class="tab"><span class="tab-icon">▦</span><span>Thư viện</span></button>
+    <button data-tab="albums" class="tab"><span class="tab-icon">❏</span><span>Album</span></button>
+    <button data-tab="shared" class="tab"><span class="tab-icon">♡</span><span>Chia sẻ</span><span id="shared-badge" class="tab-badge" hidden></span></button>
+    <button data-tab="uploads" class="tab"><span class="tab-icon">⇪</span><span>Tải lên</span></button>
+    <button data-tab="settings" class="tab"><span class="tab-icon">⚙︎</span><span>Cài đặt</span></button>
   </nav>
 </body>
 </html>
