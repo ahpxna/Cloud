@@ -40,6 +40,7 @@ type API struct {
 	mfaRepo        MFARepository
 	mfaCipher      *mfaCipher
 	refreshCipher  *mfaCipher
+	uploadKeys     UploadKeyRepository
 }
 
 type SecurityConfig struct {
@@ -133,6 +134,7 @@ func newAPI(repository Repository, tokens *auth.AccessTokenManager, logger *slog
 		refreshCipher: refreshCipher,
 	}
 	api.durableLimiter, _ = repository.(LoginThrottleRepository)
+	api.uploadKeys, _ = repository.(UploadKeyRepository)
 	return api, nil
 }
 
@@ -197,6 +199,12 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.listSessions(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/auth/sessions/") && r.Method == http.MethodDelete:
 		api.revokeSession(w, r, strings.TrimPrefix(r.URL.Path, "/v1/auth/sessions/"))
+	case r.URL.Path == "/v1/auth/upload-keys" && r.Method == http.MethodGet:
+		api.listUploadKeys(w, r)
+	case r.URL.Path == "/v1/auth/upload-keys" && r.Method == http.MethodPost:
+		api.createUploadKey(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/auth/upload-keys/") && r.Method == http.MethodDelete:
+		api.revokeUploadKey(w, r, strings.TrimPrefix(r.URL.Path, "/v1/auth/upload-keys/"))
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
 		accountProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")

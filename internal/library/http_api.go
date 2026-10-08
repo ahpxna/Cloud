@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,16 @@ type API struct {
 	mediaRoot        string
 	writeIdleTimeout time.Duration
 	writeMaxDuration time.Duration
+	viewTickets      *auth.AccessTokenManager
+}
+
+// viewTicketTTL bounds how long a listed view_url keeps working.
+const viewTicketTTL = 10 * time.Minute
+
+// EnableViewTickets lets GET /v1/assets?tickets=1 attach a short-lived,
+// asset-scoped view_url to each item for browser <img>/<video> elements.
+func (api *API) EnableViewTickets(tokens *auth.AccessTokenManager) {
+	api.viewTickets = tokens
 }
 
 func NewAPI(repository upload.AssetRepository, mediaRoot string) (*API, error) {
@@ -60,6 +71,7 @@ type assetResponse struct {
 	ContentSHA256    string    `json:"content_sha256"`
 	CreatedAt        time.Time `json:"created_at"`
 	OriginalURL      string    `json:"original_url"`
+	ViewURL          string    `json:"view_url,omitempty"`
 }
 
 type listResponse struct {
@@ -113,9 +125,20 @@ func (api *API) list(w http.ResponseWriter, r *http.Request, principal auth.Prin
 		return
 	}
 
+	withTickets := r.URL.Query().Get("tickets") == "1" && api.viewTickets != nil
+	now := time.Now()
 	response := listResponse{Assets: make([]assetResponse, 0, min(limit, len(assets)))}
 	for _, asset := range assets[:min(limit, len(assets))] {
-		response.Assets = append(response.Assets, assetForResponse(asset))
+		item := assetForResponse(asset)
+		if withTickets {
+			ticket, err := api.viewTickets.IssueView(principal, asset.ID, now, viewTicketTTL)
+			if err != nil {
+				writeProblem(w, http.StatusInternalServerError, "view_ticket_failed", "could not list assets")
+				return
+			}
+			item.ViewURL = item.OriginalURL + "?ticket=" + url.QueryEscape(ticket)
+		}
+		response.Assets = append(response.Assets, item)
 	}
 	if len(assets) > limit {
 		last := assets[limit-1]

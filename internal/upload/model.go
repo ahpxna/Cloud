@@ -109,6 +109,24 @@ type Repository interface {
 	ResetForRetry(context.Context, string, string) (Session, error)
 }
 
+// SessionSummary is the owner's progress view of one upload.
+type SessionSummary struct {
+	ID               string    `json:"id"`
+	OriginalFilename string    `json:"original_filename"`
+	MediaType        string    `json:"media_type"`
+	State            State     `json:"state"`
+	ExpectedSize     int64     `json:"expected_size"`
+	ReceivedSize     int64     `json:"received_size"`
+	ErrorCode        string    `json:"error_code,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// SessionLister lists an owner's most recently updated uploads.
+type SessionLister interface {
+	ListSessions(ctx context.Context, ownerID string, limit int) ([]SessionSummary, error)
+}
+
 // AssetRepository is deliberately read-only. Asset visibility is granted only
 // after Repository.MarkAvailable completes the verified commit state machine.
 type AssetRepository interface {

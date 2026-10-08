@@ -15,6 +15,7 @@ import (
 	"family-photo-cloud/internal/auth"
 	"family-photo-cloud/internal/library"
 	"family-photo-cloud/internal/upload"
+	"family-photo-cloud/internal/webapp"
 
 	"github.com/tus/tusd/v2/pkg/filelocker"
 	"github.com/tus/tusd/v2/pkg/filestore"
@@ -44,7 +45,10 @@ type Config struct {
 	GlobalLoginBurst          int
 	MFAEncryptionKey          []byte
 	RefreshRetryEncryptionKey []byte
-	Logger                    *slog.Logger
+	// UploadKeys verifies Shortcut upload keys; when nil, Accounts is used if
+	// it implements UploadKeyVerifier.
+	UploadKeys UploadKeyVerifier
+	Logger     *slog.Logger
 }
 
 type Server struct {
@@ -369,16 +373,43 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	libraryAPI.EnableViewTickets(config.Tokens)
 	mux.Handle("/v1/assets", authenticate(config.Tokens, config.Accounts, libraryAPI))
-	mux.Handle("/v1/assets/", authenticate(config.Tokens, config.Accounts, libraryAPI))
+	mux.Handle("/v1/assets/", authenticateLibrary(config.Tokens, config.Accounts, libraryAPI))
 	mux.Handle("/v1/upload-sessions", authenticate(config.Tokens, config.Accounts, uploadAPI))
 	mux.Handle("/v1/upload-sessions/", authenticate(config.Tokens, config.Accounts, uploadAPI))
 
 	strippedTus := http.StripPrefix(strings.TrimSuffix(tusBasePath, "/"), tusHandler)
 	limiter := newPatchLimiter(config.MaxConcurrentPatches, config.MaxPatchesPerUser)
+	uploadKeys := config.UploadKeys
+	if uploadKeys == nil {
+		uploadKeys, _ = config.Accounts.(UploadKeyVerifier)
+	}
+	mux.Handle(directUploadPath, &directUploader{
+		repository:          config.Repository,
+		processor:           processor,
+		store:               store,
+		locker:              locker,
+		limiter:             limiter,
+		tokens:              config.Tokens,
+		accounts:            config.Accounts,
+		keys:                uploadKeys,
+		maxBytes:            config.MaxUploadBytes,
+		availableBytes:      upload.AvailableBytes(config.MediaRoot),
+		minimumFreeBytes:    config.MinimumFreeBytes,
+		maxActiveSessions:   config.MaxActiveUploadSessions,
+		createWindow:        config.UploadSessionCreateWindow,
+		maxCreatesPerWindow: config.MaxUploadCreatesPerWindow,
+		wake:                wake,
+		logger:              config.Logger,
+		readIdleTimeout:     2 * time.Minute,
+	})
 	protectedTus := authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus)
 	mux.Handle(strings.TrimSuffix(tusBasePath, "/"), protectedTus)
 	mux.Handle(tusBasePath, protectedTus)
+	mux.Handle(webapp.BasePath, webapp.Handler())
+	mux.Handle(strings.TrimSuffix(webapp.BasePath, "/"), webapp.Handler())
+	mux.Handle("/", webapp.RedirectRoot())
 	server.handler = securityHeaders(mux)
 	return server, nil
 }
@@ -466,6 +497,39 @@ func authenticate(tokens *auth.AccessTokenManager, accounts account.Repository, 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := authenticateHeader(tokens, r.Header.Get("Authorization"))
 		if !ok {
+			writeAuthError(w)
+			return
+		}
+		if accounts != nil {
+			active, err := accounts.SessionActive(r.Context(), principal.UserID, principal.SessionID)
+			if err != nil || !active {
+				writeAuthError(w)
+				return
+			}
+		}
+		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
+	})
+}
+
+// authenticateLibrary also accepts an asset-scoped view ticket in the query
+// string, but only for GET/HEAD of that asset's original and only while the
+// issuing device session is still active.
+func authenticateLibrary(tokens *auth.AccessTokenManager, accounts account.Repository, next http.Handler) http.Handler {
+	withHeader := authenticate(tokens, accounts, next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ticket := r.URL.Query().Get("ticket")
+		if r.Header.Get("Authorization") != "" || ticket == "" ||
+			(r.Method != http.MethodGet && r.Method != http.MethodHead) {
+			withHeader.ServeHTTP(w, r)
+			return
+		}
+		assetID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/assets/"), "/original")
+		if assetID == "" || strings.Contains(assetID, "/") || !strings.HasSuffix(r.URL.Path, "/original") {
+			writeAuthError(w)
+			return
+		}
+		principal, err := tokens.VerifyView(ticket, assetID)
+		if err != nil {
 			writeAuthError(w)
 			return
 		}

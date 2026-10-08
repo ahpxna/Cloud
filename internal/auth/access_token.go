@@ -13,6 +13,10 @@ const (
 	DefaultIssuer   = "family-photo-cloud"
 	DefaultAudience = "family-photo-cloud-ios"
 	UploadAudience  = "family-photo-cloud-tus"
+	// ViewAudience scopes a short-lived ticket to one asset's original so a
+	// browser <img>/<video> element, which cannot send an Authorization
+	// header, can load it.
+	ViewAudience = "family-photo-cloud-view"
 )
 
 type Principal struct {
@@ -164,4 +168,60 @@ func (m *AccessTokenManager) VerifyUpload(raw string) (Principal, error) {
 		return Principal{}, errors.New("invalid upload-token identity")
 	}
 	return Principal{UserID: claims.UserID, SessionID: claims.SessionID, UploadID: claims.UploadID}, nil
+}
+
+type ViewClaims struct {
+	UserID    string `json:"uid"`
+	SessionID string `json:"sid"`
+	AssetID   string `json:"aid"`
+	jwt.RegisteredClaims
+}
+
+func (m *AccessTokenManager) IssueView(principal Principal, assetID string, now time.Time, ttl time.Duration) (string, error) {
+	if principal.UserID == "" || principal.SessionID == "" || assetID == "" {
+		return "", errors.New("user, session, and asset IDs are required")
+	}
+	if ttl <= 0 || ttl > 30*time.Minute {
+		return "", errors.New("view-ticket TTL must be between zero and 30 minutes")
+	}
+	claims := ViewClaims{
+		UserID: principal.UserID, SessionID: principal.SessionID, AssetID: assetID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    m.issuer,
+			Subject:   principal.UserID,
+			Audience:  jwt.ClaimStrings{ViewAudience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now.Add(-m.leeway)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.key)
+}
+
+// VerifyView accepts a view ticket only for the asset it was issued for.
+func (m *AccessTokenManager) VerifyView(raw, assetID string) (Principal, error) {
+	claims := new(ViewClaims)
+	token, err := jwt.ParseWithClaims(
+		raw,
+		claims,
+		func(token *jwt.Token) (any, error) {
+			if token.Method != jwt.SigningMethodHS256 {
+				return nil, fmt.Errorf("unexpected signing method %q", token.Method.Alg())
+			}
+			return m.key, nil
+		},
+		jwt.WithAudience(ViewAudience),
+		jwt.WithIssuer(m.issuer),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(m.leeway),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	)
+	if err != nil || !token.Valid {
+		return Principal{}, errors.New("invalid view ticket")
+	}
+	if claims.UserID == "" || claims.SessionID == "" || claims.Subject != claims.UserID || claims.AssetID == "" || claims.AssetID != assetID {
+		return Principal{}, errors.New("invalid view-ticket scope")
+	}
+	return Principal{UserID: claims.UserID, SessionID: claims.SessionID}, nil
 }

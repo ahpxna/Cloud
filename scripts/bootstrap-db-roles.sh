@@ -111,6 +111,7 @@ GRANT SELECT, INSERT, UPDATE ON upload_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON upload_session_throttles TO photo_cloud_gateway;
 GRANT SELECT, INSERT ON assets TO photo_cloud_gateway;
 GRANT SELECT, INSERT ON upload_events TO photo_cloud_gateway;
+GRANT SELECT, INSERT, UPDATE ON device_upload_keys TO photo_cloud_gateway;
 
 -- uuidv7() does not require sequence rights, but upload_events uses an identity
 -- sequence. Grant only that generated sequence to the gateway.
@@ -131,6 +132,8 @@ GRANT SELECT (user_id, confirmed_at) ON user_mfa_totp TO photo_cloud_admin;
 GRANT DELETE ON user_mfa_totp TO photo_cloud_admin;
 GRANT SELECT (user_id) ON user_mfa_recovery_codes, mfa_action_throttles TO photo_cloud_admin;
 GRANT DELETE ON user_mfa_recovery_codes, mfa_action_throttles TO photo_cloud_admin;
+GRANT SELECT (user_id, revoked_at) ON device_upload_keys TO photo_cloud_admin;
+GRANT UPDATE (revoked_at) ON device_upload_keys TO photo_cloud_admin;
 
 -- Integrity jobs can read the durable inventory and append their own evidence.
 -- They cannot mutate uploads, users, assets, or upload_events.
@@ -179,12 +182,15 @@ BEGIN
   END IF;
   IF has_table_privilege('photo_cloud_readonly', 'users', 'SELECT')
      OR has_table_privilege('photo_cloud_readonly', 'user_sessions', 'SELECT')
-     OR has_table_privilege('photo_cloud_readonly', 'device_sessions', 'SELECT') THEN
+     OR has_table_privilege('photo_cloud_readonly', 'device_sessions', 'SELECT')
+     OR has_table_privilege('photo_cloud_readonly', 'device_upload_keys', 'SELECT') THEN
     RAISE EXCEPTION 'observability database role can read auth/session tables';
   END IF;
   IF has_column_privilege('photo_cloud_admin', 'users', 'password_hash', 'SELECT')
      OR has_column_privilege('photo_cloud_admin', 'user_mfa_totp', 'encrypted_secret', 'SELECT')
      OR has_column_privilege('photo_cloud_admin', 'user_sessions', 'refresh_token_sha256', 'SELECT')
+     OR has_column_privilege('photo_cloud_admin', 'device_upload_keys', 'key_sha256', 'SELECT')
+     OR has_table_privilege('photo_cloud_admin', 'device_upload_keys', 'INSERT')
      OR has_table_privilege('photo_cloud_admin', 'device_sessions', 'INSERT')
      OR has_table_privilege('photo_cloud_admin', 'user_sessions', 'INSERT')
      OR has_table_privilege('photo_cloud_admin', 'upload_events', 'INSERT') THEN

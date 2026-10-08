@@ -741,6 +741,30 @@ func (r *PostgresRepository) ResetForRetry(ctx context.Context, id, ownerID stri
 	return r.SessionByID(ctx, id)
 }
 
+func (r *PostgresRepository) ListSessions(ctx context.Context, ownerID string, limit int) ([]SessionSummary, error) {
+	rows, err := r.pool.Query(ctx, `
+        SELECT id::text, original_filename, media_type, state, expected_size,
+               received_size, COALESCE(last_error_code, ''), created_at, updated_at
+        FROM upload_sessions
+        WHERE owner_id = $1::uuid
+        ORDER BY updated_at DESC, id DESC
+        LIMIT $2`, ownerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sessions := make([]SessionSummary, 0, limit)
+	for rows.Next() {
+		var summary SessionSummary
+		if err := rows.Scan(&summary.ID, &summary.OriginalFilename, &summary.MediaType, &summary.State,
+			&summary.ExpectedSize, &summary.ReceivedSize, &summary.ErrorCode, &summary.CreatedAt, &summary.UpdatedAt); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, summary)
+	}
+	return sessions, rows.Err()
+}
+
 func (r *PostgresRepository) ListAssets(ctx context.Context, ownerID string, before *AssetCursor, limit int) ([]Asset, error) {
 	var cursorCreatedAt any
 	var cursorID any

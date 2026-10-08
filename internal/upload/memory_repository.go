@@ -17,6 +17,7 @@ type MemoryRepository struct {
 	byClient        map[string]string
 	assets          map[string]Asset
 	createThrottles map[string]createThrottle
+	created         map[string]time.Time
 }
 
 type createThrottle struct {
@@ -30,6 +31,7 @@ func NewMemoryRepository() *MemoryRepository {
 		byClient:        make(map[string]string),
 		assets:          make(map[string]Asset),
 		createThrottles: make(map[string]createThrottle),
+		created:         make(map[string]time.Time),
 	}
 }
 
@@ -116,7 +118,35 @@ func (r *MemoryRepository) CreateSession(_ context.Context, input CreateSessionI
 	}
 	r.sessions[id] = session
 	r.byClient[clientKey] = id
+	r.created[id] = time.Now().UTC()
 	return session, true, nil
+}
+
+func (r *MemoryRepository) ListSessions(_ context.Context, ownerID string, limit int) ([]SessionSummary, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	summaries := make([]SessionSummary, 0)
+	for _, session := range r.sessions {
+		if session.OwnerID != ownerID {
+			continue
+		}
+		created := r.created[session.ID]
+		summaries = append(summaries, SessionSummary{
+			ID: session.ID, OriginalFilename: session.OriginalFilename, MediaType: session.MediaType,
+			State: session.State, ExpectedSize: session.ExpectedSize, ReceivedSize: session.ReceivedSize,
+			CreatedAt: created, UpdatedAt: created,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		if summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
+			return summaries[i].ID > summaries[j].ID
+		}
+		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+	})
+	if len(summaries) > limit {
+		summaries = summaries[:limit]
+	}
+	return summaries, nil
 }
 
 func (r *MemoryRepository) SessionByID(_ context.Context, id string) (Session, error) {

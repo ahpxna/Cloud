@@ -210,8 +210,9 @@ func (r *AdminRepository) withAccount(ctx context.Context, email string, action 
 	return tx.Commit(ctx)
 }
 
-// revokeAccountSessionsTx revokes every device and refresh generation and
-// advances the authentication epoch, which also voids in-flight MFA challenges.
+// revokeAccountSessionsTx revokes every device, refresh generation and
+// Shortcut upload key, and advances the authentication epoch, which also voids
+// in-flight MFA challenges.
 func revokeAccountSessionsTx(ctx context.Context, tx pgx.Tx, userID string) (int64, error) {
 	if _, err := tx.Exec(ctx, `
         UPDATE user_sessions SET revoked_at = now(), last_used_at = now()
@@ -223,6 +224,13 @@ func revokeAccountSessionsTx(ctx context.Context, tx pgx.Tx, userID string) (int
         UPDATE device_sessions SET revoked_at = now(), last_used_at = now()
         WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID)
 	if err != nil {
+		return 0, err
+	}
+	// Shortcut upload keys live on the same phones; a lost phone or a password
+	// reset must stop them too.
+	if _, err := tx.Exec(ctx, `
+        UPDATE device_upload_keys SET revoked_at = now()
+        WHERE user_id = $1::uuid AND revoked_at IS NULL`, userID); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE users SET auth_epoch = auth_epoch + 1, updated_at = now() WHERE id = $1::uuid`, userID); err != nil {
