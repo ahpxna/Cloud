@@ -202,7 +202,7 @@ func TestProcessorExpiresIncompleteSessionAndPermitsSameClientRetry(t *testing.T
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), partial, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, int64(len(partial)))
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize)
 	expired, err := repository.ExpiredSessions(context.Background(), time.Now(), 10)
 	if err != nil || len(expired) != 1 {
 		t.Fatalf("expired sessions=%#v err=%v", expired, err)
@@ -245,7 +245,7 @@ func TestCompletedTusUploadsFindsDurableFinalByteAfterEventLoss(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sidecar := []byte(`{"ID":"` + session.ID + `","Size":` + fmt.Sprint(len(content)) + `,"Offset":` + fmt.Sprint(len(content)) + `}`)
+	sidecar := []byte(`{"ID":"` + session.ID + `","Size":` + fmt.Sprint(len(content)) + `,"Offset":0}`)
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID+".info"), sidecar, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestResetForRetryRemovesOnlyIncompleteTusResource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), partial, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, 25)
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize)
 	if _, err := processor.ResetForRetry(context.Background(), session.ID, testOwnerID); err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestExpireReconcilesDurablyCompleteTusResource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, session.ExpectedSize)
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize)
 
 	stale, err := repository.SessionByID(context.Background(), session.ID)
 	if err != nil {
@@ -402,7 +402,7 @@ func TestResetForRetryReconcilesDurablyCompleteTusResource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, session.ExpectedSize)
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize)
 
 	got, err := processor.ResetForRetry(context.Background(), session.ID, testOwnerID)
 	if err != nil {
@@ -451,9 +451,11 @@ func TestExpirePreservesInconsistentTusResource(t *testing.T) {
 	}
 }
 
-func writeTusSidecar(t *testing.T, processor *Processor, id string, size, offset int64) {
+// writeTusSidecar mirrors tusd's filestore: the sidecar is written once at
+// creation with Offset 0 and is never rewritten as chunks arrive.
+func writeTusSidecar(t *testing.T, processor *Processor, id string, size int64) {
 	t.Helper()
-	sidecar := []byte(fmt.Sprintf(`{"ID":%q,"Size":%d,"Offset":%d}`, id, size, offset))
+	sidecar := []byte(fmt.Sprintf(`{"ID":%q,"Size":%d,"SizeIsDeferred":false,"Offset":0,"MetaData":{"session_id":%q},"IsPartial":false,"IsFinal":false,"PartialUploads":null,"Storage":{"Type":"filestore"}}`, id, size, id))
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), id+".info"), sidecar, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -561,7 +563,7 @@ func prepareReceivedSession(
 	if err := os.WriteFile(filepath.Join(processor.StagingDirectory(), session.ID), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeTusSidecar(t, processor, session.ID, session.ExpectedSize, session.ExpectedSize)
+	writeTusSidecar(t, processor, session.ID, session.ExpectedSize)
 	if err := repository.MarkReceived(context.Background(), session.ID, session.ExpectedSize); err != nil {
 		t.Fatal(err)
 	}

@@ -400,8 +400,9 @@ final class UploadCoordinator: ObservableObject {
 
     func downloadOriginal(_ asset: LibraryAsset) async throws -> URL {
         guard !isChangingAuthentication else { throw CancellationError() }
-        let accessToken = try await auth.accessToken(api: api)
-        return try await api.downloadOriginal(asset, accessToken: accessToken)
+        let auth = self.auth
+        let api = self.api
+        return try await api.downloadOriginal(asset, accessToken: { try await auth.accessToken(api: api) })
     }
 
     private func begin(_ original: QueuedUpload) async {

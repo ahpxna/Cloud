@@ -1,0 +1,26 @@
+{
+  "TCP": {
+    "443": {
+      "HTTPS": true
+    },
+    "80": {
+      "HTTP": true
+    }
+  },
+  "Web": {
+    "${TS_CERT_DOMAIN}:443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://upload-gateway:8080"
+        }
+      }
+    },
+    "${TS_CERT_DOMAIN}:80": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://upload-gateway:8080/__plain-http"
+        }
+      }
+    }
+  }
+}

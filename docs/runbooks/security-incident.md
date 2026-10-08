@@ -12,9 +12,10 @@ availability.
    incident note.
 2. If active compromise is plausible, stop public ingress by disabling the
    Cloudflare public hostname/tunnel or firewalling TCP 443. Do not wipe disks.
-3. Revoke affected refresh sessions, disable the account, rotate the gateway
-   HMAC key and tunnel token if exposed, and preserve the old key only as sealed
-   evidence when needed for investigation.
+3. Disable the affected account (`make disable-user EMAIL=…`, which also
+   revokes every device; see `account-lifecycle.md`), rotate the gateway HMAC key
+   and tunnel token if exposed, and preserve the old key only as sealed evidence
+   when needed for investigation.
 4. Snapshot PostgreSQL, media inventory, gateway logs, host logs, and active
    container/image digests to an encrypted evidence location. Label every copy
    with UTC time and SHA-256.

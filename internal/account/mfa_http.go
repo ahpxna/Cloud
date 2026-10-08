@@ -2,11 +2,14 @@ package account
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"rsc.io/qr"
 )
 
 type mfaVerifyRequest struct {
@@ -119,10 +122,40 @@ func (api *API) mfaEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	api.clearSensitiveMFAAction(r.Context(), principal.UserID, "enroll")
-	accountJSON(w, http.StatusOK, map[string]any{
+	uri := totpURI(user.Email, encoded)
+	response := map[string]any{
 		"secret":      encoded,
-		"otpauth_uri": totpURI(user.Email, encoded),
-	})
+		"otpauth_uri": uri,
+	}
+	// A QR code helps when enrolling from a computer; on the phone itself the
+	// web app offers the otpauth:// link, which opens the Passwords app.
+	if code, err := qr.Encode(uri, qr.M); err == nil {
+		code.Scale = 6
+		response["qr_png_base64"] = base64.StdEncoding.EncodeToString(code.PNG())
+	}
+	accountJSON(w, http.StatusOK, response)
+}
+
+// mfaStatus reports whether MFA is enabled or an enrollment is pending, so a
+// client can show the right controls. It reveals nothing about the secret.
+func (api *API) mfaStatus(w http.ResponseWriter, r *http.Request) {
+	principal, ok := api.authenticateAccess(w, r)
+	if !ok {
+		return
+	}
+	if api.mfaRepo == nil {
+		accountJSON(w, http.StatusOK, map[string]any{"available": false, "enabled": false, "pending": false})
+		return
+	}
+	record, err := api.mfaRepo.TOTPForUser(r.Context(), principal.UserID)
+	if err != nil && !errors.Is(err, ErrMFANotConfigured) {
+		api.logger.Error("load MFA status", "user_id", principal.UserID, "error", err)
+		accountProblem(w, http.StatusServiceUnavailable, "mfa_unavailable", "MFA is temporarily unavailable")
+		return
+	}
+	enabled := err == nil && record.ConfirmedAt != nil
+	pending := err == nil && record.ConfirmedAt == nil
+	accountJSON(w, http.StatusOK, map[string]any{"available": true, "enabled": enabled, "pending": pending})
 }
 
 func (api *API) mfaConfirm(w http.ResponseWriter, r *http.Request) {

@@ -44,10 +44,10 @@ jobs:
           - target: session-maintenance
             image_name: session-maintenance
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.7"
+          go-version: "1.26.8"
           cache: true
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
@@ -56,7 +56,7 @@ jobs:
           cache: true
       - name: Install cosign
         run: |
-          go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.0
+          go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.5
           cosign version
       - name: Log in to GHCR
         env:
@@ -74,7 +74,7 @@ jobs:
             [[ "$pinned" =~ @sha256:[0-9a-f]{64}$ ]]
             printf '%s\n' "$pinned"
           }
-          printf 'go_build=%s\n' "$(resolve 'golang:1.26.7-alpine3.23')" >> "$GITHUB_OUTPUT"
+          printf 'go_build=%s\n' "$(resolve 'golang:1.26.8-alpine3.23')" >> "$GITHUB_OUTPUT"
           printf 'runtime=%s\n' "$(resolve 'alpine:3.23')" >> "$GITHUB_OUTPUT"
       - name: Build and push immutable image
         id: image

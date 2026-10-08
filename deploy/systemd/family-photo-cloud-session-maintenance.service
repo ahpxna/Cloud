@@ -1,0 +1,11 @@
+[Unit]
+Description=Family Photo Cloud expired/revoked session history pruning
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/family-photo-cloud
+EnvironmentFile=/opt/family-photo-cloud/.env
+ExecStart=/usr/bin/make session-maintenance
+Nice=10

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,11 +21,30 @@ import (
 const (
 	defaultPageSize = 50
 	maximumPageSize = 100
+
+	// Originals can be multi-gigabyte videos served over a home uplink, so the
+	// server-wide absolute HTTP_WRITE_TIMEOUT would cut them off. Downloads
+	// instead get an idle deadline that moves with progress, bounded by an
+	// overall ceiling so a trickling client cannot hold a connection forever.
+	originalWriteIdleTimeout = 2 * time.Minute
+	originalWriteMaxDuration = 12 * time.Hour
 )
 
 type API struct {
-	repository upload.AssetRepository
-	mediaRoot  string
+	repository       upload.AssetRepository
+	mediaRoot        string
+	writeIdleTimeout time.Duration
+	writeMaxDuration time.Duration
+	viewTickets      *auth.AccessTokenManager
+}
+
+// viewTicketTTL bounds how long a listed view_url keeps working.
+const viewTicketTTL = 10 * time.Minute
+
+// EnableViewTickets lets GET /v1/assets?tickets=1 attach a short-lived,
+// asset-scoped view_url to each item for browser <img>/<video> elements.
+func (api *API) EnableViewTickets(tokens *auth.AccessTokenManager) {
+	api.viewTickets = tokens
 }
 
 func NewAPI(repository upload.AssetRepository, mediaRoot string) (*API, error) {
@@ -35,7 +55,12 @@ func NewAPI(repository upload.AssetRepository, mediaRoot string) (*API, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve media root: %w", err)
 	}
-	return &API{repository: repository, mediaRoot: root}, nil
+	return &API{
+		repository:       repository,
+		mediaRoot:        root,
+		writeIdleTimeout: originalWriteIdleTimeout,
+		writeMaxDuration: originalWriteMaxDuration,
+	}, nil
 }
 
 type assetResponse struct {
@@ -46,6 +71,8 @@ type assetResponse struct {
 	ContentSHA256    string    `json:"content_sha256"`
 	CreatedAt        time.Time `json:"created_at"`
 	OriginalURL      string    `json:"original_url"`
+	ViewURL          string    `json:"view_url,omitempty"`
+	ThumbnailURL     string    `json:"thumbnail_url,omitempty"`
 }
 
 type listResponse struct {
@@ -76,6 +103,21 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		api.original(w, r, principal, assetID)
+	case strings.HasSuffix(path, "/thumbnail"):
+		assetID := strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/thumbnail")
+		if assetID == "" || strings.Contains(assetID, "/") {
+			writeProblem(w, http.StatusNotFound, "not_found", "asset not found")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			api.serveThumbnail(w, r, principal, assetID)
+		case http.MethodPut:
+			api.storeThumbnail(w, r, principal, assetID)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, PUT")
+			writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		}
 	default:
 		w.Header().Set("Allow", "GET, HEAD")
 		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -99,9 +141,26 @@ func (api *API) list(w http.ResponseWriter, r *http.Request, principal auth.Prin
 		return
 	}
 
+	withTickets := r.URL.Query().Get("tickets") == "1" && api.viewTickets != nil
+	now := time.Now()
 	response := listResponse{Assets: make([]assetResponse, 0, min(limit, len(assets)))}
 	for _, asset := range assets[:min(limit, len(assets))] {
-		response.Assets = append(response.Assets, assetForResponse(asset))
+		item := assetForResponse(asset)
+		if withTickets {
+			ticket, err := api.viewTickets.IssueView(principal, asset.ID, auth.ViewOriginal, now, viewTicketTTL)
+			if err != nil {
+				writeProblem(w, http.StatusInternalServerError, "view_ticket_failed", "could not list assets")
+				return
+			}
+			item.ViewURL = item.OriginalURL + "?ticket=" + url.QueryEscape(ticket)
+			if api.hasThumbnail(asset) {
+				if item.ThumbnailURL, err = api.thumbnailURL(principal, asset.ID, now); err != nil {
+					writeProblem(w, http.StatusInternalServerError, "view_ticket_failed", "could not list assets")
+					return
+				}
+			}
+		}
+		response.Assets = append(response.Assets, item)
 	}
 	if len(assets) > limit {
 		last := assets[limit-1]
@@ -153,7 +212,47 @@ func (api *API) original(w http.ResponseWriter, r *http.Request, principal auth.
 	w.Header().Set("Content-Disposition", "inline; filename=\"original\"")
 	w.Header().Set("ETag", `"sha256-`+hex.EncodeToString(asset.ContentSHA256[:])+`"`)
 	w.Header().Set("Cache-Control", "private, no-store")
-	http.ServeContent(w, r, "original", asset.CreatedAt, file)
+	http.ServeContent(api.progressDeadlineWriter(w, time.Now()), r, "original", asset.CreatedAt, file)
+}
+
+// progressDeadlineWriter extends the connection write deadline before every
+// write. Only the ResponseWriter methods are exposed, so io.Copy feeds it in
+// bounded buffers and each buffer renews the idle deadline.
+type progressDeadlineWriter struct {
+	http.ResponseWriter
+	controller *http.ResponseController
+	idle       time.Duration
+	ceiling    time.Time
+}
+
+func (api *API) progressDeadlineWriter(w http.ResponseWriter, start time.Time) *progressDeadlineWriter {
+	writer := &progressDeadlineWriter{
+		ResponseWriter: w,
+		controller:     http.NewResponseController(w),
+		idle:           api.writeIdleTimeout,
+		ceiling:        start.Add(api.writeMaxDuration),
+	}
+	writer.extend()
+	return writer
+}
+
+func (w *progressDeadlineWriter) extend() {
+	deadline := time.Now().Add(w.idle)
+	if deadline.After(w.ceiling) {
+		deadline = w.ceiling
+	}
+	// Unsupported writers (for example test recorders) keep the server default.
+	_ = w.controller.SetWriteDeadline(deadline)
+}
+
+func (w *progressDeadlineWriter) Write(p []byte) (int, error) {
+	w.extend()
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap lets http.ResponseController reach the underlying connection.
+func (w *progressDeadlineWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (api *API) originalPath(storageKey string) (string, error) {

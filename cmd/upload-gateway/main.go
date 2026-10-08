@@ -144,6 +144,7 @@ func run(logger *slog.Logger) error {
 		GlobalLoginBurst:          globalLoginBurst,
 		MFAEncryptionKey:          mfaEncryptionKey,
 		RefreshRetryEncryptionKey: refreshRetryEncryptionKey,
+		CanonicalHost:             os.Getenv("CANONICAL_HOST"),
 		Logger:                    logger,
 	})
 	if err != nil {

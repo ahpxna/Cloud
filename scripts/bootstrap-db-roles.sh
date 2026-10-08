@@ -111,15 +111,29 @@ GRANT SELECT, INSERT, UPDATE ON upload_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON upload_session_throttles TO photo_cloud_gateway;
 GRANT SELECT, INSERT ON assets TO photo_cloud_gateway;
 GRANT SELECT, INSERT ON upload_events TO photo_cloud_gateway;
+GRANT SELECT, INSERT, UPDATE ON device_upload_keys TO photo_cloud_gateway;
 
 -- uuidv7() does not require sequence rights, but upload_events uses an identity
 -- sequence. Grant only that generated sequence to the gateway.
 GRANT USAGE, SELECT ON SEQUENCE upload_events_sequence_id_seq TO photo_cloud_gateway;
 
--- Admin one-shot tooling can provision users, but cannot read password hashes
--- or mutate upload/integrity/audit history.
+-- Admin one-shot tooling provisions accounts and runs the account lifecycle
+-- (disable, password/MFA reset, device revocation, deletion). It can overwrite
+-- but never read password hashes, can revoke but never mint sessions, and
+-- cannot mutate upload/integrity/audit history.
 GRANT INSERT ON users TO photo_cloud_admin;
-GRANT SELECT (id) ON users TO photo_cloud_admin;
+GRANT SELECT (id, email, role, state, auth_epoch, created_at, deleted_at) ON users TO photo_cloud_admin;
+GRANT UPDATE (password_hash, state, auth_epoch, updated_at, deleted_at) ON users TO photo_cloud_admin;
+GRANT SELECT (id, user_id, revoked_at, expires_at) ON device_sessions TO photo_cloud_admin;
+GRANT UPDATE (revoked_at, last_used_at) ON device_sessions TO photo_cloud_admin;
+GRANT SELECT (device_session_id, revoked_at) ON user_sessions TO photo_cloud_admin;
+GRANT UPDATE (revoked_at, last_used_at) ON user_sessions TO photo_cloud_admin;
+GRANT SELECT (user_id, confirmed_at) ON user_mfa_totp TO photo_cloud_admin;
+GRANT DELETE ON user_mfa_totp TO photo_cloud_admin;
+GRANT SELECT (user_id) ON user_mfa_recovery_codes, mfa_action_throttles TO photo_cloud_admin;
+GRANT DELETE ON user_mfa_recovery_codes, mfa_action_throttles TO photo_cloud_admin;
+GRANT SELECT (user_id, revoked_at) ON device_upload_keys TO photo_cloud_admin;
+GRANT UPDATE (revoked_at) ON device_upload_keys TO photo_cloud_admin;
 
 -- Integrity jobs can read the durable inventory and append their own evidence.
 -- They cannot mutate uploads, users, assets, or upload_events.
@@ -168,8 +182,19 @@ BEGIN
   END IF;
   IF has_table_privilege('photo_cloud_readonly', 'users', 'SELECT')
      OR has_table_privilege('photo_cloud_readonly', 'user_sessions', 'SELECT')
-     OR has_table_privilege('photo_cloud_readonly', 'device_sessions', 'SELECT') THEN
+     OR has_table_privilege('photo_cloud_readonly', 'device_sessions', 'SELECT')
+     OR has_table_privilege('photo_cloud_readonly', 'device_upload_keys', 'SELECT') THEN
     RAISE EXCEPTION 'observability database role can read auth/session tables';
+  END IF;
+  IF has_column_privilege('photo_cloud_admin', 'users', 'password_hash', 'SELECT')
+     OR has_column_privilege('photo_cloud_admin', 'user_mfa_totp', 'encrypted_secret', 'SELECT')
+     OR has_column_privilege('photo_cloud_admin', 'user_sessions', 'refresh_token_sha256', 'SELECT')
+     OR has_column_privilege('photo_cloud_admin', 'device_upload_keys', 'key_sha256', 'SELECT')
+     OR has_table_privilege('photo_cloud_admin', 'device_upload_keys', 'INSERT')
+     OR has_table_privilege('photo_cloud_admin', 'device_sessions', 'INSERT')
+     OR has_table_privilege('photo_cloud_admin', 'user_sessions', 'INSERT')
+     OR has_table_privilege('photo_cloud_admin', 'upload_events', 'INSERT') THEN
+    RAISE EXCEPTION 'admin database role can read secrets or mint sessions';
   END IF;
   IF has_table_privilege('photo_cloud_backup', 'users', 'UPDATE') THEN
     RAISE EXCEPTION 'backup database role is writable';

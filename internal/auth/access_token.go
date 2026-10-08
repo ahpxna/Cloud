@@ -13,6 +13,10 @@ const (
 	DefaultIssuer   = "family-photo-cloud"
 	DefaultAudience = "family-photo-cloud-ios"
 	UploadAudience  = "family-photo-cloud-tus"
+	// ViewAudience scopes a short-lived ticket to one asset's original so a
+	// browser <img>/<video> element, which cannot send an Authorization
+	// header, can load it.
+	ViewAudience = "family-photo-cloud-view"
 )
 
 type Principal struct {
@@ -164,4 +168,78 @@ func (m *AccessTokenManager) VerifyUpload(raw string) (Principal, error) {
 		return Principal{}, errors.New("invalid upload-token identity")
 	}
 	return Principal{UserID: claims.UserID, SessionID: claims.SessionID, UploadID: claims.UploadID}, nil
+}
+
+// View ticket kinds: a ticket for one never opens the other.
+const (
+	ViewOriginal  = "original"
+	ViewThumbnail = "thumbnail"
+)
+
+type ViewClaims struct {
+	UserID    string `json:"uid"`
+	SessionID string `json:"sid"`
+	AssetID   string `json:"aid"`
+	Kind      string `json:"knd"`
+	jwt.RegisteredClaims
+}
+
+func (m *AccessTokenManager) IssueView(principal Principal, assetID, kind string, now time.Time, ttl time.Duration) (string, error) {
+	if principal.UserID == "" || principal.SessionID == "" || assetID == "" {
+		return "", errors.New("user, session, and asset IDs are required")
+	}
+	// Original tickets are short-lived. Thumbnail tickets may live a few hours
+	// so they can be issued per hour and cached by the browser.
+	maxTTL := 30 * time.Minute
+	switch kind {
+	case ViewOriginal:
+	case ViewThumbnail:
+		maxTTL = 3 * time.Hour
+	default:
+		return "", errors.New("unknown view-ticket kind")
+	}
+	if ttl <= 0 || ttl > maxTTL {
+		return "", errors.New("view-ticket TTL exceeds the limit for its kind")
+	}
+	claims := ViewClaims{
+		UserID: principal.UserID, SessionID: principal.SessionID, AssetID: assetID, Kind: kind,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    m.issuer,
+			Subject:   principal.UserID,
+			Audience:  jwt.ClaimStrings{ViewAudience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now.Add(-m.leeway)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.key)
+}
+
+// VerifyView accepts a view ticket only for the asset and kind it was issued for.
+func (m *AccessTokenManager) VerifyView(raw, assetID, kind string) (Principal, error) {
+	claims := new(ViewClaims)
+	token, err := jwt.ParseWithClaims(
+		raw,
+		claims,
+		func(token *jwt.Token) (any, error) {
+			if token.Method != jwt.SigningMethodHS256 {
+				return nil, fmt.Errorf("unexpected signing method %q", token.Method.Alg())
+			}
+			return m.key, nil
+		},
+		jwt.WithAudience(ViewAudience),
+		jwt.WithIssuer(m.issuer),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(m.leeway),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	)
+	if err != nil || !token.Valid {
+		return Principal{}, errors.New("invalid view ticket")
+	}
+	if claims.UserID == "" || claims.SessionID == "" || claims.Subject != claims.UserID || claims.AssetID == "" ||
+		claims.AssetID != assetID || claims.Kind == "" || claims.Kind != kind {
+		return Principal{}, errors.New("invalid view-ticket scope")
+	}
+	return Principal{UserID: claims.UserID, SessionID: claims.SessionID}, nil
 }

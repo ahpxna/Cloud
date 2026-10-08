@@ -50,15 +50,15 @@ operator_lock_acquire
 trap 'operator_lock_release' EXIT INT TERM
 
 # Refuse to sign a new inventory if even one stored original fails a full read.
-docker compose --profile integrity run --rm scrub -output "/reports/scrub-$stamp.json"
-docker compose --profile integrity run --rm manifest \
+docker compose --profile integrity run --build --rm scrub -output "/reports/scrub-$stamp.json"
+docker compose --profile integrity run --build --rm manifest \
   -output "/manifests/$manifest_name" \
   -object-key "manifests/$manifest_name"
 
 # Independently verify the signature with the public trust key. This catches a
 # damaged output file or a signing/verification key mismatch before the cycle is
 # reported as successful.
-docker compose --profile integrity run --rm manifest-verify \
+docker compose --profile integrity run --build --rm manifest-verify \
   -mode verify \
   -input "/manifests/$manifest_name" \
   -object-key "manifests/$manifest_name" \

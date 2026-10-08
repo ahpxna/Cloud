@@ -20,9 +20,9 @@ resolve() {
   printf '%s=%s\n' "$variable" "$pinned"
 }
 
-resolve POSTGRES_IMAGE "${POSTGRES_IMAGE:-postgres:18.4-alpine}"
-resolve TUSD_IMAGE "${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.0}"
-resolve CLOUDFLARED_IMAGE "${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.7.2}"
-resolve PROMETHEUS_IMAGE "${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}"
-resolve ALERTMANAGER_IMAGE "${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}"
-resolve GRAFANA_IMAGE "${GRAFANA_IMAGE:-grafana/grafana:12.1.0}"
+resolve POSTGRES_IMAGE "${POSTGRES_IMAGE:-postgres:18.6-alpine}"
+resolve TUSD_IMAGE "${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.1}"
+resolve CLOUDFLARED_IMAGE "${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.9.3}"
+resolve PROMETHEUS_IMAGE "${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.4}"
+resolve ALERTMANAGER_IMAGE "${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}"
+resolve GRAFANA_IMAGE "${GRAFANA_IMAGE:-grafana/grafana:12.4.12}"

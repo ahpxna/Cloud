@@ -249,8 +249,10 @@ func TestLoginLimiterFailsClosedWhenCardinalityIsSaturated(t *testing.T) {
 func TestLoginLimiterLocksAccountWithinWindow(t *testing.T) {
 	now := time.Date(2026, time.August, 23, 0, 0, 0, 0, time.UTC)
 	limiter := newLoginLimiter(2, time.Minute, 10)
-	if !limiter.Allow("parent@example.com", now) || !limiter.Allow("parent@example.com", now) {
-		t.Fatal("expected attempts within limit")
+	for attempt := 1; attempt <= 2; attempt++ {
+		if !limiter.Allow("parent@example.com", now) {
+			t.Fatalf("attempt %d should be within the limit", attempt)
+		}
 	}
 	if limiter.Allow("parent@example.com", now) {
 		t.Fatal("expected account limiter to reject third attempt")

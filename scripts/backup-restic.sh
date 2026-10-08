@@ -69,7 +69,7 @@ chmod 600 "$dump"
   printf 'audit_root=%s\n' "$audit_root"
 	printf 'manifest_public_keyring=%s\n' "$manifest_keyring_root"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
-  printf 'postgres_image=%s\n' "${POSTGRES_IMAGE:-postgres:18.4-alpine}"
+  printf 'postgres_image=%s\n' "${POSTGRES_IMAGE:-postgres:18.6-alpine}"
 } > "$metadata"
 chmod 600 "$metadata"
 
@@ -87,6 +87,13 @@ restic check --read-data-subset="${RESTIC_READ_DATA_SUBSET:-1/100}"
 # A local dump is useful only as staging for the encrypted repository. Remove it
 # after restic confirms the snapshot to reduce duplicate sensitive state.
 rm -rf "$work"
+
+# Record success only after restic has written and checked the snapshot. The
+# metrics exporter turns this into the PhotoCloudBackupStale alert.
+status_dir="${BACKUP_STATUS_DIR:-$repo_root/.data/backup-status}"
+mkdir -p "$status_dir"
+date -u +%s > "$status_dir/last-success.tmp"
+mv "$status_dir/last-success.tmp" "$status_dir/last-success"
 trap - EXIT INT TERM
 if [[ $started_gateway -eq 1 ]]; then
   docker compose --profile gateway up -d --no-deps upload-gateway

@@ -33,6 +33,10 @@ The accepted direction is:
   protocol as the long-term transport after the 100 MB Cloudflare constraint is
   removed through public IP or a VPS/WireGuard path.
 
+**Deploying?** Follow the ordered [go-live checklist](docs/runbooks/go-live.md).
+For free private family access (Tailscale + web app + iOS Shortcut), see
+[tailnet-family](docs/runbooks/tailnet-family.md).
+
 Read [the architecture](docs/architecture.md), [MVP API contract](docs/api.md),
 [integrity manifest format](docs/integrity-manifest-v1.md), [iOS scaffold
 notes](ios/README.md), [operator runbooks](docs/runbooks/), and
@@ -101,19 +105,21 @@ make db-up
 Generate independent runtime database passwords plus four gateway cryptographic
 secrets in the untracked `.env`, then start the gateway. The bootstrap
 `POSTGRES_USER` credential is migration-only; runtime services use the scoped
-roles created by `db-role-bootstrap`. Never reuse a password/key across these
-purposes:
+roles created by `db-role-bootstrap`. `make secrets` fills every blank or
+placeholder secret with an independent random value, adds keys introduced in
+`.env.example` since your `.env` was created, and never prints or rotates an
+existing value:
 
 ```bash
-openssl rand -base64 32  # ACCESS_TOKEN_HMAC_KEY_BASE64
-openssl rand -base64 32  # LOGIN_THROTTLE_HMAC_KEY_BASE64
-openssl rand -base64 32  # MFA_ENCRYPTION_KEY_BASE64 (exactly 32 decoded bytes)
-openssl rand -base64 32  # REFRESH_RETRY_ENCRYPTION_KEY_BASE64 (exactly 32 decoded bytes)
-# Also replace GATEWAY_DB_PASSWORD, ADMIN_DB_PASSWORD,
-# INTEGRITY_DB_PASSWORD, READONLY_DB_PASSWORD, and BACKUP_DB_PASSWORD with independent values.
+make secrets
 make gateway-up
 make create-user EMAIL=parent@example.com
 ```
+
+On a laptop with less than 200 GiB free, lower `PHOTO_MIN_FREE_BYTES` in `.env`
+for a smoke test; otherwise `/readyz` stays unhealthy by design. Account
+operations (disable, password/MFA reset, device revocation, deletion) are in
+the [account lifecycle runbook](docs/runbooks/account-lifecycle.md).
 
 After configuring a named Cloudflare Tunnel whose public hostname targets
 `http://upload-gateway:8080`, add its scoped token to `.env`. Review and apply

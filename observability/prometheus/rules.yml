@@ -33,3 +33,30 @@ groups:
           severity: warning
         annotations:
           summary: "Media filesystem has less than 200 GiB available"
+
+      - alert: PhotoCloudGatewayDown
+        expr: photo_cloud_gateway_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Upload gateway is not ready; family uploads and library access are failing"
+          description: "Check `make status` and the upload-gateway logs. /readyz also fails when free space drops below PHOTO_MIN_FREE_BYTES or the media disk is read-only."
+
+      - alert: PhotoCloudBackupStale
+        expr: time() - photo_cloud_backup_last_success_timestamp_seconds > 36 * 3600
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No checked encrypted backup in the last 36 hours (or ever)"
+          description: "Run `make backup` and read its output; check `systemctl status family-photo-cloud-backup.timer`. A single disk is not a backup."
+
+      - alert: PhotoCloudIntegrityCycleStale
+        expr: time() - photo_cloud_last_signed_manifest_timestamp_seconds > 8 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No signed integrity manifest in the last 8 days"
+          description: "The weekly `make integrity-cycle` has not completed; check `systemctl status family-photo-cloud-integrity.timer`."

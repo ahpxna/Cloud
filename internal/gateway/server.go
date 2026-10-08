@@ -15,6 +15,7 @@ import (
 	"family-photo-cloud/internal/auth"
 	"family-photo-cloud/internal/library"
 	"family-photo-cloud/internal/upload"
+	"family-photo-cloud/internal/webapp"
 
 	"github.com/tus/tusd/v2/pkg/filelocker"
 	"github.com/tus/tusd/v2/pkg/filestore"
@@ -44,7 +45,13 @@ type Config struct {
 	GlobalLoginBurst          int
 	MFAEncryptionKey          []byte
 	RefreshRetryEncryptionKey []byte
-	Logger                    *slog.Logger
+	// UploadKeys verifies Shortcut upload keys; when nil, Accounts is used if
+	// it implements UploadKeyVerifier.
+	UploadKeys UploadKeyVerifier
+	// CanonicalHost is the HTTPS name plain-HTTP requests are redirected to,
+	// e.g. family-photos.<tailnet>.ts.net. Empty keeps the request's host.
+	CanonicalHost string
+	Logger        *slog.Logger
 }
 
 type Server struct {
@@ -101,7 +108,13 @@ func New(config Config) (*Server, error) {
 	store := filestore.New(processor.StagingDirectory())
 	store.DirModePerm = 0o700
 	store.FileModePerm = 0o600
+	// tusd's lock is the single per-upload mutex for PATCH, restart and expiry.
+	// A new request asks the current holder to release it, so a PATCH stranded
+	// by a phone changing networks is interrupted within about a second instead
+	// of pinning the upload until the HTTP read timeout.
 	locker := filelocker.New(processor.StagingDirectory())
+	locker.HolderPollInterval = time.Second
+	locker.AcquirerPollInterval = 250 * time.Millisecond
 	composer := tusd.NewStoreComposer()
 	store.UseIn(composer)
 	locker.UseIn(composer)
@@ -170,7 +183,9 @@ func New(config Config) (*Server, error) {
 		return nil, fmt.Errorf("create verifier identity: %w", err)
 	}
 	workerID = "gateway-" + workerID
-	resourceLocks := newResourceLocks()
+	lockUpload := func(ctx context.Context, id string) (func(), error) {
+		return lockTusResource(ctx, locker, id)
+	}
 	wake := func() {
 		for range config.VerificationJobs {
 			select {
@@ -240,8 +255,14 @@ func New(config Config) (*Server, error) {
 				return
 			}
 			for _, session := range expired {
-				unlock := resourceLocks.lock(session.ID)
-				err := processor.Expire(ctx, session)
+				unlock, err := lockUpload(ctx, session.ID)
+				if err != nil {
+					// Leave it for the next reconcile pass rather than stalling
+					// recovery, verification wake-ups and other expiries.
+					config.Logger.Warn("defer expiry of busy upload", "upload_id", session.ID, "error", err)
+					continue
+				}
+				err = processor.Expire(ctx, session)
 				unlock()
 				if err != nil && !errors.Is(err, upload.ErrInvalidState) {
 					config.Logger.Error("expire stale upload", "upload_id", session.ID, "error", err)
@@ -327,7 +348,10 @@ func New(config Config) (*Server, error) {
 	// than liveness and is the endpoint used by Compose.
 	mux.Handle("GET /healthz", readyHandler)
 	uploadAPI := upload.NewAPI(config.Repository, config.MaxUploadBytes, config.ChunkBytes, config.Tokens, upload.AvailableBytes(config.MediaRoot), config.MinimumFreeBytes, config.MaxActiveUploadSessions, config.UploadSessionCreateWindow, config.MaxUploadCreatesPerWindow, func(requestContext context.Context, id, ownerID string) (upload.Session, error) {
-		unlock := resourceLocks.lock(id)
+		unlock, err := lockUpload(requestContext, id)
+		if err != nil {
+			return upload.Session{}, err
+		}
 		defer unlock()
 		return processor.ResetForRetry(requestContext, id, ownerID)
 	})
@@ -352,68 +376,88 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	libraryAPI.EnableViewTickets(config.Tokens)
 	mux.Handle("/v1/assets", authenticate(config.Tokens, config.Accounts, libraryAPI))
-	mux.Handle("/v1/assets/", authenticate(config.Tokens, config.Accounts, libraryAPI))
+	mux.Handle("/v1/assets/", authenticateLibrary(config.Tokens, config.Accounts, libraryAPI))
 	mux.Handle("/v1/upload-sessions", authenticate(config.Tokens, config.Accounts, uploadAPI))
 	mux.Handle("/v1/upload-sessions/", authenticate(config.Tokens, config.Accounts, uploadAPI))
 
 	strippedTus := http.StripPrefix(strings.TrimSuffix(tusBasePath, "/"), tusHandler)
 	limiter := newPatchLimiter(config.MaxConcurrentPatches, config.MaxPatchesPerUser)
-	protectedTus := lockPatches(resourceLocks, authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus))
+	uploadKeys := config.UploadKeys
+	if uploadKeys == nil {
+		uploadKeys, _ = config.Accounts.(UploadKeyVerifier)
+	}
+	directUploads := &directUploader{
+		repository:          config.Repository,
+		processor:           processor,
+		store:               store,
+		locker:              locker,
+		limiter:             limiter,
+		tokens:              config.Tokens,
+		accounts:            config.Accounts,
+		keys:                uploadKeys,
+		maxBytes:            config.MaxUploadBytes,
+		availableBytes:      upload.AvailableBytes(config.MediaRoot),
+		minimumFreeBytes:    config.MinimumFreeBytes,
+		maxActiveSessions:   config.MaxActiveUploadSessions,
+		createWindow:        config.UploadSessionCreateWindow,
+		maxCreatesPerWindow: config.MaxUploadCreatesPerWindow,
+		wake:                wake,
+		logger:              config.Logger,
+		readIdleTimeout:     2 * time.Minute,
+	}
+	mux.Handle(directUploadPath, directUploads)
+	protectedTus := authenticateTus(config.Tokens, config.Accounts, config.Repository, limiter, config.ChunkBytes, strippedTus)
 	mux.Handle(strings.TrimSuffix(tusBasePath, "/"), protectedTus)
 	mux.Handle(tusBasePath, protectedTus)
-	server.handler = securityHeaders(mux)
+	// The family uses one address for everything: opening /app/#uploads shows
+	// progress, and a Shortcut POSTing a photo to that same address uploads it.
+	// The fragment never reaches the server, so the POST arrives at /app/.
+	webApp := uploadOrWebApp(directUploads, webapp.Handler())
+	mux.Handle(webapp.BasePath, webApp)
+	mux.Handle(strings.TrimSuffix(webapp.BasePath, "/"), webApp)
+	mux.Handle("/", webapp.RedirectRoot())
+	server.handler = securityHeaders(redirectPlainHTTP(config.CanonicalHost, mux))
 	return server, nil
 }
 
-type resourceLocks struct {
-	mu      sync.Mutex
-	entries map[string]*resourceLock
-}
-type resourceLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
-func newResourceLocks() *resourceLocks {
-	return &resourceLocks{entries: make(map[string]*resourceLock)}
-}
-func (locks *resourceLocks) lock(id string) func() {
-	locks.mu.Lock()
-	entry := locks.entries[id]
-	if entry == nil {
-		entry = &resourceLock{}
-		locks.entries[id] = entry
-	}
-	entry.refs++
-	locks.mu.Unlock()
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		locks.mu.Lock()
-		entry.refs--
-		if entry.refs == 0 {
-			delete(locks.entries, id)
-		}
-		locks.mu.Unlock()
-	}
-}
-
-func lockPatches(locks *resourceLocks, next http.Handler) http.Handler {
+// uploadOrWebApp routes POST /app/ to the single-request upload handler and
+// everything else to the web app.
+func uploadOrWebApp(uploads, app http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch {
-			next.ServeHTTP(w, r)
+		if r.Method == http.MethodPost && (r.URL.Path == webapp.BasePath || r.URL.Path == strings.TrimSuffix(webapp.BasePath, "/")) {
+			uploads.ServeHTTP(w, r)
 			return
 		}
-		id := strings.Trim(strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(tusBasePath, "/")), "/")
-		if id == "" || strings.Contains(id, "/") {
-			next.ServeHTTP(w, r)
-			return
-		}
-		unlock := locks.lock(id)
-		defer unlock()
-		next.ServeHTTP(w, r)
+		app.ServeHTTP(w, r)
 	})
+}
+
+// tusResourceLockTimeout bounds how long restart/expiry wait for an active
+// PATCH to honour tusd's release request.
+const tusResourceLockTimeout = 15 * time.Second
+
+// lockTusResource takes the same lock tusd uses for an upload. Restart and
+// expiry hold it only briefly, so they ignore release requests; a PATCH that
+// arrives meanwhile waits for tusd's AcquireLockTimeout and then proceeds.
+func lockTusResource(ctx context.Context, locker filelocker.FileLocker, id string) (func(), error) {
+	if id == "" || strings.ContainsAny(id, `/\`) {
+		return nil, upload.ErrNotFound
+	}
+	lock, err := locker.NewLock(id)
+	if err != nil {
+		return nil, err
+	}
+	lockContext, cancel := context.WithTimeout(ctx, tusResourceLockTimeout)
+	defer cancel()
+	if err := lock.Lock(lockContext, func() {}); err != nil {
+		if errors.Is(err, tusd.ErrLockTimeout) {
+			return nil, upload.ErrUploadBusy
+		}
+		return nil, fmt.Errorf("lock upload resource: %w", err)
+	}
+	return func() { _ = lock.Unlock() }, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -473,6 +517,50 @@ func authenticate(tokens *auth.AccessTokenManager, accounts account.Repository, 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := authenticateHeader(tokens, r.Header.Get("Authorization"))
 		if !ok {
+			writeAuthError(w)
+			return
+		}
+		if accounts != nil {
+			active, err := accounts.SessionActive(r.Context(), principal.UserID, principal.SessionID)
+			if err != nil || !active {
+				writeAuthError(w)
+				return
+			}
+		}
+		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
+	})
+}
+
+// authenticateLibrary also accepts an asset-scoped view ticket in the query
+// string, but only for GET/HEAD of that asset's original or thumbnail (each
+// needs its own ticket kind) and only while the issuing device session is
+// still active.
+func authenticateLibrary(tokens *auth.AccessTokenManager, accounts account.Repository, next http.Handler) http.Handler {
+	withHeader := authenticate(tokens, accounts, next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ticket := r.URL.Query().Get("ticket")
+		if r.Header.Get("Authorization") != "" || ticket == "" ||
+			(r.Method != http.MethodGet && r.Method != http.MethodHead) {
+			withHeader.ServeHTTP(w, r)
+			return
+		}
+		var kind, suffix string
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/original"):
+			kind, suffix = auth.ViewOriginal, "/original"
+		case strings.HasSuffix(r.URL.Path, "/thumbnail"):
+			kind, suffix = auth.ViewThumbnail, "/thumbnail"
+		default:
+			writeAuthError(w)
+			return
+		}
+		assetID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/assets/"), suffix)
+		if assetID == "" || strings.Contains(assetID, "/") {
+			writeAuthError(w)
+			return
+		}
+		principal, err := tokens.VerifyView(ticket, assetID, kind)
+		if err != nil {
 			writeAuthError(w)
 			return
 		}
@@ -625,6 +713,47 @@ func writeAuthError(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write([]byte("{\"status\":401,\"code\":\"unauthorized\",\"detail\":\"valid access token required\"}\n"))
+}
+
+// plainHTTPPrefix is where deploy/tailscale/serve.json sends port-80 traffic.
+// Tailscale serve has no redirect handler and marks only HTTPS requests with
+// X-Forwarded-Proto, so plain HTTP is identified by this explicit prefix.
+const plainHTTPPrefix = "/__plain-http"
+
+// redirectPlainHTTP sends plain-HTTP requests from the front proxy to the HTTPS
+// origin. The web app needs a secure context, and credentials must never travel
+// without TLS. Other requests (direct, loopback, Cloudflare) are untouched.
+func redirectPlainHTTP(canonicalHost string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		plain := path == plainHTTPPrefix || strings.HasPrefix(path, plainHTTPPrefix+"/") ||
+			strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "http")
+		if !plain {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The certificate covers only the full name, so a short MagicDNS name
+		// such as http://family-photos/ must land on the canonical host.
+		host := canonicalHost
+		if host == "" {
+			host = r.Host
+			if index := strings.LastIndex(host, ":"); index > strings.LastIndex(host, "]") {
+				host = host[:index]
+			}
+		}
+		if host == "" || strings.ContainsAny(host, "/\\@") || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+			http.Error(w, "use https", http.StatusBadRequest)
+			return
+		}
+		target := strings.TrimPrefix(path, plainHTTPPrefix)
+		if target == "" {
+			target = "/"
+		}
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, "https://"+host+target, http.StatusPermanentRedirect)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {

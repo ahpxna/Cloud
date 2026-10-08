@@ -32,6 +32,7 @@ type gatewayFixture struct {
 	httpServer *httptest.Server
 	repository *upload.MemoryRepository
 	tokens     *auth.AccessTokenManager
+	mediaRoot  string
 }
 
 func newGatewayFixture(t *testing.T) *gatewayFixture {
@@ -41,10 +42,11 @@ func newGatewayFixture(t *testing.T) *gatewayFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mediaRoot := t.TempDir()
 	server, err := New(Config{
 		Repository:       repository,
 		Tokens:           tokens,
-		MediaRoot:        t.TempDir(),
+		MediaRoot:        mediaRoot,
 		MaxUploadBytes:   1 << 20,
 		ChunkBytes:       6,
 		VerificationJobs: 1,
@@ -58,7 +60,7 @@ func newGatewayFixture(t *testing.T) *gatewayFixture {
 		httpServer.Close()
 		server.Close()
 	})
-	return &gatewayFixture{t: t, server: server, httpServer: httpServer, repository: repository, tokens: tokens}
+	return &gatewayFixture{t: t, server: server, httpServer: httpServer, repository: repository, tokens: tokens, mediaRoot: mediaRoot}
 }
 
 func (fixture *gatewayFixture) token(user string) string {

@@ -10,6 +10,10 @@ help: ## Show available commands
 env: ## Create .env from the safe example when absent
 	@test -f .env || cp .env.example .env
 
+.PHONY: secrets
+secrets: env ## Generate missing/placeholder secrets in .env (never prints or rotates them)
+	bash scripts/generate-secrets.sh
+
 .PHONY: config
 config: env ## Validate the Compose model without starting containers
 	docker compose $(ALL_PROFILES) config --quiet
@@ -39,18 +43,62 @@ edge-up: env ## Start gateway plus Cloudflare Tunnel after configuring its token
 	@test -n "$$(sed -n 's/^CLOUDFLARE_TUNNEL_TOKEN=//p' .env)" || (echo "set CLOUDFLARE_TUNNEL_TOKEN in .env"; exit 1)
 	docker compose --profile gateway --profile edge up -d --build --wait postgres upload-gateway cloudflared
 
+.PHONY: tailnet-up
+tailnet-up: env ## Start gateway plus private Tailscale ingress (https://<host>.<tailnet>.ts.net)
+	@test -n "$$(sed -n 's/^TAILSCALE_AUTHKEY=//p' .env)" -o -s .data/tailscale/tailscaled.state || (echo "set TAILSCALE_AUTHKEY in .env (first start only)"; exit 1)
+	mkdir -p .data/tailscale
+	docker compose --profile gateway --profile tailnet up -d --build --wait postgres upload-gateway tailscale
+	@host="$$(docker compose --profile tailnet exec -T tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
+		| sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/\1/p' | head -n1)"; \
+	if [ -n "$$host" ] && [ "$$(sed -n 's/^CANONICAL_HOST=//p' .env)" != "$$host" ]; then \
+		if grep -q '^CANONICAL_HOST=' .env; then sed -i.bak "s#^CANONICAL_HOST=.*#CANONICAL_HOST=$$host#" .env && rm -f .env.bak; \
+		else printf 'CANONICAL_HOST=%s\n' "$$host" >> .env; fi; \
+		docker compose --profile gateway up -d --wait upload-gateway >/dev/null; \
+	fi; \
+	echo "Family web app: https://$$host/app/"
+
 .PHONY: observability-up
 observability-up: env ## Start private metrics, Prometheus, Alertmanager, and Grafana
+	mkdir -p .data/alertmanager/data .data/backup-status
 	docker compose --profile observability up -d --build --wait postgres metrics-exporter prometheus alertmanager grafana
+
+.PHONY: alert-email
+alert-email: env ## Render+validate Alertmanager email config from ALERT_* in .env (prompts for SMTP password)
+	bash scripts/configure-alert-email.sh $(if $(RESET_PASSWORD),--reset-password,)
+
+.PHONY: alert-test
+alert-test: ## Send a synthetic alert through Alertmanager (firing now, resolved ~5 min later)
+	docker compose --profile observability exec -T alertmanager amtool alert add PhotoCloudTestAlert \
+		'severity="info"' --annotation='summary="Test alert from make alert-test; no action needed"' \
+		--alertmanager.url=http://127.0.0.1:9093
+	@echo "Sent. Expect a FIRING email within ~1 minute and a RESOLVED email after ~5 minutes."
 
 .PHONY: create-user
 create-user: ## Create an invite-only family user in the running stack
 	@test -n "$(EMAIL)" || (echo "usage: make create-user EMAIL=name@example.com [ROLE=member]"; exit 1)
-	docker compose --profile admin run --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
+	docker compose --profile admin run --build --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
+
+.PHONY: list-users
+list-users: ## List accounts with state, MFA and active device count
+	docker compose --profile admin run --build --rm admin list-users
+
+ACCOUNT_ACTIONS := disable-user enable-user reset-password revoke-sessions reset-mfa
+.PHONY: account-actions $(ACCOUNT_ACTIONS)
+account-actions: ## make disable-user|enable-user|reset-password|revoke-sessions|reset-mfa EMAIL=...
+	@echo "usage: make <$(ACCOUNT_ACTIONS)> EMAIL=name@example.com (see docs/runbooks/account-lifecycle.md)"
+
+$(ACCOUNT_ACTIONS):
+	@test -n "$(EMAIL)" || (echo "usage: make $@ EMAIL=name@example.com"; exit 1)
+	docker compose --profile admin run --build --rm admin $@ -email "$(EMAIL)"
+
+.PHONY: delete-user
+delete-user: ## Start account deletion (see docs/runbooks/account-lifecycle.md)
+	@test -n "$(EMAIL)" || (echo "usage: make delete-user EMAIL=name@example.com CONFIRM=name@example.com"; exit 1)
+	docker compose --profile admin run --build --rm admin delete-user -email "$(EMAIL)" -confirm "$(CONFIRM)"
 
 .PHONY: scrub
 scrub: env ## Re-read and SHA-256 every committed original
-	docker compose --profile integrity run --rm scrub $(SCRUB_ARGS)
+	docker compose --profile integrity run --build --rm scrub $(SCRUB_ARGS)
 
 .PHONY: integrity-cycle
 integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
@@ -59,16 +107,16 @@ integrity-cycle: env ## Full-byte scrub followed by a new signed manifest
 .PHONY: manifest-verify
 manifest-verify: env ## Verify one signed manifest with the public trust key
 	@test -n "$(MANIFEST_FILE)" || (echo "usage: make manifest-verify MANIFEST_FILE=manifest-...json [MANIFEST_ARGS=...]"; exit 1)
-	docker compose --profile integrity run --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
+	docker compose --profile integrity run --build --rm manifest-verify -mode verify -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "manifests/$(notdir $(MANIFEST_FILE))" $(MANIFEST_ARGS)
 
 .PHONY: manifest-reconcile
 manifest-reconcile: env ## Repair a verified manifest file -> DB linkage crash window
 	@test -n "$(MANIFEST_FILE)" -a -n "$(OBJECT_KEY)" || (echo "usage: make manifest-reconcile MANIFEST_FILE=manifest-...json OBJECT_KEY=manifests/manifest-...json"; exit 1)
-	docker compose --profile integrity run --rm manifest-verify -mode reconcile -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "$(OBJECT_KEY)"
+	docker compose --profile integrity run --build --rm manifest-verify -mode reconcile -input "/manifests/$(notdir $(MANIFEST_FILE))" -object-key "$(OBJECT_KEY)"
 
 .PHONY: session-maintenance
 session-maintenance: env ## Prune expired/revoked refresh generations past retention
-	docker compose --profile maintenance run --rm session-maintenance
+	docker compose --profile maintenance run --build --rm session-maintenance
 
 .PHONY: audit-export
 audit-export: env ## Export append-only upload events to JSONL + SHA-256
@@ -91,7 +139,7 @@ synthetic-probe: ## Exercise login -> resumable upload -> verify -> download SHA
 synthetic-probe-docker: env ## Run the synthetic probe inside the private Docker ingress network
 	@test -n "$(EMAIL)" -a -n "$(PASSWORD_FILE)" || (echo "usage: make synthetic-probe-docker EMAIL=probe@example.com PASSWORD_FILE=/absolute/path/to/password [PROBE_ARGS=...]"; exit 1)
 	@test -f "$(PASSWORD_FILE)" || (echo "probe password file not found: $(PASSWORD_FILE)"; exit 1)
-	docker compose --profile gateway run --rm \
+	docker compose --profile gateway run --build --rm \
 		-v "$(abspath $(PASSWORD_FILE)):/run/secrets/probe-password:ro" \
 		synthetic-probe \
 		-base-url http://upload-gateway:8080 \
@@ -111,8 +159,10 @@ install-systemd: ## Install backup/integrity timers on a Linux host
 	install -m 0644 deploy/systemd/family-photo-cloud-integrity.timer /etc/systemd/system/
 	install -m 0644 deploy/systemd/family-photo-cloud-backup.service /etc/systemd/system/
 	install -m 0644 deploy/systemd/family-photo-cloud-backup.timer /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-session-maintenance.service /etc/systemd/system/
+	install -m 0644 deploy/systemd/family-photo-cloud-session-maintenance.timer /etc/systemd/system/
 	systemctl daemon-reload
-	@echo "Review unit paths/environment, then enable explicitly: systemctl enable --now family-photo-cloud-{integrity,backup}.timer"
+	@echo "Review unit paths/environment, then enable explicitly: systemctl enable --now family-photo-cloud-{integrity,backup,session-maintenance}.timer"
 
 .PHONY: status
 status: ## Show local container state across all profiles

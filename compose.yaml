@@ -20,12 +20,11 @@ networks:
 
 volumes:
   prometheus-data:
-  alertmanager-data:
   grafana-data:
 
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
       POSTGRES_USER: ${POSTGRES_USER:-photo_cloud}
@@ -46,7 +45,7 @@ services:
   # Runtime roles are separate from the bootstrap superuser. This runs on every
   # deployment so existing volumes are upgraded without docker-entrypoint hooks.
   db-role-bootstrap:
-    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine}
     command: ["/bin/sh", "/opt/photo-cloud/bootstrap-db-roles.sh", "bootstrap"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
@@ -102,7 +101,7 @@ services:
     cap_drop: ["ALL"]
 
   db-runtime-grants:
-    image: ${POSTGRES_IMAGE:-postgres:18.4-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine}
     command: ["/bin/sh", "/opt/photo-cloud/bootstrap-db-roles.sh", "finalize"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-photo_cloud}
@@ -189,13 +188,14 @@ services:
       HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-30m}
       HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-2m}
       HTTP_ADDR: :8080
+      CANONICAL_HOST: ${CANONICAL_HOST:-}
     ports:
       - "127.0.0.1:${UPLOAD_GATEWAY_DEV_PORT:-8081}:8080"
     networks: [database, ingress]
     volumes:
       # Staging, quarantine, and originals intentionally share one mount. This
       # is required for no-replace atomic commit semantics.
-      - ./.data/media:/srv/media
+      - ${PHOTO_MEDIA_HOST_ROOT:-./.data/media}:/srv/media
     depends_on:
       postgres:
         condition: service_healthy
@@ -354,7 +354,7 @@ services:
       PHOTO_MEDIA_ROOT: /srv/media
     networks: [database]
     volumes:
-      - ./.data/media:/srv/media:ro
+      - ${PHOTO_MEDIA_HOST_ROOT:-./.data/media}:/srv/media:ro
       - ${INTEGRITY_REPORT_DIR:-./.data/integrity-reports}:/reports
     depends_on:
       postgres:
@@ -385,11 +385,15 @@ services:
       PGPASSWORD: ${READONLY_DB_PASSWORD:?set READONLY_DB_PASSWORD in .env}
       PHOTO_MEDIA_ROOT: /srv/media
       METRICS_ADDR: :9090
+      # Probed over the private database network so a gateway outage alerts.
+      GATEWAY_READY_URL: http://upload-gateway:8080/readyz
+      BACKUP_STATUS_FILE: /backup-status/last-success
     ports:
       - "127.0.0.1:${METRICS_DEV_PORT:-9091}:9090"
     networks: [database, observability]
     volumes:
-      - ./.data/media:/srv/media:ro
+      - ${PHOTO_MEDIA_HOST_ROOT:-./.data/media}:/srv/media:ro
+      - ${BACKUP_STATUS_DIR:-./.data/backup-status}:/backup-status:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -410,7 +414,7 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.4}
     profiles: ["observability"]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -435,8 +439,11 @@ services:
     restart: unless-stopped
 
   alertmanager:
-    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
     profiles: ["observability"]
+    # Runs as the operator so it can read the mode-600 SMTP password rendered by
+    # `make alert-email`; its state lives in a host directory that user owns.
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
@@ -444,8 +451,8 @@ services:
       - "127.0.0.1:${ALERTMANAGER_DEV_PORT:-9093}:9093"
     networks: [observability, notification-egress]
     volumes:
-      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-      - alertmanager-data:/alertmanager
+      - ${ALERTMANAGER_CONFIG_DIR:-./observability/alertmanager}:/etc/alertmanager:ro
+      - ./.data/alertmanager/data:/alertmanager
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -455,13 +462,21 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: ${GRAFANA_IMAGE:-grafana/grafana:12.1.0}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.4.12}
     profiles: ["observability"]
     environment:
       GF_SERVER_HTTP_ADDR: 0.0.0.0
       GF_SERVER_HTTP_PORT: "3000"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # The observability network has no Internet egress by design; stop
+      # Grafana phoning home (and logging the failures) for updates/telemetry.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin-password
     ports:
       - "127.0.0.1:${GRAFANA_DEV_PORT:-3000}:3000"
@@ -511,7 +526,7 @@ services:
     cap_drop: ["ALL"]
 
   cloudflared:
-    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.7.2}
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.9.3}
     profiles: ["edge"]
     command: ["tunnel", "--no-autoupdate", "run"]
     environment:
@@ -526,12 +541,52 @@ services:
     cap_drop: ["ALL"]
     restart: unless-stopped
 
+  # Private family ingress (alternative to cloudflared): joins your tailnet and
+  # serves the gateway, web app included, at https://<TAILSCALE_HOSTNAME>.<tailnet>.ts.net.
+  # Only devices signed in to your tailnet can reach it; nothing is published
+  # on the public Internet. Userspace networking needs no capabilities.
+  tailscale:
+    image: ${TAILSCALE_IMAGE:-tailscale/tailscale:v1.102.5}
+    profiles: ["tailnet"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    hostname: ${TAILSCALE_HOSTNAME:-family-photos}
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY:-}
+      TS_HOSTNAME: ${TAILSCALE_HOSTNAME:-family-photos}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /tmp/tailscaled.sock
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    networks: [ingress, tunnel-egress]
+    volumes:
+      - ./.data/tailscale:/var/lib/tailscale
+      - ./deploy/tailscale/serve.json:/config/serve.json:ro
+    depends_on:
+      upload-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9002/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 8
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
   # This is deliberately a local protocol laboratory, not the production
   # ingress. It has no product authentication or ownership enforcement yet.
   # Loopback binding prevents accidental Internet exposure while the gateway
   # contract is implemented.
   tusd-lab:
-    image: ${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.0}
+    image: ${TUSD_IMAGE:-ghcr.io/tus/tusd:v2.10.1}
     profiles: ["protocol-lab"]
     command:
       - -upload-dir=/srv/tus

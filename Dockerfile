@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-ARG GO_BUILD_IMAGE=golang:1.26.7-alpine3.23
+ARG GO_BUILD_IMAGE=golang:1.26.8-alpine3.23
 ARG RUNTIME_IMAGE=alpine:3.23
 FROM ${GO_BUILD_IMAGE} AS build
 WORKDIR /src

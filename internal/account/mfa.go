@@ -29,10 +29,14 @@ const (
 	mfaActionWindow         = 5 * time.Minute
 	mfaActionAttempts       = 5
 	mfaActionRetention      = 24 * time.Hour
-	refreshRetryGrace       = 30 * time.Second
-	totpPeriodSeconds       = int64(30)
-	totpDigits              = 6
-	recoveryCodeCount       = 10
+	// A phone can lose the refresh response and only retry when the app next
+	// wakes, often hours later. The retry still needs the old token, the same
+	// rotation_request_id and a live successor, so a long window only helps the
+	// device that issued the request; a different request ID remains a replay.
+	refreshRetryGrace = 7 * 24 * time.Hour
+	totpPeriodSeconds = int64(30)
+	totpDigits        = 6
+	recoveryCodeCount = 10
 )
 
 var (

@@ -1,0 +1,78 @@
+# promtool test rules observability/prometheus/rules_test.yml
+rule_files:
+  - rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: gateway outage pages after five minutes
+    interval: 1m
+    input_series:
+      - series: 'photo_cloud_gateway_ready'
+        values: '1 1 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PhotoCloudGatewayDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: PhotoCloudGatewayDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Upload gateway is not ready; family uploads and library access are failing"
+              description: "Check `make status` and the upload-gateway logs. /readyz also fails when free space drops below PHOTO_MIN_FREE_BYTES or the media disk is read-only."
+
+  # promtool's clock starts at Unix time 0, so "never backed up" (0) only
+  # looks stale once the test clock passes 36 hours.
+  - name: a never-run backup is stale
+    interval: 1m
+    input_series:
+      - series: 'photo_cloud_backup_last_success_timestamp_seconds'
+        values: '0x2999'
+    alert_rule_test:
+      - eval_time: 40h
+        alertname: PhotoCloudBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No checked encrypted backup in the last 36 hours (or ever)"
+              description: "Run `make backup` and read its output; check `systemctl status family-photo-cloud-backup.timer`. A single disk is not a backup."
+
+  - name: a backup stays fresh for 36 hours
+    interval: 1m
+    input_series:
+      # Last success recorded at t=1h.
+      - series: 'photo_cloud_backup_last_success_timestamp_seconds'
+        values: '3600x2999'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: PhotoCloudBackupStale
+        exp_alerts: []
+      - eval_time: 38h
+        alertname: PhotoCloudBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No checked encrypted backup in the last 36 hours (or ever)"
+              description: "Run `make backup` and read its output; check `systemctl status family-photo-cloud-backup.timer`. A single disk is not a backup."
+
+  - name: integrity cycle older than eight days warns
+    interval: 5m
+    input_series:
+      - series: 'photo_cloud_last_signed_manifest_timestamp_seconds'
+        values: '0x2700'
+    alert_rule_test:
+      - eval_time: 7d
+        alertname: PhotoCloudIntegrityCycleStale
+        exp_alerts: []
+      - eval_time: 9d
+        alertname: PhotoCloudIntegrityCycleStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "No signed integrity manifest in the last 8 days"
+              description: "The weekly `make integrity-cycle` has not completed; check `systemctl status family-photo-cloud-integrity.timer`."

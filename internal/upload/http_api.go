@@ -81,6 +81,8 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case (path == "" || path == "/") && r.Method == http.MethodPost:
 		api.create(w, r, principal)
+	case (path == "" || path == "/") && r.Method == http.MethodGet:
+		api.list(w, r, principal)
 	case strings.HasPrefix(path, "/") && len(path) > 1 && r.Method == http.MethodGet:
 		api.get(w, r, principal, strings.TrimPrefix(path, "/"))
 	case strings.HasSuffix(path, "/restart") && r.Method == http.MethodPost:
@@ -89,6 +91,29 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
+}
+
+func (api *API) list(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	lister, ok := api.repository.(SessionLister)
+	if !ok {
+		writeProblem(w, http.StatusNotImplemented, "listing_unavailable", "upload listing is unavailable")
+		return
+	}
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 200 {
+			writeProblem(w, http.StatusBadRequest, "invalid_limit", "limit must be an integer from 1 through 200")
+			return
+		}
+		limit = value
+	}
+	sessions, err := lister.ListSessions(r.Context(), principal.UserID, limit)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "session_list_failed", "could not list uploads")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"uploads": sessions})
 }
 
 func (api *API) restartSession(w http.ResponseWriter, r *http.Request, principal auth.Principal, id string) {
@@ -107,6 +132,11 @@ func (api *API) restartSession(w http.ResponseWriter, r *http.Request, principal
 	}
 	if errors.Is(err, ErrUploadResourceInconsistent) {
 		writeProblem(w, http.StatusConflict, "upload_resource_inconsistent", "server upload bytes and TUS metadata disagree; data was preserved for recovery")
+		return
+	}
+	if errors.Is(err, ErrUploadBusy) {
+		w.Header().Set("Retry-After", "5")
+		writeProblem(w, http.StatusConflict, "upload_busy", "another request is still writing this upload; retry shortly")
 		return
 	}
 	if err != nil {

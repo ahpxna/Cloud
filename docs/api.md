@@ -26,7 +26,7 @@ and a 30-day opaque refresh token. When confirmed MFA is enabled, a correct
 password returns `202` with a one-time 5-minute `challenge` and **no access or
 refresh token**. Complete `/v1/auth/mfa/verify` with either a current TOTP code
 or one unused recovery code before tokens are issued. Store the refresh token
-in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 30 seconds the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried; `REFRESH_RETRY_ENCRYPTION_KEY_BASE64` is a dedicated persistent 32-byte key so that retry capsule remains decryptable across a gateway crash/restart; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes the entire refresh-token family for that device and is idempotent.
+in iOS Keychain, never UserDefaults or the photo queue database. `POST /v1/auth/refresh` rotates the refresh token. Updated clients also send a client-generated UUID as `rotation_request_id` and persist that UUID until a successful response. For 7 days (a phone often retries only when the app next wakes) the server can return the exact encrypted successor only when both the old token **and the same request ID** are retried and that successor is still live; `REFRESH_RETRY_ENCRYPTION_KEY_BASE64` is a dedicated persistent 32-byte key so that retry capsule remains decryptable across a gateway crash/restart; a different request ID is treated as replay and revokes the live family. Older clients that omit the request ID still rotate normally but do not receive lost-response idempotency. Refresh sessions are token families: reuse of a revoked token outside the exact retry case revokes every live descendant and emits a security warning without revealing the account to the caller. `POST /v1/auth/logout` revokes the entire refresh-token family for that device and is idempotent.
 
 
 ### MFA lifecycle
@@ -126,13 +126,16 @@ TUSKit persists its applied custom headers. Therefore it must persist this
 scoped upload capability, never the general 15-minute access token. If the app
 has lost its local TUS metadata while an incomplete server resource is still
 `uploading`, it calls `POST /v1/upload-sessions/{id}/restart` with its access
-token. The gateway rejects stale PATCH requests, removes only that incomplete
-staging resource, and returns the session in `created` state; the client starts
-the same idempotent upload from byte zero. A complete resource is never
-restartable.
+token. The gateway takes tusd's per-upload lock (interrupting a stalled PATCH
+for that upload), removes only the incomplete staging resource, and returns the
+session in `created` state; the client starts the same idempotent upload from
+byte zero. A complete resource is never restartable. `409 upload_busy` with
+`Retry-After` means another request still held the upload; retry shortly.
 
 On connection loss, keep the returned `Location`, issue authenticated `HEAD`,
-read `Upload-Offset`, and resume exactly there. Do not mark the local queue item
+read `Upload-Offset`, and resume exactly there. A new `HEAD` or `PATCH` for the
+same upload asks a stalled earlier PATCH to release its lock, so resuming after
+a network change takes about a second rather than waiting for a server timeout. Do not mark the local queue item
 complete after the last `204`: poll `GET /v1/upload-sessions/{id}` until it is
 `available`. `quarantined` means the origin's byte count or SHA-256 did not
 match and the client must not delete its source copy.
@@ -147,6 +150,79 @@ original's authenticated URL.
 video seeking and large original downloads. The gateway checks owner ID before
 opening the file and returns `404` to a different account. The original's
 storage path is never exposed in the API.
+
+`GET /v1/assets?tickets=1` also returns a `view_url` per asset: the original
+URL plus a 10-minute view ticket scoped to that one asset and to the caller's
+device session. Browser `<img>`/`<video>` elements, which cannot send an
+`Authorization` header, use it. A ticket cannot list the library, open another
+asset, or act as an access or upload token, and it stops working when the
+device session is revoked. Originals are served byte-for-byte; nothing is
+resized, transcoded or recompressed.
+
+## Thumbnails
+
+iPhone originals are mostly HEIC, which the server cannot decode in pure Go,
+so the owner's browser renders a preview (Safari decodes HEIC and video
+frames) and uploads it once with `PUT /v1/assets/{id}/thumbnail`
+(`Content-Type: image/jpeg`, access token, at most 512 KiB and 640×640). The
+server decodes and re-encodes it, dropping any metadata, and stores it under
+`thumbnails/<owner>/` on the media volume. `GET /v1/assets?tickets=1` then adds
+a `thumbnail_url` whose ticket is identical for an hour so browsers cache it.
+Thumbnail and original tickets are separate kinds: neither opens the other.
+Thumbnails are derived data, outside the signed integrity manifest, and can be
+deleted and regenerated at any time.
+
+## Upload progress
+
+`GET /v1/upload-sessions?limit=50` (access token) lists the caller's most
+recently updated uploads with `state`, `expected_size`, `received_size` and
+timestamps. The web app's *Tải lên* page polls it.
+
+## Single-request uploads (iOS Shortcut and web app)
+
+`POST /v1/direct-uploads` takes the whole file as the request body. `POST /app/`
+is an alias, so a Shortcut can use the same address the family opens to watch
+progress (`https://<host>/app/#uploads`; the fragment is never sent):
+
+| Header | Value |
+| --- | --- |
+| `Authorization` | `Bearer <upload key>` (Shortcut) or `Bearer <access token>` (web app) |
+| `Content-Length` | required, at most `TUS_MAX_UPLOAD_BYTES` |
+| `X-Content-SHA256` | hex SHA-256 the client computed |
+| `X-File-Name` | file name, optionally percent-encoded; an extension is added if missing |
+| `X-Media-Type` / `Content-Type` | optional; otherwise inferred from the extension or the file's first bytes |
+
+The request runs the same state machine as TUS: admission control, tusd's
+filestore under its per-upload lock, `received`, then server-side SHA-256
+verification before the asset becomes visible. `202` means received and being
+verified, `200` means already backed up (`duplicate: true`), `409` means
+previously rejected or busy, `429` carries `Retry-After`. Sending the same file
+again under the same name is idempotent; a digest mismatch is quarantined.
+
+Upload keys (`fpcu_…`) are long-lived and **upload-only**: they cannot read the
+library, list uploads or change the account. Manage them with an access token:
+`GET /v1/auth/upload-keys`, `POST /v1/auth/upload-keys` `{"name": "iPhone của mẹ"}`
+(returns the key once), `DELETE /v1/auth/upload-keys/{id}`. At most 10 are
+active per account. `revoke-sessions`, `reset-password`, `reset-mfa`,
+`disable-user` and `delete-user` revoke them too.
+
+## MFA status
+
+`GET /v1/auth/mfa` (access token) returns `{"available", "enabled", "pending"}`.
+`POST /v1/auth/mfa/enroll` now also returns `qr_png_base64`, a QR code of the
+`otpauth://` URI for enrolling from a computer. On an iPhone, opening the
+`otpauth://` link adds the code to the built-in Passwords app, which then
+autofills it in Safari. Confirming or disabling MFA signs out every device.
+
+## Web app
+
+`/app/` serves a same-origin web app (Vietnamese UI) for sign-in with MFA,
+browsing and downloading originals, Live Photo playback (a still and a video
+with the same base name uploaded within 10 minutes are shown as one item),
+uploads with progress, and upload-key management. It is served with
+`script-src 'self'` and no inline code. Credentials live in the browser's
+local storage, which is acceptable only because the app is reachable solely
+inside the tailnet (or behind Cloudflare) with that strict CSP.
 
 ## Current omissions
 

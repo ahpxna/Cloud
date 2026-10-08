@@ -80,3 +80,54 @@ func TestUploadCapabilityIsScopedAndNotAcceptedAsAccessToken(t *testing.T) {
 		t.Fatal("upload capability was accepted as a general access token")
 	}
 }
+
+func TestViewTicketIsScopedToOneAssetAndCannotActAsAccessToken(t *testing.T) {
+	manager, err := NewAccessTokenManager([]byte(strings.Repeat("v", 32)), DefaultIssuer, DefaultAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := Principal{UserID: "user-1", SessionID: "session-1"}
+	ticket, err := manager.IssueView(principal, "asset-1", ViewOriginal, time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := manager.VerifyView(ticket, "asset-1", ViewOriginal)
+	if err != nil || got != principal {
+		t.Fatalf("view ticket = %#v err=%v", got, err)
+	}
+	if _, err := manager.VerifyView(ticket, "asset-2", ViewOriginal); err == nil {
+		t.Fatal("view ticket accepted for a different asset")
+	}
+	if _, err := manager.VerifyView(ticket, "asset-1", ViewThumbnail); err == nil {
+		t.Fatal("original ticket accepted for the thumbnail")
+	}
+	if _, err := manager.Verify(ticket); err == nil {
+		t.Fatal("view ticket accepted as an access token")
+	}
+	hour := time.Now().Truncate(time.Hour)
+	first, err := manager.IssueView(principal, "asset-1", ViewThumbnail, hour, 2*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _ := manager.IssueView(principal, "asset-1", ViewThumbnail, hour, 2*time.Hour)
+	if first != second {
+		t.Fatal("thumbnail tickets for the same hour must be identical so browsers can cache them")
+	}
+	if _, err := manager.VerifyUpload(ticket); err == nil {
+		t.Fatal("view ticket accepted as an upload capability")
+	}
+	access, err := manager.Issue(principal, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.VerifyView(access, "asset-1", ViewOriginal); err == nil {
+		t.Fatal("access token accepted as a view ticket")
+	}
+	expired, err := manager.IssueView(principal, "asset-1", ViewOriginal, time.Now().Add(-time.Hour), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.VerifyView(expired, "asset-1", ViewOriginal); err == nil {
+		t.Fatal("expired view ticket accepted")
+	}
+}
