@@ -43,6 +43,14 @@ edge-up: env ## Start gateway plus Cloudflare Tunnel after configuring its token
 	@test -n "$$(sed -n 's/^CLOUDFLARE_TUNNEL_TOKEN=//p' .env)" || (echo "set CLOUDFLARE_TUNNEL_TOKEN in .env"; exit 1)
 	docker compose --profile gateway --profile edge up -d --build --wait postgres upload-gateway cloudflared
 
+.PHONY: tailnet-up
+tailnet-up: env ## Start gateway plus private Tailscale ingress (https://<host>.<tailnet>.ts.net)
+	@test -n "$$(sed -n 's/^TAILSCALE_AUTHKEY=//p' .env)" -o -s .data/tailscale/tailscaled.state || (echo "set TAILSCALE_AUTHKEY in .env (first start only)"; exit 1)
+	mkdir -p .data/tailscale
+	docker compose --profile gateway --profile tailnet up -d --build --wait postgres upload-gateway tailscale
+	@docker compose --profile tailnet exec -T tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
+		| sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/Family web app: https:\/\/\1\/app\//p' | head -n1
+
 .PHONY: observability-up
 observability-up: env ## Start private metrics, Prometheus, Alertmanager, and Grafana
 	mkdir -p .data/alertmanager/data .data/backup-status

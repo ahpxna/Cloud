@@ -540,6 +540,46 @@ services:
     cap_drop: ["ALL"]
     restart: unless-stopped
 
+  # Private family ingress (alternative to cloudflared): joins your tailnet and
+  # serves the gateway, web app included, at https://<TAILSCALE_HOSTNAME>.<tailnet>.ts.net.
+  # Only devices signed in to your tailnet can reach it; nothing is published
+  # on the public Internet. Userspace networking needs no capabilities.
+  tailscale:
+    image: ${TAILSCALE_IMAGE:-tailscale/tailscale:v1.102.5}
+    profiles: ["tailnet"]
+    user: "${PHOTO_UID:-1000}:${PHOTO_GID:-1000}"
+    hostname: ${TAILSCALE_HOSTNAME:-family-photos}
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY:-}
+      TS_HOSTNAME: ${TAILSCALE_HOSTNAME:-family-photos}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /tmp/tailscaled.sock
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    networks: [ingress, tunnel-egress]
+    volumes:
+      - ./.data/tailscale:/var/lib/tailscale
+      - ./deploy/tailscale/serve.json:/config/serve.json:ro
+    depends_on:
+      upload-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9002/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 8
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
   # This is deliberately a local protocol laboratory, not the production
   # ingress. It has no product authentication or ownership enforcement yet.
   # Loopback binding prevents accidental Internet exposure while the gateway

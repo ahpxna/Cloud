@@ -52,7 +52,14 @@ kept outside Git. Details live in the linked runbooks.
       `family-photo-cloud-{integrity,backup,session-maintenance}.timer`.
 - [ ] The next morning the `PhotoCloudBackupStale` alert is quiet.
 
-## 6. Public ingress ([cloudflare-mvp](cloudflare-mvp.md), `infra/cloudflare`)
+## 6. Access from outside the home: choose one
+
+**Free and private (recommended for a family):** follow
+[tailnet-family](tailnet-family.md): `make tailnet-up`, Tailscale on each
+phone, the web app at `/app/` and the iOS Shortcut. No domain, no Apple fee;
+skip the rest of section 6 and the iPhone-app items in section 7.
+
+**Public hostname (Cloudflare):**
 
 - [ ] A domain you control, added to Cloudflare (a `*.workers.dev` or
       `*.trycloudflare.com` name cannot carry a stable named Tunnel; quick
@@ -66,7 +73,7 @@ kept outside Git. Details live in the linked runbooks.
 - [ ] `make edge-up`; `make synthetic-probe BASE_URL=https://<hostname> …`
       passes through Cloudflare.
 
-## 7. iPhone app
+## 7. Native iPhone app (only with a public hostname or a paid Apple account)
 
 - [ ] Set `PHOTO_CLOUD_API_BASE_URL` in `ios/project.yml` to
       `https://<hostname>` and your Apple team in `DEVELOPMENT_TEAM`; keep the

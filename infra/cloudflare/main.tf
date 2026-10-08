@@ -85,8 +85,8 @@ resource "cloudflare_ruleset" "api_method_policy" {
     },
     {
       ref         = "family_photo_cloud_auth_methods"
-      description = "Authentication mutation endpoints are POST-only"
-      expression  = "http.host eq \"${var.api_hostname}\" and starts_with(http.request.uri.path, \"/v1/auth/\") and http.request.uri.path ne \"/v1/auth/sessions\" and not starts_with(http.request.uri.path, \"/v1/auth/sessions/\") and http.request.method ne \"POST\""
+      description = "Authentication mutation endpoints are POST-only, except device-session and upload-key management"
+      expression  = "http.host eq \"${var.api_hostname}\" and starts_with(http.request.uri.path, \"/v1/auth/\") and not starts_with(http.request.uri.path, \"/v1/auth/sessions\") and not starts_with(http.request.uri.path, \"/v1/auth/upload-keys\") and http.request.method ne \"POST\""
       action      = "block"
     }
   ]

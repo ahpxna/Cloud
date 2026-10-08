@@ -151,6 +151,56 @@ video seeking and large original downloads. The gateway checks owner ID before
 opening the file and returns `404` to a different account. The original's
 storage path is never exposed in the API.
 
+`GET /v1/assets?tickets=1` also returns a `view_url` per asset: the original
+URL plus a 10-minute view ticket scoped to that one asset and to the caller's
+device session. Browser `<img>`/`<video>` elements, which cannot send an
+`Authorization` header, use it. A ticket cannot list the library, open another
+asset, or act as an access or upload token, and it stops working when the
+device session is revoked. Originals are served byte-for-byte; nothing is
+resized, transcoded or recompressed.
+
+## Upload progress
+
+`GET /v1/upload-sessions?limit=50` (access token) lists the caller's most
+recently updated uploads with `state`, `expected_size`, `received_size` and
+timestamps. The web app's *Tải lên* page polls it.
+
+## Single-request uploads (iOS Shortcut and web app)
+
+`POST /v1/direct-uploads` takes the whole file as the request body:
+
+| Header | Value |
+| --- | --- |
+| `Authorization` | `Bearer <upload key>` (Shortcut) or `Bearer <access token>` (web app) |
+| `Content-Length` | required, at most `TUS_MAX_UPLOAD_BYTES` |
+| `X-Content-SHA256` | hex SHA-256 the client computed |
+| `X-File-Name` | file name, optionally percent-encoded; an extension is added if missing |
+| `X-Media-Type` / `Content-Type` | optional; otherwise inferred from the extension or the file's first bytes |
+
+The request runs the same state machine as TUS: admission control, tusd's
+filestore under its per-upload lock, `received`, then server-side SHA-256
+verification before the asset becomes visible. `202` means received and being
+verified, `200` means already backed up (`duplicate: true`), `409` means
+previously rejected or busy, `429` carries `Retry-After`. Sending the same file
+again under the same name is idempotent; a digest mismatch is quarantined.
+
+Upload keys (`fpcu_…`) are long-lived and **upload-only**: they cannot read the
+library, list uploads or change the account. Manage them with an access token:
+`GET /v1/auth/upload-keys`, `POST /v1/auth/upload-keys` `{"name": "iPhone của mẹ"}`
+(returns the key once), `DELETE /v1/auth/upload-keys/{id}`. At most 10 are
+active per account. `revoke-sessions`, `reset-password`, `reset-mfa`,
+`disable-user` and `delete-user` revoke them too.
+
+## Web app
+
+`/app/` serves a same-origin web app (Vietnamese UI) for sign-in with MFA,
+browsing and downloading originals, Live Photo playback (a still and a video
+with the same base name uploaded within 10 minutes are shown as one item),
+uploads with progress, and upload-key management. It is served with
+`script-src 'self'` and no inline code. Credentials live in the browser's
+local storage, which is acceptable only because the app is reachable solely
+inside the tailnet (or behind Cloudflare) with that strict CSP.
+
 ## Current omissions
 
 Thumbnails, EXIF extraction, destructive deletion/retention semantics, external

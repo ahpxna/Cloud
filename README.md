@@ -34,6 +34,8 @@ The accepted direction is:
   removed through public IP or a VPS/WireGuard path.
 
 **Deploying?** Follow the ordered [go-live checklist](docs/runbooks/go-live.md).
+For free private family access (Tailscale + web app + iOS Shortcut), see
+[tailnet-family](docs/runbooks/tailnet-family.md).
 
 Read [the architecture](docs/architecture.md), [MVP API contract](docs/api.md),
 [integrity manifest format](docs/integrity-manifest-v1.md), [iOS scaffold

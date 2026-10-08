@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2962ff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Ảnh nhà">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Ảnh gia đình</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="icon" href="icon-192.png">
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Ảnh gia đình</h1>
+    <span id="offline" class="badge warn" hidden>Mất kết nối</span>
+  </header>
+
+  <main>
+    <section id="view-login" class="view" hidden>
+      <form id="login-form" class="card" autocomplete="on">
+        <h2>Đăng nhập</h2>
+        <label>Email
+          <input id="login-email" type="email" autocomplete="username" required>
+        </label>
+        <label>Mật khẩu
+          <input id="login-password" type="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit" class="primary">Đăng nhập</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+      <form id="mfa-form" class="card" hidden>
+        <h2>Mã xác thực</h2>
+        <p>Nhập 6 số trong ứng dụng xác thực, hoặc một mã khôi phục.</p>
+        <label>Mã
+          <input id="mfa-code" inputmode="numeric" autocomplete="one-time-code" required>
+        </label>
+        <button type="submit" class="primary">Xác nhận</button>
+        <p id="mfa-error" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="view-library" class="view" hidden>
+      <p id="library-empty" class="muted" hidden>Chưa có ảnh nào được sao lưu.</p>
+      <div id="grid" class="grid"></div>
+      <button id="load-more" class="secondary" hidden>Xem thêm</button>
+      <p id="library-error" class="error" role="alert"></p>
+    </section>
+
+    <section id="view-uploads" class="view" hidden>
+      <div class="card">
+        <label class="primary file-button">Chọn ảnh hoặc video để tải lên
+          <input id="file-input" type="file" accept="image/heic,image/heif,image/*,video/quicktime,video/*" multiple>
+        </label>
+        <p class="muted">Giữ ảnh trong máy cho tới khi thấy dấu "Đã sao lưu ✓".</p>
+        <p class="muted">Lưu ý: khi chọn <b>video</b> từ Thư viện ảnh qua trình duyệt, iPhone có thể tự nén video. Muốn giữ bản gốc, hãy gửi bằng Phím tắt.</p>
+      </div>
+      <ul id="local-uploads" class="list"></ul>
+      <h2 class="section-title">Gần đây</h2>
+      <ul id="server-uploads" class="list"></ul>
+      <p id="uploads-error" class="error" role="alert"></p>
+    </section>
+
+    <section id="view-settings" class="view" hidden>
+      <div class="card">
+        <h2>Gửi ảnh từ nút Chia sẻ</h2>
+        <p>Tạo một khoá cho Phím tắt trên điện thoại này. Khoá chỉ dùng để gửi ảnh lên, không xem được thư viện.</p>
+        <label>Tên điện thoại
+          <input id="key-name" maxlength="100" value="iPhone">
+        </label>
+        <button id="create-key" class="primary">Tạo khoá cho Phím tắt</button>
+        <div id="new-key" hidden>
+          <p class="warn-text">Khoá chỉ hiện một lần. Sao chép ngay rồi dán vào Phím tắt.</p>
+          <code id="new-key-value" class="secret"></code>
+          <button id="copy-key" class="secondary">Sao chép khoá</button>
+          <p>Địa chỉ gửi ảnh:</p>
+          <code id="upload-url" class="secret"></code>
+          <button id="copy-url" class="secondary">Sao chép địa chỉ</button>
+          <p>Tạo Phím tắt <b>một lần</b> trên điện thoại này (tên hành động tiếng Anh để trong ngoặc, gõ vào ô tìm kiếm của app Phím tắt):</p>
+          <ol class="steps">
+            <li>Mở app <b>Phím tắt</b> → <b>+</b> → đặt tên <b>Ảnh nhà</b>. Bấm <b>ⓘ</b>: bật <b>Hiện trong Trang chia sẻ</b> (chọn loại <b>Ảnh</b> và <b>Phương tiện</b>) và <b>Thêm vào Màn hình chính</b>.</li>
+            <li>Thêm <b>Nếu</b> (If): <i>Đầu vào phím tắt</i> <b>có giá trị bất kỳ</b>.
+              <ul>
+                <li>Trong nhánh <b>Nếu</b>: <b>Đặt biến</b> (Set Variable) tên <code>Anh</code> = <i>Đầu vào phím tắt</i>.</li>
+                <li>Trong nhánh <b>Nếu không</b> (Otherwise): <b>Chọn từ menu</b> (Choose from Menu) với 3 mục:
+                  <ul>
+                    <li><b>Gửi ảnh lên</b>: <b>Chọn ảnh</b> (Select Photos), bật <b>Chọn nhiều</b> → <b>Đặt biến</b> <code>Anh</code> = <i>Ảnh</i>.</li>
+                    <li><b>Xem &amp; tải ảnh</b>: <b>Mở URL</b> (Open URLs) <code class="app-url" data-hash="library"></code> → <b>Dừng phím tắt này</b> (Stop This Shortcut).</li>
+                    <li><b>Tiến trình tải lên</b>: <b>Mở URL</b> <code class="app-url" data-hash="uploads"></code> → <b>Dừng phím tắt này</b>.</li>
+                  </ul>
+                </li>
+              </ul>
+            </li>
+            <li>Sau <b>Kết thúc Nếu</b>: <b>Lặp lại với mỗi</b> (Repeat with Each) mục trong <code>Anh</code>, bên trong thêm:
+              <ul>
+                <li><b>Tạo hash</b> (Generate Hash), kiểu <b>SHA256</b>, của <i>Mục lặp lại</i>.</li>
+                <li><b>Lấy tên</b> (Get Name) của <i>Mục lặp lại</i> → <b>Mã hoá URL</b> (URL Encode) kết quả đó.</li>
+                <li><b>Nhận nội dung của URL</b> (Get Contents of URL): dán <b>địa chỉ gửi ảnh</b> ở trên, Phương thức <b>POST</b>, Nội dung yêu cầu <b>Tệp</b> = <i>Mục lặp lại</i>, và 3 Tiêu đề:
+                  <ul>
+                    <li><code>Authorization</code> = <code>Bearer </code> + khoá ở trên (có một dấu cách sau Bearer)</li>
+                    <li><code>X-Content-SHA256</code> = <i>Hash</i></li>
+                    <li><code>X-File-Name</code> = <i>Văn bản đã mã hoá URL</i></li>
+                  </ul>
+                </li>
+              </ul>
+            </li>
+            <li>Sau vòng lặp: <b>Hiển thị thông báo</b> "Đã gửi ảnh lên Cloud".</li>
+            <li>Thử: mở <b>Ảnh</b> → chọn ảnh → nút Chia sẻ → <b>Ảnh nhà</b>. Rồi bấm biểu tượng Ảnh nhà trên màn hình chính → <b>Tiến trình tải lên</b> để xem.</li>
+          </ol>
+        </div>
+        <p id="key-error" class="error" role="alert"></p>
+      </div>
+      <div class="card">
+        <h2>Khoá đang dùng</h2>
+        <ul id="key-list" class="list"></ul>
+      </div>
+      <div class="card">
+        <p class="muted">Mẹo: trong Safari bấm Chia sẻ → <b>Thêm vào MH chính</b> để mở như một app.</p>
+        <button id="logout" class="danger">Đăng xuất</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="viewer" class="viewer" hidden>
+    <div class="viewer-bar">
+      <button id="viewer-close" class="secondary">Đóng</button>
+      <span id="viewer-name" class="viewer-name"></span>
+      <button id="viewer-live" class="secondary" hidden>▶ Live</button>
+      <a id="viewer-download" class="secondary button" download>Tải về</a>
+      <a id="viewer-download-live" class="secondary button" download hidden>Tải video Live</a>
+    </div>
+    <div id="viewer-body" class="viewer-body"></div>
+  </div>
+
+  <nav id="tabs" class="tabs" hidden>
+    <button data-tab="library" class="tab">Thư viện</button>
+    <button data-tab="uploads" class="tab">Tải lên</button>
+    <button data-tab="settings" class="tab">Cài đặt</button>
+  </nav>
+</body>
+</html>
