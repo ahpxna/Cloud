@@ -76,11 +76,11 @@ alert-test: ## Send a synthetic alert through Alertmanager (firing now, resolved
 .PHONY: create-user
 create-user: ## Create an invite-only family user in the running stack
 	@test -n "$(EMAIL)" || (echo "usage: make create-user EMAIL=name@example.com [ROLE=member]"; exit 1)
-	docker compose --profile admin run --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
+	docker compose --profile admin run --build --rm admin create-user -email "$(EMAIL)" -role "$(or $(ROLE),member)"
 
 .PHONY: list-users
 list-users: ## List accounts with state, MFA and active device count
-	docker compose --profile admin run --rm admin list-users
+	docker compose --profile admin run --build --rm admin list-users
 
 ACCOUNT_ACTIONS := disable-user enable-user reset-password revoke-sessions reset-mfa
 .PHONY: account-actions $(ACCOUNT_ACTIONS)
@@ -89,12 +89,12 @@ account-actions: ## make disable-user|enable-user|reset-password|revoke-sessions
 
 $(ACCOUNT_ACTIONS):
 	@test -n "$(EMAIL)" || (echo "usage: make $@ EMAIL=name@example.com"; exit 1)
-	docker compose --profile admin run --rm admin $@ -email "$(EMAIL)"
+	docker compose --profile admin run --build --rm admin $@ -email "$(EMAIL)"
 
 .PHONY: delete-user
 delete-user: ## Start account deletion (see docs/runbooks/account-lifecycle.md)
 	@test -n "$(EMAIL)" || (echo "usage: make delete-user EMAIL=name@example.com CONFIRM=name@example.com"; exit 1)
-	docker compose --profile admin run --rm admin delete-user -email "$(EMAIL)" -confirm "$(CONFIRM)"
+	docker compose --profile admin run --build --rm admin delete-user -email "$(EMAIL)" -confirm "$(CONFIRM)"
 
 .PHONY: scrub
 scrub: env ## Re-read and SHA-256 every committed original
@@ -116,7 +116,7 @@ manifest-reconcile: env ## Repair a verified manifest file -> DB linkage crash w
 
 .PHONY: session-maintenance
 session-maintenance: env ## Prune expired/revoked refresh generations past retention
-	docker compose --profile maintenance run --rm session-maintenance
+	docker compose --profile maintenance run --build --rm session-maintenance
 
 .PHONY: audit-export
 audit-export: env ## Export append-only upload events to JSONL + SHA-256
@@ -139,7 +139,7 @@ synthetic-probe: ## Exercise login -> resumable upload -> verify -> download SHA
 synthetic-probe-docker: env ## Run the synthetic probe inside the private Docker ingress network
 	@test -n "$(EMAIL)" -a -n "$(PASSWORD_FILE)" || (echo "usage: make synthetic-probe-docker EMAIL=probe@example.com PASSWORD_FILE=/absolute/path/to/password [PROBE_ARGS=...]"; exit 1)
 	@test -f "$(PASSWORD_FILE)" || (echo "probe password file not found: $(PASSWORD_FILE)"; exit 1)
-	docker compose --profile gateway run --rm \
+	docker compose --profile gateway run --build --rm \
 		-v "$(abspath $(PASSWORD_FILE)):/run/secrets/probe-password:ro" \
 		synthetic-probe \
 		-base-url http://upload-gateway:8080 \
