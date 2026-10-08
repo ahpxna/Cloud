@@ -89,7 +89,18 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
 			!bytes.Equal(session.ClientSHA256[:], input.ClientSHA256[:]) {
 			return Session{}, false, ErrConflict
 		}
-		if session.State != StateExpired {
+		purged := false
+		if session.State == StateAvailable && session.AssetID != "" {
+			if err := restoreTrashedAsset(ctx, tx, session.AssetID); err != nil {
+				return Session{}, false, err
+			}
+			// A fresh statement sees a purge that committed while the restore
+			// above waited for the row lock.
+			if err := tx.QueryRow(ctx, `SELECT deleted_at IS NOT NULL FROM assets WHERE id = $1::uuid`, session.AssetID).Scan(&purged); err != nil {
+				return Session{}, false, err
+			}
+		}
+		if session.State != StateExpired && !purged {
 			if err := tx.Commit(ctx); err != nil {
 				return Session{}, false, err
 			}
@@ -197,8 +208,9 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, input CreateSess
                 asset_id = NULL, last_error_code = NULL, expires_at = $2,
                 verification_worker_id = NULL, verification_claim_token = NULL,
                 verification_claimed_at = NULL, verification_lease_until = NULL,
+                received_at = NULL, verified_at = NULL, committed_at = NULL,
                 updated_at = $3
-            WHERE id = $1::uuid AND state = 'expired'`, session.ID, input.ExpiresAt, input.Now); err != nil {
+            WHERE id = $1::uuid AND state IN ('expired', 'available')`, session.ID, input.ExpiresAt, input.Now); err != nil {
 			return Session{}, false, err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -531,7 +543,7 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
             owner_id, upload_session_id, storage_key, original_filename,
             media_type, byte_size, content_sha256
         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
-        ON CONFLICT (owner_id, content_sha256) DO NOTHING
+        ON CONFLICT (owner_id, content_sha256) WHERE deleted_at IS NULL DO NOTHING
         RETURNING id::text`,
 		session.OwnerID, session.ID, storageKey, session.OriginalFilename,
 		session.MediaType, session.ExpectedSize, hash[:]).Scan(&assetID)
@@ -546,6 +558,10 @@ func (r *PostgresRepository) MarkAvailable(ctx context.Context, id, storageKey s
 		}
 		if existingStorageKey != storageKey || storageKey != session.FinalStorageKey {
 			return fmt.Errorf("deduplicated asset has inconsistent storage key: %w", ErrInvalidState)
+		}
+		// Uploading a photo that sits in Recently Deleted brings it back.
+		if err := restoreTrashedAsset(ctx, tx, assetID); err != nil {
+			return err
 		}
 	} else if err != nil {
 		return err
@@ -744,7 +760,8 @@ func (r *PostgresRepository) ResetForRetry(ctx context.Context, id, ownerID stri
 func (r *PostgresRepository) ListSessions(ctx context.Context, ownerID string, limit int) ([]SessionSummary, error) {
 	rows, err := r.pool.Query(ctx, `
         SELECT id::text, original_filename, media_type, state, expected_size,
-               received_size, COALESCE(last_error_code, ''), created_at, updated_at
+               received_size, COALESCE(last_error_code, ''), created_at, updated_at,
+               COALESCE(asset_id::text, '')
         FROM upload_sessions
         WHERE owner_id = $1::uuid
         ORDER BY updated_at DESC, id DESC
@@ -757,7 +774,8 @@ func (r *PostgresRepository) ListSessions(ctx context.Context, ownerID string, l
 	for rows.Next() {
 		var summary SessionSummary
 		if err := rows.Scan(&summary.ID, &summary.OriginalFilename, &summary.MediaType, &summary.State,
-			&summary.ExpectedSize, &summary.ReceivedSize, &summary.ErrorCode, &summary.CreatedAt, &summary.UpdatedAt); err != nil {
+			&summary.ExpectedSize, &summary.ReceivedSize, &summary.ErrorCode, &summary.CreatedAt, &summary.UpdatedAt,
+			&summary.AssetID); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, summary)
@@ -822,4 +840,150 @@ func scanAsset(row rowScanner) (Asset, error) {
 	}
 	copy(asset.ContentSHA256[:], hash)
 	return asset, nil
+}
+
+// restoreTrashedAsset takes a live asset out of Recently Deleted. It is a
+// no-op for an asset that is not in the bin or was already purged.
+func restoreTrashedAsset(ctx context.Context, tx pgx.Tx, assetID string) error {
+	_, err := tx.Exec(ctx, `
+        WITH restored AS (
+            UPDATE assets SET trashed_at = NULL
+            WHERE id = $1::uuid AND deleted_at IS NULL AND trashed_at IS NOT NULL
+            RETURNING id, owner_id
+        )
+        INSERT INTO asset_events (asset_id, owner_id, event_type, actor)
+        SELECT id, owner_id, 'restored', 'upload' FROM restored`, assetID)
+	return err
+}
+
+// MarkCancelled ends an unfinished upload at its owner's request. The row
+// becomes "expired" (so sending the same file again restarts it) with the
+// error code "cancelled".
+func (r *PostgresRepository) MarkCancelled(ctx context.Context, id, ownerID string) error {
+	command, err := r.pool.Exec(ctx, `
+        WITH changed AS (
+            UPDATE upload_sessions
+            SET state = 'expired', last_error_code = 'cancelled', updated_at = now()
+            WHERE id = $1::uuid AND owner_id = $2::uuid AND state IN ('created', 'uploading', 'failed')
+            RETURNING id, owner_id
+        )
+        INSERT INTO upload_events (upload_session_id, owner_id, event_type, error_code)
+        SELECT id, owner_id, 'expired', 'cancelled' FROM changed`, id, ownerID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrInvalidState
+	}
+	return nil
+}
+
+// PurgeCandidate identifies a binned asset for permanent deletion.
+type PurgeCandidate struct {
+	ID            string
+	OwnerID       string
+	StorageKey    string
+	ContentSHA256 [32]byte
+}
+
+// PurgeCandidate loads a live asset that is in Recently Deleted (and, when
+// trashedBefore is set, was binned before that time).
+func (r *PostgresRepository) PurgeCandidate(ctx context.Context, ownerID, assetID string, trashedBefore *time.Time) (PurgeCandidate, error) {
+	var candidate PurgeCandidate
+	var hash []byte
+	err := r.pool.QueryRow(ctx, `
+        SELECT id::text, owner_id::text, storage_key, content_sha256 FROM assets
+        WHERE id = $1::uuid AND owner_id = $2::uuid AND deleted_at IS NULL
+          AND trashed_at IS NOT NULL AND ($3::timestamptz IS NULL OR trashed_at <= $3)`,
+		assetID, ownerID, trashedBefore).Scan(&candidate.ID, &candidate.OwnerID, &candidate.StorageKey, &hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PurgeCandidate{}, ErrNotFound
+	}
+	if err != nil {
+		return PurgeCandidate{}, err
+	}
+	if len(hash) != 32 {
+		return PurgeCandidate{}, fmt.Errorf("asset %s has invalid content hash length", assetID)
+	}
+	copy(candidate.ContentSHA256[:], hash)
+	return candidate, nil
+}
+
+// ExpiredTrash lists assets binned before cutoff, oldest first.
+func (r *PostgresRepository) ExpiredTrash(ctx context.Context, cutoff time.Time, limit int) ([]PurgeCandidate, error) {
+	rows, err := r.pool.Query(ctx, `
+        SELECT id::text, owner_id::text, storage_key, content_sha256 FROM assets
+        WHERE deleted_at IS NULL AND trashed_at IS NOT NULL AND trashed_at <= $1
+        ORDER BY trashed_at, id
+        LIMIT $2`, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var candidates []PurgeCandidate
+	for rows.Next() {
+		var candidate PurgeCandidate
+		var hash []byte
+		if err := rows.Scan(&candidate.ID, &candidate.OwnerID, &candidate.StorageKey, &hash); err != nil {
+			return nil, err
+		}
+		if len(hash) == 32 {
+			copy(candidate.ContentSHA256[:], hash)
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates, rows.Err()
+}
+
+// PurgeAsset tombstones a binned asset, drops it from every album and records
+// the purge, all in one transaction. moveBytes runs inside the transaction and
+// must set the bytes aside reversibly; if the commit fails, restoreBytes puts
+// them back. Bytes are deleted for good only after the commit.
+func (r *PostgresRepository) PurgeAsset(ctx context.Context, candidate PurgeCandidate, trashedBefore *time.Time, actor string, moveBytes func() error, restoreBytes func()) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	command, err := tx.Exec(ctx, `
+        UPDATE assets SET deleted_at = now()
+        WHERE id = $1::uuid AND owner_id = $2::uuid AND storage_key = $3
+          AND deleted_at IS NULL AND trashed_at IS NOT NULL
+          AND ($4::timestamptz IS NULL OR trashed_at <= $4)`,
+		candidate.ID, candidate.OwnerID, candidate.StorageKey, trashedBefore)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(ctx, `UPDATE albums SET cover_asset_id = NULL, updated_at = now() WHERE cover_asset_id = $1::uuid`, candidate.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM album_assets WHERE asset_id = $1::uuid`, candidate.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+        INSERT INTO asset_events (asset_id, owner_id, event_type, actor)
+        VALUES ($1::uuid, $2::uuid, 'purged', $3)`, candidate.ID, candidate.OwnerID, actor); err != nil {
+		return err
+	}
+	if err := moveBytes(); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		restoreBytes()
+		return err
+	}
+	return nil
+}
+
+// AssetStorage reports an asset's storage key and whether it is live (not
+// purged). found is false for an unknown ID.
+func (r *PostgresRepository) AssetStorage(ctx context.Context, assetID string) (storageKey string, live bool, found bool, err error) {
+	err = r.pool.QueryRow(ctx, `SELECT storage_key, deleted_at IS NULL FROM assets WHERE id = $1::uuid`, assetID).Scan(&storageKey, &live)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, false, nil
+	}
+	return storageKey, live, err == nil, err
 }

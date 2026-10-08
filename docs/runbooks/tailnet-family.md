@@ -7,8 +7,11 @@ app with three free pieces:
    and gives the server an HTTPS name such as
    `https://family-photos.<tailnet>.ts.net`. Nothing is exposed to the public
    Internet.
-2. The **web app** at `/app/` signs in, shows the library, plays Live Photos,
-   downloads originals and shows upload progress.
+2. The **web app** at `/app/` works like the iPhone Photos app: timeline by
+   date taken, albums and folders, albums shared with the family (likes,
+   comments, contributions), favourites, hidden items, a 30-day Recently
+   Deleted, places, Live Photos, cutting part of a video, saving to the Photos
+   app, ZIP downloads, and upload progress with ✕ to stop a stuck upload.
 3. An **iOS Shortcut** appears in the Photos share sheet (and on the Home
    Screen with a menu) and uploads originals with an upload-only key.
 
@@ -58,26 +61,64 @@ save the recovery codes. Every device is then signed out; sign in again and
 Safari fills the code from the Passwords app. Tailnet-only access already keeps
 strangers out, so MFA is optional for parents.
 
+## Sharing between family members
+
+Every person gets their own account (`make create-user EMAIL=…`) and sets a
+display name in **Cài đặt → Tên của bạn**. Libraries stay private. To share,
+create an album in **Chia sẻ → ＋** (or **⋯ → Chia sẻ với người trong nhà** on an
+existing album) and tick people. Members see the album, like and comment, and
+add their own photos unless the owner turned that off. Removing someone (or
+them leaving) takes back their access and the photos they added. New activity
+shows as a dot on the **Chia sẻ** tab.
+
+## Recently Deleted and hidden items
+
+Deleting moves items to **Album → Đã xoá gần đây**, where they stay 30 days
+(the gateway purges older ones hourly) and can be restored. Sending the same
+photo again also restores it. **Đã ẩn** keeps items out of the library and every
+album. Permanent deletion removes the original from the media volume; older
+restic snapshots still contain it until they are pruned.
+
 ## What is and is not an original
 
 - The server never resizes, transcodes or recompresses anything. Every upload
   is verified against the SHA-256 the phone computed, and downloads return the
-  same bytes.
-- What iOS hands to the uploader is outside the server's control:
-  - **Shortcut from the share sheet**: photos arrive as files. Live Photos are
-    passed as the still only.
-  - **Web page file picker**: iOS may convert photos and **compresses videos**
-    picked from the Photos library. Use the Shortcut for videos.
-- Check once on a real iPhone: upload a photo and a video with the Shortcut,
-  download them from the web app, and compare size/format with Photos → ⓘ.
+  same bytes. Cutting a video copies the original's frames without re-encoding.
+- What iOS hands to the uploader is outside the server's control. Checked on
+  an iPhone 14 Pro (iOS 26.5): the **Shortcut from the share sheet** sends a
+  converted **JPEG** (not the HEIC), only the **still** of a Live Photo, and
+  **without GPS**; videos arrive as an exported copy (same capture time, other
+  bytes, location kept). The **web page file picker** may convert photos and
+  **compresses videos**.
+- For true originals (HEIC, Live Photo video, location): on a Mac, select the
+  photos in Photos → **File → Export → Export Unmodified Originals**, then
+  upload the folder in **Tải lên → Tải cả thư mục** (or drag it in). The server
+  pairs each Live Photo's still and video by Apple's content identifier.
 
 ## Live Photos
 
-The web app shows a still and a video with the same base name (for example
-`IMG_1234.HEIC` and `IMG_1234.MOV`) uploaded within 10 minutes as one **LIVE**
-item that plays on tap, with separate downloads for both parts. Getting the
-motion part out of iOS through Shortcuts must still be confirmed on a device;
-the share sheet sends only the still.
+A still and its motion video show as one item with **◎ LIVE**: press and hold
+the photo (or tap LIVE) to play it. They are paired by the content identifier
+both files carry, or for older uploads by base name (`IMG_1234.HEIC` +
+`IMG_1234.MOV`) within 10 minutes. The share sheet sends only the still, so a
+Live Photo needs the export above to keep its motion.
+
+## Slow videos over Tailscale
+
+`tailscale ping <phone>` from the server shows whether traffic is direct or
+relayed (`via DERP(nyc)`). A relay works everywhere but is slow. On Docker
+Desktop (macOS) the container sits behind two NATs and usually stays relayed.
+On the always-on Linux host, prefer a direct path: run the `tailscale`
+service with `network_mode: host` (or publish `41641/udp` and start
+tailscaled with `--port=41641`), and allow UDP 41641 through the router. When
+the phone is on the same Wi-Fi as the server, a direct LAN path is normal.
+
+## Time zone
+
+Photos store their capture time with an offset (iPhone does), and the web app
+shows them in the viewer's time zone. Files without an offset are read in
+`PHOTO_TIMEZONE` (an IANA name such as `Asia/Ho_Chi_Minh`; set it in `.env`
+when the server's zone differs from the family's).
 
 ## Operations
 

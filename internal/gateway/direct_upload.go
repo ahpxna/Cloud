@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -188,7 +189,13 @@ func (d *directUploader) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer d.limiter.Release(ownerID)
-	unlock, err := lockTusResource(r.Context(), d.locker, session.ID)
+	// Like a tusd PATCH, this request gives the upload up when another request
+	// needs it: a retry of the same file, expiry, or the owner pressing ✕.
+	body := &progressDeadlineReader{
+		controller: http.NewResponseController(w),
+		idle:       d.readIdleTimeout,
+	}
+	unlock, err := lockTusResourceReleasable(r.Context(), d.locker, session.ID, body.interrupt)
 	if err != nil {
 		w.Header().Set("Retry-After", "5")
 		writeDirectProblem(w, http.StatusConflict, "upload_busy", "this file is already being uploaded")
@@ -236,12 +243,12 @@ func (d *directUploader) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeDirectProblem(w, http.StatusInternalServerError, "upload_store_failed", "could not store upload")
 		return
 	}
-	body := &progressDeadlineReader{
-		reader:     io.MultiReader(bytes.NewReader(head), limited),
-		controller: http.NewResponseController(w),
-		idle:       d.readIdleTimeout,
-	}
+	body.reader = io.MultiReader(bytes.NewReader(head), limited)
 	written, err := stored.WriteChunk(r.Context(), 0, body)
+	if body.interrupted.Load() {
+		writeDirectProblem(w, http.StatusConflict, "upload_interrupted", "this upload was stopped or taken over by another request")
+		return
+	}
 	if err != nil || written != size {
 		// The session stays "uploading" with partial bytes; a retry resets it
 		// and stale ones expire through the normal reconciliation path.
@@ -362,16 +369,33 @@ func directMediaType(explicit, contentType, filename string) (string, bool) {
 // so a long video upload is limited by inactivity rather than by the
 // server-wide absolute read timeout.
 type progressDeadlineReader struct {
-	reader     io.Reader
-	controller *http.ResponseController
-	idle       time.Duration
+	reader      io.Reader
+	controller  *http.ResponseController
+	idle        time.Duration
+	interrupted atomic.Bool
 }
 
+var errUploadInterrupted = errors.New("upload interrupted")
+
 func (r *progressDeadlineReader) Read(p []byte) (int, error) {
+	if r.interrupted.Load() {
+		return 0, errUploadInterrupted
+	}
 	if r.idle > 0 {
 		_ = r.controller.SetReadDeadline(time.Now().Add(r.idle))
 	}
-	return r.reader.Read(p)
+	n, err := r.reader.Read(p)
+	if r.interrupted.Load() {
+		return n, errUploadInterrupted
+	}
+	return n, err
+}
+
+// interrupt makes the next (or the blocked) read fail at once, so the request
+// releases the upload's lock.
+func (r *progressDeadlineReader) interrupt() {
+	r.interrupted.Store(true)
+	_ = r.controller.SetReadDeadline(time.Now())
 }
 
 func writeDirectJSON(w http.ResponseWriter, status int, value any) {

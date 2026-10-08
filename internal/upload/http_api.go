@@ -1,6 +1,7 @@
 package upload
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"family-photo-cloud/internal/auth"
+	"family-photo-cloud/internal/media"
 )
 
 type API struct {
@@ -32,6 +35,27 @@ type API struct {
 	createWindow        time.Duration
 	maxCreatesPerWindow int
 	restart             func(context.Context, string, string) (Session, error)
+	extras              SessionExtras
+}
+
+// SessionExtras are optional upload-list features the gateway wires in:
+// cancelling a stuck upload and previewing the bytes received so far.
+type SessionExtras struct {
+	// Cancel stops an unfinished upload (taking its lock and deleting partial
+	// bytes) for its owner.
+	Cancel func(ctx context.Context, id, ownerID string) error
+	// Staged opens the bytes received so far for an upload.
+	Staged func(id string) (*os.File, int64, error)
+	// MatchAsset finds an already backed-up item that an unfinished upload
+	// duplicates: same capture time, or same name when that is unknown.
+	MatchAsset func(ctx context.Context, ownerID, filename, mediaType string, capturedAt *time.Time) string
+	// Location interprets capture times written without a UTC offset.
+	Location *time.Location
+}
+
+// EnableExtras turns on cancel and preview support.
+func (api *API) EnableExtras(extras SessionExtras) {
+	api.extras = extras
 }
 
 func NewAPI(repository Repository, maxBytes, chunkBytes int64, tokens *auth.AccessTokenManager, availableBytes func() (int64, error), minimumFreeBytes int64, maxActiveSessions int, createWindow time.Duration, maxCreatesPerWindow int, restart func(context.Context, string, string) (Session, error)) *API {
@@ -79,6 +103,10 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	path := strings.TrimPrefix(r.URL.Path, "/v1/upload-sessions")
 	switch {
+	case strings.HasSuffix(path, "/preview") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		api.preview(w, r, principal, strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/preview"))
+	case strings.HasPrefix(path, "/") && len(path) > 1 && !strings.Contains(path[1:], "/") && r.Method == http.MethodDelete:
+		api.cancel(w, r, principal, strings.TrimPrefix(path, "/"))
 	case (path == "" || path == "/") && r.Method == http.MethodPost:
 		api.create(w, r, principal)
 	case (path == "" || path == "/") && r.Method == http.MethodGet:
@@ -88,7 +116,7 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(path, "/restart") && r.Method == http.MethodPost:
 		api.restartSession(w, r, principal, strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/restart"))
 	default:
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
 }
@@ -113,7 +141,141 @@ func (api *API) list(w http.ResponseWriter, r *http.Request, principal auth.Prin
 		writeProblem(w, http.StatusInternalServerError, "session_list_failed", "could not list uploads")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"uploads": sessions})
+	views := make([]sessionView, 0, len(sessions))
+	now := api.now().UTC()
+	for _, summary := range sessions {
+		views = append(views, api.describe(r.Context(), principal, summary, now))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"uploads": views})
+}
+
+// sessionView adds what the bytes received so far reveal about an unfinished
+// upload, so a person can tell which stuck upload they are about to stop.
+type sessionView struct {
+	SessionSummary
+	PreviewURL    string     `json:"preview_url,omitempty"`
+	ThumbnailURL  string     `json:"thumbnail_url,omitempty"`
+	CapturedAt    *time.Time `json:"captured_at,omitempty"`
+	DurationMS    int64      `json:"duration_ms,omitempty"`
+	Width         int        `json:"width,omitempty"`
+	Height        int        `json:"height,omitempty"`
+	Camera        string     `json:"camera,omitempty"`
+	SameAsAssetID string     `json:"same_as_asset_id,omitempty"`
+	Cancellable   bool       `json:"cancellable,omitempty"`
+}
+
+// previewTicketTTL bounds how long a listed preview_url keeps working.
+const previewTicketTTL = 10 * time.Minute
+
+// maxPreviewBytes caps how much of an unfinished upload is served as a
+// preview: enough for a video's header and first frames or a photo's top.
+const maxPreviewBytes = 32 << 20
+
+func (api *API) describe(ctx context.Context, principal auth.Principal, summary SessionSummary, now time.Time) sessionView {
+	view := sessionView{SessionSummary: summary}
+	switch summary.State {
+	case StateCreated, StateUploading, StateFailed:
+		view.Cancellable = api.extras.Cancel != nil
+	case StateReceived, StateVerifying, StateVerified, StateCommitting:
+	default:
+		return view
+	}
+	if api.extras.Staged == nil {
+		return view
+	}
+	file, size, err := api.extras.Staged(summary.ID)
+	if err != nil {
+		return view
+	}
+	defer file.Close()
+	if size > view.ReceivedSize && size <= summary.ExpectedSize {
+		// Single-request uploads report progress only through the file size.
+		view.ReceivedSize = size
+	}
+	if size == 0 {
+		return view
+	}
+	meta, err := media.Extract(file, size, api.extras.Location)
+	if err == nil {
+		view.CapturedAt = meta.CapturedAt
+		view.DurationMS = meta.DurationMS
+		view.Width, view.Height = meta.Width, meta.Height
+		view.Camera = strings.TrimSpace(meta.Model)
+	}
+	ticket, err := api.tokens.IssueView(principal, summary.ID, auth.ViewUploadPreview, now, previewTicketTTL)
+	if err == nil {
+		base := "/v1/upload-sessions/" + summary.ID + "/preview?ticket=" + url.QueryEscape(ticket)
+		if strings.HasPrefix(summary.MediaType, "video/") || summary.MediaType == "image/jpeg" || summary.MediaType == "image/png" {
+			view.PreviewURL = base
+		}
+		if _, ok := media.ExifThumbnail(file, size); ok {
+			view.ThumbnailURL = base + "&part=thumbnail"
+		}
+	}
+	if api.extras.MatchAsset != nil {
+		view.SameAsAssetID = api.extras.MatchAsset(ctx, principal.UserID, summary.OriginalFilename, summary.MediaType, view.CapturedAt)
+	}
+	return view
+}
+
+func (api *API) cancel(w http.ResponseWriter, r *http.Request, principal auth.Principal, id string) {
+	if api.extras.Cancel == nil {
+		writeProblem(w, http.StatusNotImplemented, "cancel_unavailable", "cancelling uploads is unavailable")
+		return
+	}
+	err := api.extras.Cancel(r.Context(), id, principal.UserID)
+	switch {
+	case err == nil:
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, ErrNotFound) || errors.Is(err, ErrOwnerMismatch):
+		writeProblem(w, http.StatusNotFound, "not_found", "upload session not found")
+	case errors.Is(err, ErrAlreadyReceived):
+		writeProblem(w, http.StatusConflict, "upload_already_received", "every byte already arrived; the upload is being checked")
+	case errors.Is(err, ErrUploadBusy):
+		w.Header().Set("Retry-After", "5")
+		writeProblem(w, http.StatusConflict, "upload_busy", "the upload did not stop in time; retry shortly")
+	case errors.Is(err, ErrInvalidState) || errors.Is(err, ErrUploadResourceInconsistent):
+		writeProblem(w, http.StatusConflict, "upload_not_cancellable", "this upload cannot be cancelled")
+	default:
+		writeProblem(w, http.StatusInternalServerError, "upload_cancel_failed", "could not cancel the upload")
+	}
+}
+
+// preview serves the first bytes received for an unfinished upload, or the
+// small preview JPEG embedded in its EXIF block (?part=thumbnail).
+func (api *API) preview(w http.ResponseWriter, r *http.Request, principal auth.Principal, id string) {
+	if api.extras.Staged == nil || id == "" || strings.Contains(id, "/") {
+		writeProblem(w, http.StatusNotFound, "not_found", "preview not found")
+		return
+	}
+	session, err := api.repository.SessionByID(r.Context(), id)
+	if err != nil || subtle.ConstantTimeCompare([]byte(session.OwnerID), []byte(principal.UserID)) != 1 {
+		writeProblem(w, http.StatusNotFound, "not_found", "preview not found")
+		return
+	}
+	file, size, err := api.extras.Staged(id)
+	if err != nil || size == 0 {
+		writeProblem(w, http.StatusNotFound, "not_found", "no bytes received yet")
+		return
+	}
+	defer file.Close()
+	w.Header().Set("Cache-Control", "private, no-store")
+	if r.URL.Query().Get("part") == "thumbnail" {
+		thumbnail, ok := media.ExifThumbnail(file, size)
+		if !ok {
+			writeProblem(w, http.StatusNotFound, "not_found", "no embedded preview")
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		http.ServeContent(w, r, "preview.jpg", time.Time{}, bytes.NewReader(thumbnail))
+		return
+	}
+	if size > maxPreviewBytes {
+		size = maxPreviewBytes
+	}
+	w.Header().Set("Content-Type", session.MediaType)
+	http.ServeContent(w, r, "preview", time.Time{}, io.NewSectionReader(file, 0, size))
 }
 
 func (api *API) restartSession(w http.ResponseWriter, r *http.Request, principal auth.Principal, id string) {
