@@ -33,6 +33,8 @@ The accepted direction is:
   protocol as the long-term transport after the 100 MB Cloudflare constraint is
   removed through public IP or a VPS/WireGuard path.
 
+**Deploying?** Follow the ordered [go-live checklist](docs/runbooks/go-live.md).
+
 Read [the architecture](docs/architecture.md), [MVP API contract](docs/api.md),
 [integrity manifest format](docs/integrity-manifest-v1.md), [iOS scaffold
 notes](ios/README.md), [operator runbooks](docs/runbooks/), and

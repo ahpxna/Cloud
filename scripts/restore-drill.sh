@@ -24,7 +24,8 @@ snapshot="${RESTORE_SNAPSHOT:-latest}"
 echo "Restoring snapshot $snapshot into $target..."
 restic restore "$snapshot" --tag family-photo-cloud --target "$target"
 
-mapfile -t dumps < <(find "$target" -type f -name postgres.dump -print)
+dumps=()
+while IFS= read -r found; do dumps+=("$found"); done < <(find "$target" -type f -name postgres.dump -print)
 if [[ ${#dumps[@]} -ne 1 ]]; then
   echo "expected exactly one postgres.dump in restored snapshot, found ${#dumps[@]}" >&2
   exit 1
@@ -70,7 +71,7 @@ if [[ "$asset_count" != "0" ]]; then
     [[ -n "$storage_key" ]] || continue
     path="$media_root/$storage_key"
     [[ -f "$path" ]] || { echo "missing restored original: $storage_key" >&2; exit 1; }
-    actual_size="$(stat -c %s "$path")"
+    actual_size="$(wc -c <"$path" | tr -d '[:space:]')"
     [[ "$actual_size" == "$expected_size" ]] || { echo "size mismatch: $storage_key" >&2; exit 1; }
     actual_hex="$(sha256sum "$path" | awk '{print $1}')"
     [[ "$actual_hex" == "$expected_hex" ]] || { echo "SHA-256 mismatch: $storage_key" >&2; exit 1; }
@@ -91,7 +92,8 @@ if [[ "$manifest_count" != "0" ]]; then
     "$(realpath "$target")"/*) echo "trust fingerprints must be independent of the restored snapshot" >&2; exit 2 ;;
   esac
 
-  mapfile -t restored_keyrings < <(find "$target" -type d -name manifest-public-keyring -print)
+  restored_keyrings=()
+  while IFS= read -r found; do restored_keyrings+=("$found"); done < <(find "$target" -type d -name manifest-public-keyring -print)
   if [[ ${#restored_keyrings[@]} -ne 1 ]]; then
     echo "expected exactly one restored manifest public keyring, found ${#restored_keyrings[@]}" >&2
     exit 1
@@ -102,13 +104,14 @@ if [[ "$manifest_count" != "0" ]]; then
   # tampered snapshot cannot smuggle in an untrusted signing key ID.
   if ! diff -u \
       <(awk '{name=$2; sub(/^\*/, "", name); print name}' "$trust_fingerprints" | LC_ALL=C sort -u) \
-      <(find "$keyring_path" -maxdepth 1 -type f -name '*.pem' -printf '%f\n' | LC_ALL=C sort -u); then
+      <(find "$keyring_path" -maxdepth 1 -type f -name '*.pem' -exec basename {} \; | LC_ALL=C sort -u); then
     echo "restored manifest keyring differs from independent trust-anchor set" >&2
     exit 1
   fi
   (cd "$keyring_path" && sha256sum --strict --check "$trust_fingerprints")
 
-  mapfile -t restored_manifest_dirs < <(find "$target" -type d -name manifests -print)
+  restored_manifest_dirs=()
+  while IFS= read -r found; do restored_manifest_dirs+=("$found"); done < <(find "$target" -type d -name manifests -print)
   if [[ ${#restored_manifest_dirs[@]} -ne 1 ]]; then
     echo "expected exactly one restored manifests directory, found ${#restored_manifest_dirs[@]}" >&2
     exit 1
@@ -133,7 +136,9 @@ if [[ "$manifest_count" != "0" ]]; then
     manifest_file="$restored_manifest_root/$relative"
     [[ -f "$manifest_file" ]] || { echo "restored manifest missing for DB row: $object_key" >&2; exit 1; }
 
-    MANIFEST_PUBLIC_KEYRING_HOST_PATH="$keyring_path" docker compose --profile integrity run --rm --no-deps \
+    # -T and </dev/null: `docker compose run` would otherwise consume the
+    # loop's stdin and silently end the loop after the first manifest.
+    MANIFEST_PUBLIC_KEYRING_HOST_PATH="$keyring_path" docker compose --profile integrity run --rm --no-deps -T \
       -v "$manifest_file:/verify/$relative:ro" \
       manifest-verify \
       -mode verify \
@@ -143,10 +148,20 @@ if [[ "$manifest_count" != "0" ]]; then
       -expected-asset-count "$db_asset_count" \
       -expected-payload-sha256 "$payload_hex" \
       -expected-key-id "$key_id" \
-      -expected-signature-hex "$signature_hex"
+      -expected-signature-hex "$signature_hex" </dev/null
     manifests_verified=$((manifests_verified + 1))
   done < <(docker exec -e PGPASSWORD="$password" "$container" psql -At -F $'\t' -U photo_cloud -d photo_cloud -c \
     "SELECT manifest_version, object_key, asset_count, encode(payload_sha256,'hex'), signing_key_id, encode(signature,'hex') FROM signed_manifests ORDER BY generated_at, id")
+fi
+
+# Never report PASS for a partial check.
+if [[ "$checked" != "$asset_count" ]]; then
+  echo "rehashed $checked of $asset_count restored assets" >&2
+  exit 1
+fi
+if [[ "$manifests_verified" != "$manifest_count" ]]; then
+  echo "verified $manifests_verified of $manifest_count signed manifests" >&2
+  exit 1
 fi
 
 report="$target/restore-drill-report.txt"
