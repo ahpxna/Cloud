@@ -48,8 +48,14 @@ tailnet-up: env ## Start gateway plus private Tailscale ingress (https://<host>.
 	@test -n "$$(sed -n 's/^TAILSCALE_AUTHKEY=//p' .env)" -o -s .data/tailscale/tailscaled.state || (echo "set TAILSCALE_AUTHKEY in .env (first start only)"; exit 1)
 	mkdir -p .data/tailscale
 	docker compose --profile gateway --profile tailnet up -d --build --wait postgres upload-gateway tailscale
-	@docker compose --profile tailnet exec -T tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
-		| sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/Family web app: https:\/\/\1\/app\//p' | head -n1
+	@host="$$(docker compose --profile tailnet exec -T tailscale tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null \
+		| sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/\1/p' | head -n1)"; \
+	if [ -n "$$host" ] && [ "$$(sed -n 's/^CANONICAL_HOST=//p' .env)" != "$$host" ]; then \
+		if grep -q '^CANONICAL_HOST=' .env; then sed -i.bak "s#^CANONICAL_HOST=.*#CANONICAL_HOST=$$host#" .env && rm -f .env.bak; \
+		else printf 'CANONICAL_HOST=%s\n' "$$host" >> .env; fi; \
+		docker compose --profile gateway up -d --wait upload-gateway >/dev/null; \
+	fi; \
+	echo "Family web app: https://$$host/app/"
 
 .PHONY: observability-up
 observability-up: env ## Start private metrics, Prometheus, Alertmanager, and Grafana

@@ -48,7 +48,10 @@ type Config struct {
 	// UploadKeys verifies Shortcut upload keys; when nil, Accounts is used if
 	// it implements UploadKeyVerifier.
 	UploadKeys UploadKeyVerifier
-	Logger     *slog.Logger
+	// CanonicalHost is the HTTPS name plain-HTTP requests are redirected to,
+	// e.g. family-photos.<tailnet>.ts.net. Empty keeps the request's host.
+	CanonicalHost string
+	Logger        *slog.Logger
 }
 
 type Server struct {
@@ -410,7 +413,7 @@ func New(config Config) (*Server, error) {
 	mux.Handle(webapp.BasePath, webapp.Handler())
 	mux.Handle(strings.TrimSuffix(webapp.BasePath, "/"), webapp.Handler())
 	mux.Handle("/", webapp.RedirectRoot())
-	server.handler = securityHeaders(mux)
+	server.handler = securityHeaders(redirectPlainHTTP(config.CanonicalHost, mux))
 	return server, nil
 }
 
@@ -693,6 +696,47 @@ func writeAuthError(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write([]byte("{\"status\":401,\"code\":\"unauthorized\",\"detail\":\"valid access token required\"}\n"))
+}
+
+// plainHTTPPrefix is where deploy/tailscale/serve.json sends port-80 traffic.
+// Tailscale serve has no redirect handler and marks only HTTPS requests with
+// X-Forwarded-Proto, so plain HTTP is identified by this explicit prefix.
+const plainHTTPPrefix = "/__plain-http"
+
+// redirectPlainHTTP sends plain-HTTP requests from the front proxy to the HTTPS
+// origin. The web app needs a secure context, and credentials must never travel
+// without TLS. Other requests (direct, loopback, Cloudflare) are untouched.
+func redirectPlainHTTP(canonicalHost string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		plain := path == plainHTTPPrefix || strings.HasPrefix(path, plainHTTPPrefix+"/") ||
+			strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "http")
+		if !plain {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The certificate covers only the full name, so a short MagicDNS name
+		// such as http://family-photos/ must land on the canonical host.
+		host := canonicalHost
+		if host == "" {
+			host = r.Host
+			if index := strings.LastIndex(host, ":"); index > strings.LastIndex(host, "]") {
+				host = host[:index]
+			}
+		}
+		if host == "" || strings.ContainsAny(host, "/\\@") || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+			http.Error(w, "use https", http.StatusBadRequest)
+			return
+		}
+		target := strings.TrimPrefix(path, plainHTTPPrefix)
+		if target == "" {
+			target = "/"
+		}
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, "https://"+host+target, http.StatusPermanentRedirect)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {

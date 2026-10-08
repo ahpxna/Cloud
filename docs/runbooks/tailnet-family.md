@@ -24,7 +24,9 @@ app with three free pieces:
    make tailnet-up
    ```
 
-   It prints the web app address. The key is only needed for this first start;
+   It prints the web app address and records it as `CANONICAL_HOST`, so
+   `http://…` and the short name `http://family-photos/` redirect to it over
+   HTTPS (the certificate covers only the full name). The key is only needed for this first start;
    the node identity is kept in `.data/tailscale` (back it up with the host, do
    not commit it). You may clear `TAILSCALE_AUTHKEY` afterwards.
 3. In the admin console **Machines** list, open the server → **Disable key
