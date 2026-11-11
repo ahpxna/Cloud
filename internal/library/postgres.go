@@ -72,6 +72,7 @@ const itemJoins = `
         WHERE a.live_photo_id IS NOT NULL AND a.media_type NOT LIKE 'video/%'
           AND video.owner_id = a.owner_id AND video.live_photo_id = a.live_photo_id
           AND video.media_type LIKE 'video/%' AND video.deleted_at IS NULL
+          AND video.hidden = a.hidden AND (video.trashed_at IS NULL) = (a.trashed_at IS NULL)
         ORDER BY video.created_at
         LIMIT 1
     ) AS live ON true`
@@ -701,22 +702,47 @@ func (s *PostgresStore) DeleteAlbum(ctx context.Context, ownerID, albumID string
 	return nil
 }
 
+// lockAlbum serializes album mutations with membership removal. Membership must
+// be read in a new statement after the lock, so a waiter sees the committed removal.
+func lockAlbum(ctx context.Context, tx pgx.Tx, viewerID, albumID string) (Album, error) {
+	album := Album{ID: albumID}
+	err := tx.QueryRow(ctx, `SELECT owner_id = $1::uuid, members_can_add FROM albums WHERE id = $2::uuid FOR UPDATE`,
+		viewerID, albumID).Scan(&album.IsOwner, &album.MembersCanAdd)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Album{}, ErrNotFound
+	}
+	if err != nil {
+		return Album{}, err
+	}
+	if !album.IsOwner {
+		var member bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM album_members WHERE album_id = $1::uuid AND user_id = $2::uuid)`,
+			albumID, viewerID).Scan(&member); err != nil {
+			return Album{}, err
+		}
+		if !member {
+			return Album{}, ErrNotFound
+		}
+	}
+	return album, nil
+}
+
 func (s *PostgresStore) AddToAlbum(ctx context.Context, viewerID, albumID string, assetIDs []string) (int, error) {
 	if len(assetIDs) == 0 || len(assetIDs) > 1000 {
 		return 0, ErrInvalid
-	}
-	album, err := s.Album(ctx, viewerID, albumID)
-	if err != nil {
-		return 0, err
-	}
-	if !album.IsOwner && !album.MembersCanAdd {
-		return 0, ErrForbidden
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
+	album, err := lockAlbum(ctx, tx, viewerID, albumID)
+	if err != nil {
+		return 0, err
+	}
+	if !album.IsOwner && !album.MembersCanAdd {
+		return 0, ErrForbidden
+	}
 	command, err := tx.Exec(ctx, `WITH `+targetsCTE+`
         INSERT INTO album_assets (album_id, asset_id, added_by)
         SELECT $3::uuid, targets.id, $1::uuid FROM targets
@@ -735,13 +761,18 @@ func (s *PostgresStore) RemoveFromAlbum(ctx context.Context, viewerID, albumID s
 	if len(assetIDs) == 0 || len(assetIDs) > 1000 {
 		return 0, ErrInvalid
 	}
-	album, err := s.Album(ctx, viewerID, albumID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	album, err := lockAlbum(ctx, tx, viewerID, albumID)
 	if err != nil {
 		return 0, err
 	}
 	// The owner may remove anything; members only what they added. The other
 	// half of a Live Photo goes with it.
-	command, err := s.pool.Exec(ctx, `
+	command, err := tx.Exec(ctx, `
         WITH requested AS (
             SELECT assets.id, assets.owner_id, assets.live_photo_id FROM album_assets
             JOIN assets ON assets.id = album_assets.asset_id
@@ -759,11 +790,14 @@ func (s *PostgresStore) RemoveFromAlbum(ctx context.Context, viewerID, albumID s
 	if err != nil {
 		return 0, err
 	}
-	_, err = s.pool.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
         UPDATE albums SET updated_at = now(),
             cover_asset_id = CASE WHEN cover_asset_id = ANY($2::uuid[]) THEN NULL ELSE cover_asset_id END
         WHERE id = $1::uuid`, album.ID, assetIDs)
-	return int(command.RowsAffected()), err
+	if err != nil {
+		return 0, err
+	}
+	return int(command.RowsAffected()), tx.Commit(ctx)
 }
 
 func (s *PostgresStore) SetMembers(ctx context.Context, ownerID, albumID string, userIDs []string) error {
@@ -797,6 +831,13 @@ func (s *PostgresStore) SetMembers(ctx context.Context, ownerID, albumID string,
 		return ErrInvalid
 	}
 	// People removed from the album also take their own photos with them.
+	for _, table := range []string{"album_comments", "album_likes"} {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+table+` WHERE album_id = $1::uuid AND user_id IN (
+            SELECT user_id FROM album_members WHERE album_id = $1::uuid AND user_id <> ALL($2::uuid[]))`,
+			albumID, userIDs); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec(ctx, `
         DELETE FROM album_assets WHERE album_id = $1::uuid AND added_by <> $3::uuid
           AND added_by IN (SELECT user_id FROM album_members WHERE album_id = $1::uuid AND user_id <> ALL($2::uuid[]))`,
@@ -835,12 +876,20 @@ func (s *PostgresStore) LeaveAlbum(ctx context.Context, userID, albumID string) 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := lockAlbum(ctx, tx, userID, albumID); err != nil {
+		return err
+	}
 	command, err := tx.Exec(ctx, `DELETE FROM album_members WHERE album_id = $1::uuid AND user_id = $2::uuid`, albumID, userID)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return ErrNotFound
+	}
+	for _, table := range []string{"album_comments", "album_likes"} {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+table+` WHERE album_id = $1::uuid AND user_id = $2::uuid`, albumID, userID); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM album_assets WHERE album_id = $1::uuid AND added_by = $2::uuid`, albumID, userID); err != nil {
 		return err
@@ -854,31 +903,48 @@ func (s *PostgresStore) inAlbum(ctx context.Context, viewerID, albumID, assetID 
 	if err != nil {
 		return Album{}, err
 	}
+	return album, albumAssetShown(ctx, s.pool, albumID, assetID)
+}
+
+func albumAssetShown(ctx context.Context, query interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, albumID, assetID string) error {
 	var shown bool
-	if err := s.pool.QueryRow(ctx, `
+	if err := query.QueryRow(ctx, `
         SELECT EXISTS (
             SELECT 1 FROM album_assets JOIN assets AS a ON a.id = album_assets.asset_id
             WHERE album_assets.album_id = $1::uuid AND album_assets.asset_id = $2::uuid AND `+visible("a")+`)`,
-		album.ID, assetID).Scan(&shown); err != nil {
-		return Album{}, err
+		albumID, assetID).Scan(&shown); err != nil {
+		return err
 	}
 	if !shown {
-		return Album{}, ErrNotFound
+		return ErrNotFound
 	}
-	return album, nil
+	return nil
 }
 
 func (s *PostgresStore) SetLike(ctx context.Context, viewerID, albumID, assetID string, liked bool) error {
-	album, err := s.inAlbum(ctx, viewerID, albumID, assetID)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if liked {
-		_, err = s.pool.Exec(ctx, `INSERT INTO album_likes (album_id, asset_id, user_id) VALUES ($1::uuid, $2::uuid, $3::uuid) ON CONFLICT DO NOTHING`, album.ID, assetID, viewerID)
-	} else {
-		_, err = s.pool.Exec(ctx, `DELETE FROM album_likes WHERE album_id = $1::uuid AND asset_id = $2::uuid AND user_id = $3::uuid`, album.ID, assetID, viewerID)
+	defer tx.Rollback(ctx)
+	album, err := lockAlbum(ctx, tx, viewerID, albumID)
+	if err != nil {
+		return err
 	}
-	return err
+	if err := albumAssetShown(ctx, tx, albumID, assetID); err != nil {
+		return err
+	}
+	if liked {
+		_, err = tx.Exec(ctx, `INSERT INTO album_likes (album_id, asset_id, user_id) VALUES ($1::uuid, $2::uuid, $3::uuid) ON CONFLICT DO NOTHING`, album.ID, assetID, viewerID)
+	} else {
+		_, err = tx.Exec(ctx, `DELETE FROM album_likes WHERE album_id = $1::uuid AND asset_id = $2::uuid AND user_id = $3::uuid`, album.ID, assetID, viewerID)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) Comments(ctx context.Context, viewerID, albumID, assetID string) ([]Comment, error) {
@@ -912,12 +978,20 @@ func (s *PostgresStore) AddComment(ctx context.Context, viewerID, albumID, asset
 	if body == "" || len([]rune(body)) > 1000 {
 		return Comment{}, ErrInvalid
 	}
-	album, err := s.inAlbum(ctx, viewerID, albumID, assetID)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Comment{}, err
 	}
+	defer tx.Rollback(ctx)
+	album, err := lockAlbum(ctx, tx, viewerID, albumID)
+	if err != nil {
+		return Comment{}, err
+	}
+	if err := albumAssetShown(ctx, tx, albumID, assetID); err != nil {
+		return Comment{}, err
+	}
 	comment := Comment{AlbumID: album.ID, AssetID: assetID, AuthorID: viewerID, Body: body, Mine: true}
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
         WITH inserted AS (
             INSERT INTO album_comments (album_id, asset_id, user_id, body)
             VALUES ($1::uuid, $2::uuid, $3::uuid, $4)
@@ -926,11 +1000,22 @@ func (s *PostgresStore) AddComment(ctx context.Context, viewerID, albumID, asset
         SELECT inserted.id::text, inserted.created_at, `+nameOf("author")+`
         FROM inserted, users AS author WHERE author.id = $3::uuid`,
 		album.ID, assetID, viewerID, body).Scan(&comment.ID, &comment.CreatedAt, &comment.AuthorName)
-	return comment, err
+	if err != nil {
+		return Comment{}, err
+	}
+	return comment, tx.Commit(ctx)
 }
 
 func (s *PostgresStore) DeleteComment(ctx context.Context, viewerID, albumID, commentID string) error {
-	command, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := lockAlbum(ctx, tx, viewerID, albumID); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
         DELETE FROM album_comments AS note
         USING albums AS al
         WHERE note.id = $3::uuid AND note.album_id = $2::uuid AND al.id = note.album_id
@@ -941,7 +1026,7 @@ func (s *PostgresStore) DeleteComment(ctx context.Context, viewerID, albumID, co
 	if command.RowsAffected() != 1 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) Activity(ctx context.Context, viewerID string, limit int) ([]Activity, error) {

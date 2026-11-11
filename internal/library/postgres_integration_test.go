@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -536,6 +537,128 @@ func TestAlbumsFoldersSharingAndDownloads(t *testing.T) {
 	}
 	if match := f.store.MatchAsset(f.ctx, mom, "whatever.HEIC", "image/heic", at("2026-02-01T00:00:00Z")); match != second {
 		t.Fatalf("match = %q", match)
+	}
+}
+
+func TestAlbumMembershipMutationRace(t *testing.T) {
+	f := startFamily(t)
+	owner := f.user("owner@example.test")
+	member := f.user("member@example.test")
+	ownerAsset := f.upload(owner, "owner.jpg", "image/jpeg", []byte("owner fixture"))
+	memberAsset := f.upload(member, "member.jpg", "image/jpeg", []byte("member fixture"))
+	lateAsset := f.upload(member, "late.jpg", "image/jpeg", []byte("late member fixture"))
+	// Dedicated single-connection pools give each concurrent operation a known PID.
+	worker := func() (*library.PostgresStore, int32) {
+		config := f.pool.Config()
+		config.MaxConns = 1
+		pool, err := pgxpool.NewWithConfig(f.ctx, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		var pid int32
+		if err := pool.QueryRow(f.ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t.Fatal(err)
+		}
+		return library.NewPostgresStore(pool), pid
+	}
+	remover, removalPID := worker()
+	mutator, mutationPID := worker()
+	for _, leave := range []bool{false, true} {
+		for _, action := range []string{"add", "comment", "like", "remove", "delete-comment"} {
+			t.Run(fmt.Sprintf("leave=%t/%s", leave, action), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(f.ctx, 15*time.Second)
+				defer cancel()
+				album, err := f.store.CreateAlbum(ctx, owner, "Race fixture", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.store.SetMembers(ctx, owner, album.ID, []string{member}); err != nil {
+					t.Fatal(err)
+				}
+				for user, asset := range map[string]string{owner: ownerAsset, member: memberAsset} {
+					if n, err := f.store.AddToAlbum(ctx, user, album.ID, []string{asset}); err != nil || n != 1 {
+						t.Fatalf("seed contribution = %d, %v", n, err)
+					}
+				}
+				comment, err := f.store.AddComment(ctx, member, album.ID, ownerAsset, "fixture")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.store.SetLike(ctx, member, album.ID, ownerAsset, true); err != nil {
+					t.Fatal(err)
+				}
+				holder, err := f.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer holder.Rollback(f.ctx)
+				var holderPID int32
+				if err := holder.QueryRow(ctx, `SELECT pg_backend_pid() FROM albums WHERE id = $1::uuid FOR UPDATE`, album.ID).Scan(&holderPID); err != nil {
+					t.Fatal(err)
+				}
+				waitBlocked := func(pid, blocker int32) {
+					t.Helper()
+					for {
+						var blocked bool
+						if err := f.pool.QueryRow(ctx, `SELECT $2::int = ANY(pg_blocking_pids($1::int))`, pid, blocker).Scan(&blocked); err != nil {
+							t.Fatalf("wait for album lock: %v", err)
+						}
+						if blocked {
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+				removed := make(chan error, 1)
+				go func() {
+					if leave {
+						removed <- remover.LeaveAlbum(ctx, member, album.ID)
+					} else {
+						removed <- remover.SetMembers(ctx, owner, album.ID, []string{})
+					}
+				}()
+				waitBlocked(removalPID, holderPID)
+				mutated := make(chan error, 1)
+				go func() {
+					var err error
+					switch action {
+					case "add":
+						_, err = mutator.AddToAlbum(ctx, member, album.ID, []string{lateAsset})
+					case "comment":
+						_, err = mutator.AddComment(ctx, member, album.ID, ownerAsset, "late")
+					case "like":
+						err = mutator.SetLike(ctx, member, album.ID, ownerAsset, true)
+					case "remove":
+						_, err = mutator.RemoveFromAlbum(ctx, member, album.ID, []string{memberAsset})
+					case "delete-comment":
+						err = mutator.DeleteComment(ctx, member, album.ID, comment.ID)
+					}
+					mutated <- err
+				}()
+				// The remover is ahead in the album lock queue, so it commits
+				// its cleanup before the mutation can re-check membership.
+				waitBlocked(mutationPID, removalPID)
+				if err := holder.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-removed; err != nil {
+					t.Fatalf("remove member: %v", err)
+				}
+				if err := <-mutated; !errors.Is(err, library.ErrNotFound) {
+					t.Fatalf("departed member mutation = %v, want not found", err)
+				}
+				var remaining int
+				if err := f.pool.QueryRow(ctx, `SELECT
+                    (SELECT count(*) FROM album_assets WHERE album_id = $1::uuid AND added_by = $2::uuid) +
+                    (SELECT count(*) FROM album_comments WHERE album_id = $1::uuid AND user_id = $2::uuid) +
+                    (SELECT count(*) FROM album_likes WHERE album_id = $1::uuid AND user_id = $2::uuid)`,
+					album.ID, member).Scan(&remaining); err != nil || remaining != 0 {
+					t.Fatalf("departed member contributions = %d, %v", remaining, err)
+				}
+				t.Log("removal committed before queued mutation; no departed-member contributions remain")
+			})
+		}
 	}
 }
 

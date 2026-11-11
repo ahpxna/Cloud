@@ -107,6 +107,16 @@ func parseTree(data []byte, depth int) ([]*node, error) {
 		item := &node{kind: kind}
 		if containerKinds[kind] {
 			children, err := parseTree(body, depth+1)
+			// QuickTime user data may end with a 32-bit zero terminator.
+			if err != nil && kind == "udta" && len(body) >= 4 && bytes.Equal(body[len(body)-4:], []byte{0, 0, 0, 0}) {
+				children, err = parseTree(body[:len(body)-4], depth+1)
+			}
+			if err != nil && kind == "udta" {
+				// Optional vendor metadata can be opaque. Drop it rather than
+				// copying a possible Live Photo identifier or refusing the movie.
+				position += length
+				continue
+			}
 			if err != nil {
 				return nil, err
 			}

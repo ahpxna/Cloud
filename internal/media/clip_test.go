@@ -304,6 +304,22 @@ func FuzzPlanClip(f *testing.F) {
 	children := parseChildren(metadata[moov.dataStart:moov.end])
 	nested, _ := buildSynthMovie(f, []synthTrack{video, audio}, 600, 600, atom("udta", atom("meta", children["meta"])))
 	f.Add(nested, 0.2, 0.8)
+	for _, userData := range [][]byte{
+		atom("udta", atom("meta", children["meta"]), atom("vend", []byte("camera")), u32(0)),
+		atom("udta", atom("meta", children["meta"]), []byte{0, 0, 0, 20, 'b', 'a', 'd', '!'}),
+	} {
+		seed, _ := buildSynthMovie(f, []synthTrack{video, audio}, 600, 600, userData)
+		clip, err := PlanClip(bytes.NewReader(seed), int64(len(seed)), 0.2, 0.8)
+		if err != nil {
+			f.Fatalf("user-data seed: %v", err)
+		}
+		var out bytes.Buffer
+		written, err := clip.WriteTo(&out)
+		if err != nil || written != clip.Size() || bytes.Contains(out.Bytes(), []byte("com.apple.quicktime.content.identifier")) {
+			f.Fatalf("user-data clip: size=%d/%d error=%v", written, clip.Size(), err)
+		}
+		f.Add(seed, 0.2, 0.8)
+	}
 	overflowing, err := parseTree(seed, 0)
 	if err != nil {
 		f.Fatal(err)
