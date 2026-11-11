@@ -255,11 +255,15 @@ func (api *API) preview(w http.ResponseWriter, r *http.Request, principal auth.P
 		return
 	}
 	file, size, err := api.extras.Staged(id)
-	if err != nil || size == 0 {
+	if err != nil {
 		writeProblem(w, http.StatusNotFound, "not_found", "no bytes received yet")
 		return
 	}
 	defer file.Close()
+	if size == 0 {
+		writeProblem(w, http.StatusNotFound, "not_found", "no bytes received yet")
+		return
+	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	if r.URL.Query().Get("part") == "thumbnail" {
 		thumbnail, ok := media.ExifThumbnail(file, size)

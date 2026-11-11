@@ -73,7 +73,7 @@ type node struct {
 }
 
 var containerKinds = map[string]bool{
-	"moov": true, "trak": true, "mdia": true, "minf": true, "stbl": true, "edts": true, "dinf": true,
+	"moov": true, "trak": true, "mdia": true, "minf": true, "stbl": true, "edts": true, "dinf": true, "udta": true,
 }
 
 func parseTree(data []byte, depth int) ([]*node, error) {
@@ -199,12 +199,12 @@ func PlanClip(r io.ReaderAt, size int64, start, end float64) (*Clip, error) {
 	if _, fragmented := findBox(top, "moof"); fragmented {
 		return nil, ErrClipUnsupported
 	}
+	if ftypBox.end-ftypBox.start > maxBoxRead || moovBox.end-moovBox.dataStart > maxMoovSize {
+		return nil, ErrClipUnsupported
+	}
 	ftyp := make([]byte, ftypBox.end-ftypBox.start)
 	if _, err := r.ReadAt(ftyp, ftypBox.start); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
-	}
-	if moovBox.end-moovBox.dataStart > maxMoovSize {
-		return nil, ErrClipUnsupported
 	}
 	moovData := make([]byte, moovBox.end-moovBox.dataStart)
 	if _, err := r.ReadAt(moovData, moovBox.dataStart); err != nil && !errors.Is(err, io.EOF) {
@@ -215,6 +215,7 @@ func PlanClip(r io.ReaderAt, size int64, start, end float64) (*Clip, error) {
 		return nil, err
 	}
 	moov := &node{kind: "moov", children: children}
+	moov.stripLivePhotoKey()
 	if moov.child("mvex") != nil {
 		return nil, ErrClipUnsupported
 	}
@@ -316,8 +317,6 @@ func PlanClip(r io.ReaderAt, size int64, start, end float64) (*Clip, error) {
 				continue
 			case "mvhd":
 				out.children = append(out.children, &node{kind: "mvhd", payload: withMovieDuration(item.payload, segmentDuration)})
-			case "meta":
-				out.children = append(out.children, &node{kind: "meta", payload: withoutLivePhotoKey(item.payload)})
 			default:
 				out.children = append(out.children, item)
 			}
@@ -573,11 +572,11 @@ func (t *track) readSamples(stbl *node, fileSize int64) error {
 		for chunkNumber := firstChunk; chunkNumber <= lastChunk && index < count; chunkNumber++ {
 			position := offsets[chunkNumber-1]
 			for inChunk := 0; inChunk < perChunk && index < count; inChunk++ {
-				samples[index].offset = int64(position)
-				position += uint64(samples[index].size)
-				if position > uint64(fileSize) {
+				if position > uint64(fileSize) || uint64(samples[index].size) > uint64(fileSize)-position {
 					return ErrClipUnsupported
 				}
+				samples[index].offset = int64(position)
+				position += uint64(samples[index].size)
 				index++
 			}
 		}
@@ -836,6 +835,15 @@ func chunkOffsetBox(offsets []uint64) *node {
 		binary.BigEndian.PutUint64(body[8+index*8:], offset)
 	}
 	return &node{kind: "co64", payload: body}
+}
+
+func (n *node) stripLivePhotoKey() {
+	if n.kind == "meta" {
+		n.payload = withoutLivePhotoKey(n.payload)
+	}
+	for _, child := range n.children {
+		child.stripLivePhotoKey()
+	}
 }
 
 // withoutLivePhotoKey removes com.apple.quicktime.content.identifier from an

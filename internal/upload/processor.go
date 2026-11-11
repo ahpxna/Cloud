@@ -761,7 +761,8 @@ func (p *Processor) SweepPurging(ctx context.Context, store PurgeStore) error {
 			if err != nil {
 				return err
 			}
-			if _, err := os.Stat(original); errors.Is(err, os.ErrNotExist) {
+			_, err = os.Stat(original)
+			if errors.Is(err, os.ErrNotExist) {
 				if err := os.MkdirAll(filepath.Dir(original), 0o700); err != nil {
 					return err
 				}
@@ -770,6 +771,9 @@ func (p *Processor) SweepPurging(ctx context.Context, store PurgeStore) error {
 				}
 				_ = syncDirectory(filepath.Dir(original))
 				continue
+			}
+			if err != nil {
+				return err
 			}
 		}
 		// Purged (or unknown, or the live asset already has its bytes).

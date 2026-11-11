@@ -441,6 +441,8 @@ func FuzzExtract(f *testing.F) {
 	f.Add([]byte("\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  \x00\x00\x00\x08moov"))
 	f.Add([]byte("\x00\x00\x00\x14ftypheic\x00\x00\x00\x00mif1\x00\x00\x00\x0cmeta\x00\x00\x00\x00"))
 	f.Add([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"))
+	f.Add(buildQuickTime(true, map[string]string{"com.apple.quicktime.content.identifier": "LIVE", "com.apple.quicktime.location.ISO6709": "+40.00-074.00/"}))
+	f.Add(buildHEIF([]byte("MM\x00*\x00\x00\x00\x08\x00\x00"), true))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = Extract(bytes.NewReader(data), int64(len(data)), time.UTC)
 		_, _ = ExifThumbnail(bytes.NewReader(data), int64(len(data)))

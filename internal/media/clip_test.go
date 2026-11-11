@@ -3,6 +3,7 @@ package media
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -147,7 +148,7 @@ func TestClipCutsAtKeyframeWithExactEdit(t *testing.T) {
 			append(append(u32(8+8+8+24), u32(1)...), atom("data", u32(1), u32(0), []byte("2026-10-02T20:43:23-0400"))...),
 			append(append(u32(8+8+8+4), u32(2)...), atom("data", u32(1), u32(0), []byte("LIVE"))...)),
 	)
-	file, _ := buildSynthMovie(t, []synthTrack{video, audio, metadata}, 600, 1800, appleKeys)
+	file, _ := buildSynthMovie(t, []synthTrack{video, audio, metadata}, 600, 1800, appleKeys, atom("udta", appleKeys))
 
 	clip, err := PlanClip(bytes.NewReader(file), int64(len(file)), 1.25, 2.5)
 	if err != nil {
@@ -209,6 +210,9 @@ func TestClipCutsAtKeyframeWithExactEdit(t *testing.T) {
 			t.Fatalf("clip metadata = %+v", parsed)
 		}
 	}
+	if bytes.Contains(out.Bytes(), []byte("com.apple.quicktime.content.identifier")) {
+		t.Fatal("clip retained nested Live Photo identifier")
+	}
 	// Interleaved: chunks alternate between tracks instead of all video first.
 	offsets := []int64{cut.samples[0].offset, sound.samples[0].offset}
 	if offsets[1] > cut.samples[len(cut.samples)-1].offset {
@@ -261,11 +265,61 @@ func TestClipRejectsUnsupportedLayouts(t *testing.T) {
 	}
 }
 
+type largeFTYPReader struct {
+	largestRead int
+}
+
+func (r *largeFTYPReader) ReadAt(p []byte, offset int64) (int, error) {
+	r.largestRead = max(r.largestRead, len(p))
+	if len(p) > 16 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if offset == 0 {
+		copy(p, append(u32(8<<20), []byte("ftypqt  \x00\x00\x00\x00")...))
+		return len(p), nil
+	}
+	if offset == 8<<20 {
+		return copy(p, atom("moov")), io.EOF
+	}
+	return 0, io.EOF
+}
+
+func TestClipBoundsFTYPRead(t *testing.T) {
+	reader := &largeFTYPReader{}
+	_, err := PlanClip(reader, 8<<20+8, 0, 1)
+	if err == nil || reader.largestRead > maxBoxRead {
+		t.Fatalf("oversized ftyp: error=%v largest allocated read=%d", err, reader.largestRead)
+	}
+}
+
 func FuzzPlanClip(f *testing.F) {
 	video := synthTrack{handler: "vide", timescale: 600, durations: repeatUint32(20, 30), sizes: repeatUint32(10, 30), sync: []int{1, 16}, editMedia: 0, fill: 2}
 	audio := synthTrack{handler: "soun", timescale: 48000, durations: repeatUint32(1024, 20), sizes: repeatUint32(4, 20), editMedia: 2112, fill: 3}
 	seed, _ := buildSynthMovie(f, []synthTrack{video, audio}, 600, 600)
 	f.Add(seed, 0.2, 0.8)
+	f.Add(append(u32(8<<20), []byte("ftypqt  \x00\x00\x00\x00")...), 0.0, 1.0)
+	metadata := buildQuickTime(false, map[string]string{"com.apple.quicktime.content.identifier": "LIVE"})
+	boxes, _ := walkBoxes(bytes.NewReader(metadata), 0, int64(len(metadata)), int64(len(metadata)))
+	moov, _ := findBox(boxes, "moov")
+	children := parseChildren(metadata[moov.dataStart:moov.end])
+	nested, _ := buildSynthMovie(f, []synthTrack{video, audio}, 600, 600, atom("udta", atom("meta", children["meta"])))
+	f.Add(nested, 0.2, 0.8)
+	overflowing, err := parseTree(seed, 0)
+	if err != nil {
+		f.Fatal(err)
+	}
+	for _, box := range overflowing {
+		if box.kind == "moov" {
+			offsets := box.path("trak", "mdia", "minf", "stbl", "stco")
+			offsets.kind = "co64"
+			offsets.payload = append(append(u32(0), u32(1)...), []byte{255, 255, 255, 255, 255, 255, 255, 255}...)
+		}
+	}
+	var hostile bytes.Buffer
+	for _, box := range overflowing {
+		box.encode(&hostile)
+	}
+	f.Add(hostile.Bytes(), 0.2, 0.8)
 	f.Fuzz(func(t *testing.T, data []byte, start, end float64) {
 		clip, err := PlanClip(bytes.NewReader(data), int64(len(data)), start, end)
 		if err != nil {

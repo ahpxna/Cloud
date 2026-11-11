@@ -154,6 +154,15 @@ func (api *API) serveDownload(w http.ResponseWriter, r *http.Request, principal 
 		writeProblem(w, http.StatusNotFound, "not_found", "download expired; select the items again")
 		return
 	}
+	items := make([]Item, 0, len(set.items))
+	for _, cached := range set.items {
+		item, file, ok := api.openOriginal(w, r, principal, cached.ID)
+		if !ok {
+			return
+		}
+		file.Close()
+		items = append(items, item)
+	}
 	name := "Anh-gia-dinh-" + time.Now().Format("2006-01-02-1504") + ".zip"
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
@@ -161,20 +170,20 @@ func (api *API) serveDownload(w http.ResponseWriter, r *http.Request, principal 
 	writer := api.progressDeadlineWriter(w, time.Now())
 	archive := zip.NewWriter(writer)
 	used := map[string]int{}
-	for _, item := range set.items {
+	for _, item := range items {
 		path, err := api.originalPath(item.StorageKey)
 		if err != nil {
-			continue
+			return
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			continue
+			return
 		}
 		header := &zip.FileHeader{Name: uniqueArchiveName(item.OriginalFilename, used), Method: zip.Store, Modified: item.TakenAt}
 		header.SetMode(0o644)
 		entry, err := archive.CreateHeader(header)
 		if err == nil {
-			_, err = io.Copy(entry, file)
+			_, err = io.CopyN(entry, file, item.ByteSize)
 		}
 		file.Close()
 		if err != nil {
@@ -195,12 +204,20 @@ func uniqueArchiveName(name string, used map[string]int) string {
 		name = "photo"
 	}
 	key := strings.ToLower(name)
-	used[key]++
-	if used[key] == 1 {
+	if used[key] == 0 {
+		used[key] = 1
 		return name
 	}
 	extension := filepath.Ext(name)
-	return fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(name, extension), used[key], extension)
+	for {
+		used[key]++
+		candidate := fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(name, extension), used[key], extension)
+		candidateKey := strings.ToLower(candidate)
+		if used[candidateKey] == 0 {
+			used[candidateKey] = 1
+			return candidate
+		}
+	}
 }
 
 // clip streams part of a video, cut losslessly at the requested times.
