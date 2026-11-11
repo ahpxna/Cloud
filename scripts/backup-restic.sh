@@ -31,6 +31,11 @@ work="$backup_root/$stamp"
 dump="$work/postgres.dump"
 metadata="$work/backup-metadata.txt"
 mkdir -p "$work" "$manifest_root" "$audit_root"
+# Record canonical source paths so recovery can remap arbitrary host layouts.
+[[ ! -d "$media_root" ]] || media_root="$(realpath "$media_root")"
+manifest_root="$(realpath "$manifest_root")"
+audit_root="$(realpath "$audit_root")"
+[[ ! -d "$manifest_keyring_root" ]] || manifest_keyring_root="$(realpath "$manifest_keyring_root")"
 chmod 700 "$backup_root" "$work" 2>/dev/null || true
 
 started_gateway=0

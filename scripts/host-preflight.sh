@@ -4,6 +4,12 @@
 # dm-crypt/LUKS mapping; an unrelated /etc/crypttab entry is not evidence.
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/load-env.sh
+source "$repo_root/scripts/lib/load-env.sh"
+load_dotenv "$repo_root/.env" PHOTO_MEDIA_MOUNT PHOTO_MEDIA_DEVICE_UUID \
+  PHOTO_MEDIA_MIN_FREE_GIB PHOTO_MEDIA_HOST_ROOT
+
 failures=0
 warnings=0
 
@@ -38,11 +44,14 @@ if ! [[ "$minimum_free_gib" =~ ^[0-9]+$ ]]; then
   fail "PHOTO_MEDIA_MIN_FREE_GIB must be a whole number"
 fi
 
-for tool in findmnt findfs df stat lsblk cryptsetup docker; do
+for tool in findmnt findfs mountpoint realpath df stat lsblk cryptsetup docker; do
   require_command "$tool"
 done
 
 if [[ -n "$media_mount" && -d "$media_mount" ]]; then
+  if ! mountpoint -q "$media_mount"; then
+    fail "$media_mount is not a mountpoint (refusing an underlying root directory)"
+  fi
   source_device="$(findmnt --noheadings --output SOURCE --target "$media_mount" 2>/dev/null | xargs || true)"
   filesystem="$(findmnt --noheadings --output FSTYPE --target "$media_mount" 2>/dev/null | xargs || true)"
   if [[ -z "$source_device" ]]; then
@@ -64,11 +73,18 @@ if [[ -n "$media_mount" && -d "$media_mount" ]]; then
     expected_source="$(findfs UUID="$media_uuid" 2>/dev/null || true)"
     if [[ -z "$expected_source" ]]; then
       fail "no local filesystem has UUID $media_uuid"
-    elif [[ "$expected_source" != "$source_device" ]]; then
+    elif [[ "$(readlink -f "$expected_source")" != "$(readlink -f "$source_device")" ]]; then
       fail "mounted source $source_device does not match UUID $media_uuid ($expected_source)"
     else
       pass "mounted filesystem UUID matches the expected UUID"
     fi
+  fi
+
+  media_root="${PHOTO_MEDIA_HOST_ROOT:-$repo_root/.data/media}"
+  if [[ "$(realpath -m "$media_root")" != "$(realpath "$media_mount")/"* ]]; then
+    fail "PHOTO_MEDIA_HOST_ROOT must be inside PHOTO_MEDIA_MOUNT"
+  else
+    pass "media root is inside the checked media mount"
   fi
 
   if [[ "$minimum_free_gib" =~ ^[0-9]+$ ]]; then
@@ -138,4 +154,4 @@ if [[ "$failures" -gt 0 ]]; then
   exit 1
 fi
 
-printf 'Host preflight passed with %d warning(s). Continue with disposable fixtures only.\n' "$warnings"
+printf 'Host preflight passed with %d warning(s).\n' "$warnings"

@@ -1,0 +1,7 @@
+# Linux only: keep the private userspace ingress, with a reachable peer UDP port.
+services:
+  tailscale:
+    ports:
+      - "41641:41641/udp"
+    environment:
+      TS_TAILSCALED_EXTRA_ARGS: "--port=41641"

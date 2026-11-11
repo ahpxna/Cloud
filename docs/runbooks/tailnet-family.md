@@ -112,6 +112,7 @@ On the always-on Linux host, prefer a direct path: run the `tailscale`
 service with `network_mode: host` (or publish `41641/udp` and start
 tailscaled with `--port=41641`), and allow UDP 41641 through the router. When
 the phone is on the same Wi-Fi as the server, a direct LAN path is normal.
+For this repo's Linux override and setup, follow [ThinkCentre setup](thinkcentre-host.md) and [compose.linux-host.yaml](../../compose.linux-host.yaml).
 
 ## Time zone
 
