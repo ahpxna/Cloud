@@ -130,6 +130,10 @@ backup: env ## Create a quiescent encrypted restic backup
 restore-drill: env ## Restore a snapshot into isolation and re-hash all originals
 	bash scripts/restore-drill.sh $(RESTORE_ARGS)
 
+.PHONY: restore-live
+restore-live: env ## Restore a snapshot into an empty stack and verify before serving
+	bash scripts/restore-live.sh
+
 .PHONY: synthetic-probe
 synthetic-probe: ## Exercise login -> resumable upload -> verify -> download SHA-256
 	@test -n "$(BASE_URL)" -a -n "$(EMAIL)" -a -n "$(PASSWORD_FILE)" || (echo "usage: make synthetic-probe BASE_URL=https://... EMAIL=probe@example.com PASSWORD_FILE=/path/to/password [PROBE_ARGS=...]"; exit 1)
@@ -191,7 +195,7 @@ ios-parse: ## Parse the iOS/Share Extension scaffold without full Xcode
 	ruby -e 'require "yaml"; YAML.load_file("ios/project.yml")'
 
 .PHONY: host-preflight
-host-preflight: ## Read-only Linux/media-disk readiness check for the future host
+host-preflight: ## Read-only Linux/media-disk readiness check for the host
 	bash scripts/host-preflight.sh
 
 .PHONY: ios-test
@@ -200,4 +204,4 @@ ios-test: ## Generate the iOS project and run simulator XCTest (requires full Xc
 
 .PHONY: integration-test
 integration-test: ## Run PostgreSQL 18 upload + account/MFA integration tests without Docker
-	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go GOCACHE=$(CURDIR)/.cache/go-build go test -tags=integration -count=1 ./internal/upload ./internal/account
+	GOMODCACHE=$(CURDIR)/.cache/go-mod GOPATH=$(CURDIR)/.cache/go GOCACHE=$(CURDIR)/.cache/go-build go test -tags=integration -count=1 ./internal/upload ./internal/account ./internal/library

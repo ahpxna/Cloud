@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"family-photo-cloud/internal/auth"
-	"family-photo-cloud/internal/upload"
 )
 
 // Thumbnails are derived, replaceable previews. iPhone originals are mostly
@@ -39,8 +38,8 @@ func (api *API) thumbnailPath(ownerID, assetID string) (string, error) {
 	return filepath.Join(api.mediaRoot, "thumbnails", ownerID, assetID+".jpg"), nil
 }
 
-func (api *API) hasThumbnail(asset upload.Asset) bool {
-	path, err := api.thumbnailPath(asset.OwnerID, asset.ID)
+func (api *API) hasThumbnail(ownerID, assetID string) bool {
+	path, err := api.thumbnailPath(ownerID, assetID)
 	if err != nil {
 		return false
 	}
@@ -48,10 +47,14 @@ func (api *API) hasThumbnail(asset upload.Asset) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// thumbnailURL returns a view URL whose ticket is identical for a whole hour,
-// so the browser can cache the image across library reloads.
-func (api *API) thumbnailURL(principal auth.Principal, assetID string, now time.Time) (string, error) {
-	ticket, err := api.viewTickets.IssueView(principal, assetID, auth.ViewThumbnail, now.Truncate(time.Hour), thumbnailTicketTTL)
+// thumbnailURL uses stable hourly tickets for visible assets and fresh URLs
+// for hidden or trashed assets so old browser cache entries are not reused.
+func (api *API) thumbnailURL(principal auth.Principal, assetID string, now time.Time, protected bool) (string, error) {
+	ticketTime := now.Truncate(time.Hour)
+	if protected {
+		ticketTime = now
+	}
+	ticket, err := api.viewTickets.IssueView(principal, assetID, auth.ViewThumbnail, ticketTime, thumbnailTicketTTL)
 	if err != nil {
 		return "", err
 	}
@@ -59,13 +62,9 @@ func (api *API) thumbnailURL(principal auth.Principal, assetID string, now time.
 }
 
 func (api *API) serveThumbnail(w http.ResponseWriter, r *http.Request, principal auth.Principal, assetID string) {
-	asset, err := api.repository.AssetByID(r.Context(), principal.UserID, assetID)
-	if errors.Is(err, upload.ErrNotFound) {
-		writeProblem(w, http.StatusNotFound, "not_found", "asset not found")
-		return
-	}
+	asset, err := api.store.Accessible(r.Context(), principal.UserID, assetID)
 	if err != nil {
-		writeProblem(w, http.StatusInternalServerError, "asset_lookup_failed", "could not load asset")
+		api.writeStoreError(w, err, "could not load asset")
 		return
 	}
 	path, err := api.thumbnailPath(asset.OwnerID, asset.ID)
@@ -86,6 +85,9 @@ func (api *API) serveThumbnail(w http.ResponseWriter, r *http.Request, principal
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", thumbnailCacheControl)
+	if asset.Hidden || asset.TrashedAt != nil {
+		w.Header().Set("Cache-Control", "private, no-store")
+	}
 	http.ServeContent(w, r, "thumbnail.jpg", info.ModTime(), file)
 }
 
@@ -94,13 +96,14 @@ func (api *API) storeThumbnail(w http.ResponseWriter, r *http.Request, principal
 		writeProblem(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "thumbnail must be image/jpeg")
 		return
 	}
-	asset, err := api.repository.AssetByID(r.Context(), principal.UserID, assetID)
-	if errors.Is(err, upload.ErrNotFound) {
-		writeProblem(w, http.StatusNotFound, "not_found", "asset not found")
+	asset, err := api.store.Accessible(r.Context(), principal.UserID, assetID)
+	if err != nil {
+		api.writeStoreError(w, err, "could not load asset")
 		return
 	}
-	if err != nil {
-		writeProblem(w, http.StatusInternalServerError, "asset_lookup_failed", "could not load asset")
+	// Only the owner's devices write previews of their photos.
+	if asset.OwnerID != principal.UserID {
+		writeProblem(w, http.StatusForbidden, "forbidden", "only the owner can set a thumbnail")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, thumbnailMaxUploadBytes))

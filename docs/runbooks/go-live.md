@@ -4,6 +4,8 @@ The order matters: each stage proves something the next one relies on. Tick a
 box only with dated evidence (command output, email received, report file)
 kept outside Git. Details live in the linked runbooks.
 
+For the ordered Linux hardware setup and Mac library move, use [ThinkCentre host](thinkcentre-host.md).
+
 ## 1. Source and CI (no hardware)
 
 - [ ] `main` is green: Go race/integration tests, iOS XCTest, Trivy, CodeQL,

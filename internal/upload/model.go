@@ -36,6 +36,8 @@ var (
 	ErrCreateRateLimit            = errors.New("upload session creation rate limited")
 	ErrUploadResourceInconsistent = errors.New("upload resource metadata is inconsistent")
 	ErrUploadBusy                 = errors.New("upload resource is busy")
+	// ErrAlreadyReceived means every byte arrived before a cancel request.
+	ErrAlreadyReceived = errors.New("upload already received")
 )
 
 type Session struct {
@@ -106,6 +108,8 @@ type Repository interface {
 	PendingVerification(context.Context, int) ([]Session, error)
 	ExpiredSessions(context.Context, time.Time, int) ([]Session, error)
 	MarkExpired(context.Context, string) error
+	// MarkCancelled ends an unfinished upload at its owner's request.
+	MarkCancelled(context.Context, string, string) error
 	ResetForRetry(context.Context, string, string) (Session, error)
 }
 
@@ -120,6 +124,7 @@ type SessionSummary struct {
 	ErrorCode        string    `json:"error_code,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	AssetID          string    `json:"asset_id,omitempty"`
 }
 
 // SessionLister lists an owner's most recently updated uploads.

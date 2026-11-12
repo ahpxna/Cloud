@@ -18,6 +18,7 @@ type MemoryRepository struct {
 	assets          map[string]Asset
 	createThrottles map[string]createThrottle
 	created         map[string]time.Time
+	cancelled       map[string]bool
 }
 
 type createThrottle struct {
@@ -32,6 +33,7 @@ func NewMemoryRepository() *MemoryRepository {
 		assets:          make(map[string]Asset),
 		createThrottles: make(map[string]createThrottle),
 		created:         make(map[string]time.Time),
+		cancelled:       make(map[string]bool),
 	}
 }
 
@@ -131,11 +133,15 @@ func (r *MemoryRepository) ListSessions(_ context.Context, ownerID string, limit
 			continue
 		}
 		created := r.created[session.ID]
-		summaries = append(summaries, SessionSummary{
+		summary := SessionSummary{
 			ID: session.ID, OriginalFilename: session.OriginalFilename, MediaType: session.MediaType,
 			State: session.State, ExpectedSize: session.ExpectedSize, ReceivedSize: session.ReceivedSize,
-			CreatedAt: created, UpdatedAt: created,
-		})
+			CreatedAt: created, UpdatedAt: created, AssetID: session.AssetID,
+		}
+		if r.cancelled[session.ID] && session.State == StateExpired {
+			summary.ErrorCode = "cancelled"
+		}
+		summaries = append(summaries, summary)
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		if summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
@@ -495,4 +501,20 @@ func (r *MemoryRepository) ResetForRetry(_ context.Context, id, ownerID string) 
 	session.TransportResource = ""
 	r.sessions[id] = session
 	return session, nil
+}
+
+func (r *MemoryRepository) MarkCancelled(_ context.Context, id, ownerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.sessions[id]
+	if !ok || session.OwnerID != ownerID {
+		return ErrNotFound
+	}
+	if session.State != StateCreated && session.State != StateUploading && session.State != StateFailed {
+		return ErrInvalidState
+	}
+	session.State = StateExpired
+	r.sessions[id] = session
+	r.cancelled[id] = true
+	return nil
 }

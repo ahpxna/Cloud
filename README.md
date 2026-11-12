@@ -34,8 +34,19 @@ The accepted direction is:
   removed through public IP or a VPS/WireGuard path.
 
 **Deploying?** Follow the ordered [go-live checklist](docs/runbooks/go-live.md).
+For an always-on Linux box and a tested library migration path, follow [ThinkCentre host](docs/runbooks/thinkcentre-host.md).
 For free private family access (Tailscale + web app + iOS Shortcut), see
 [tailnet-family](docs/runbooks/tailnet-family.md).
+For parents using iPhones, see [Hướng dẫn cho ba mẹ](docs/huong-dan-gia-dinh.md).
+
+The web app at `/app/` is modelled on the iPhone Photos app: a timeline by date
+taken with sorting, filters and search; multi-select; albums in folders, smart
+albums, places and "on this day"; albums shared between family accounts with
+likes, comments and contributions; favourites, hidden items and a 30-day
+Recently Deleted; Live Photos; lossless cutting of part of a video; saving to
+the Photos app and ZIP downloads; and uploads you can preview and stop. Capture
+metadata comes from a fuzzed, pure-Go EXIF/HEIF/QuickTime reader
+(`internal/media`); nothing is ever re-encoded.
 
 Read [the architecture](docs/architecture.md), [MVP API contract](docs/api.md),
 [integrity manifest format](docs/integrity-manifest-v1.md), [iOS scaffold

@@ -118,6 +118,87 @@ func (f *libraryFixture) serve(method, target, owner string, headers map[string]
 	return recorder
 }
 
+type sharedDownloadStore struct {
+	Store
+	shared bool
+}
+
+func (s *sharedDownloadStore) Accessible(ctx context.Context, viewer, id string) (Item, error) {
+	if s.shared && viewer == ownerB {
+		viewer = ownerA
+	}
+	return s.Store.Accessible(ctx, viewer, id)
+}
+
+func TestDownloadRechecksRevokedAccess(t *testing.T) {
+	f := newLibraryFixture(t)
+	f.addAsset("shared", ownerA, []byte("private original"), time.Now())
+	store := &sharedDownloadStore{Store: f.api.store, shared: true}
+	f.api.store = store
+	item, err := store.Accessible(context.Background(), ownerB, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := f.api.downloads.put(downloadSet{
+		ownerID: ownerB, sessionID: "90000000-0000-4000-8000-000000000009",
+		items: []Item{item}, expires: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "/v1/assets/download/" + id
+	if response := f.serve(http.MethodGet, target, ownerB, nil); response.Code != http.StatusOK {
+		t.Fatalf("shared download = %d", response.Code)
+	}
+	store.shared = false
+	if response := f.serve(http.MethodGet, target, ownerB, nil); response.Code != http.StatusNotFound {
+		t.Fatalf("download after revocation = %d, body contains %d bytes", response.Code, response.Body.Len())
+	}
+}
+
+func TestArchiveNamesDoNotOverwriteOtherOriginals(t *testing.T) {
+	used := map[string]int{}
+	seen := map[string]bool{}
+	for _, name := range []string{"photo.jpg", "photo.jpg", "photo (2).jpg", "PHOTO.JPG", "photo (3).jpg"} {
+		got := uniqueArchiveName(name, used)
+		if seen[strings.ToLower(got)] {
+			t.Fatalf("duplicate archive entry %q for %q", got, name)
+		}
+		seen[strings.ToLower(got)] = true
+	}
+}
+
+func TestDownloadRejectsIncompleteOriginals(t *testing.T) {
+	for _, missing := range []bool{true, false} {
+		f := newLibraryFixture(t)
+		asset := f.addAsset("original", ownerA, []byte("complete original"), time.Now())
+		item, err := f.api.store.Accessible(context.Background(), ownerA, asset.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := f.api.downloads.put(downloadSet{
+			ownerID: ownerA, sessionID: "90000000-0000-4000-8000-000000000009",
+			items: []Item{item}, expires: time.Now().Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(f.root, filepath.FromSlash(asset.StorageKey))
+		if missing {
+			err = os.Remove(path)
+		} else {
+			err = os.Truncate(path, 1)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := f.serve(http.MethodGet, "/v1/assets/download/"+id, ownerA, nil)
+		if response.Code < 400 {
+			t.Errorf("incomplete original (missing=%v) produced a successful ZIP: status=%d bytes=%d", missing, response.Code, response.Body.Len())
+		}
+	}
+}
+
 func TestListIsOwnerScopedAndPaginates(t *testing.T) {
 	fixture := newLibraryFixture(t)
 	base := time.Date(2026, time.October, 1, 12, 0, 0, 0, time.UTC)

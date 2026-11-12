@@ -170,10 +170,14 @@ func (m *AccessTokenManager) VerifyUpload(raw string) (Principal, error) {
 	return Principal{UserID: claims.UserID, SessionID: claims.SessionID, UploadID: claims.UploadID}, nil
 }
 
-// View ticket kinds: a ticket for one never opens the other.
+// View ticket kinds: a ticket for one never opens another. The ticket's
+// subject ID is an asset ID, except for upload previews (an upload session
+// ID) and downloads (a server-side download selection ID).
 const (
-	ViewOriginal  = "original"
-	ViewThumbnail = "thumbnail"
+	ViewOriginal      = "original"
+	ViewThumbnail     = "thumbnail"
+	ViewUploadPreview = "upload_preview"
+	ViewDownload      = "download"
 )
 
 type ViewClaims struct {
@@ -192,7 +196,7 @@ func (m *AccessTokenManager) IssueView(principal Principal, assetID, kind string
 	// so they can be issued per hour and cached by the browser.
 	maxTTL := 30 * time.Minute
 	switch kind {
-	case ViewOriginal:
+	case ViewOriginal, ViewUploadPreview, ViewDownload:
 	case ViewThumbnail:
 		maxTTL = 3 * time.Hour
 	default:

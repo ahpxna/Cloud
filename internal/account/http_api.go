@@ -179,6 +179,10 @@ type tokenResponse struct {
 
 func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/v1/auth/library-lock" && (r.Method == http.MethodGet || r.Method == http.MethodPut):
+		api.libraryLock(w, r)
+	case (r.URL.Path == "/v1/auth/library-lock/unlock" || r.URL.Path == "/v1/auth/library-lock/relock") && r.Method == http.MethodPost:
+		api.libraryLock(w, r)
 	case r.URL.Path == "/v1/auth/login" && r.Method == http.MethodPost:
 		api.login(w, r)
 	case r.URL.Path == "/v1/auth/refresh" && r.Method == http.MethodPost:
@@ -285,11 +289,23 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 		accountProblem(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
 		return
 	}
+	user, ok := api.verifyLoginPassword(w, r, email, request.Password)
+	if !ok {
+		return
+	}
+	api.createTokenPair(w, r.Context(), user, request.DeviceName, nil)
+}
+
+func (api *API) verifyLoginPassword(w http.ResponseWriter, r *http.Request, email, password string) (User, bool) {
+	if len(password) > 1024 {
+		accountProblem(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
+		return User{}, false
+	}
 	now := api.now().UTC()
 	if !api.globalLimiter.Allow(now) {
 		w.Header().Set("Retry-After", "1")
 		accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
-		return
+		return User{}, false
 	}
 	identityHash := api.loginIdentityHash(email)
 	if api.durableLimiter != nil && len(api.throttleKey) >= 32 {
@@ -297,7 +313,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			api.logger.Error("record login throttle", "error", err)
 			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
-			return
+			return User{}, false
 		}
 		if !allowed {
 			seconds := int64(retryAfter.Round(time.Second).Seconds())
@@ -306,12 +322,12 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Retry-After", fmt.Sprint(seconds))
 			accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
-			return
+			return User{}, false
 		}
 	} else if !api.limiter.Allow(email, now) {
 		w.Header().Set("Retry-After", "600")
 		accountProblem(w, http.StatusTooManyRequests, "login_rate_limited", "try again later")
-		return
+		return User{}, false
 	}
 	select {
 	case api.passwordGate <- struct{}{}:
@@ -319,7 +335,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Retry-After", "1")
 		accountProblem(w, http.StatusTooManyRequests, "login_busy", "try again shortly")
-		return
+		return User{}, false
 	}
 
 	user, err := api.repository.ActiveUserByEmail(r.Context(), email)
@@ -327,32 +343,32 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 		if !errors.Is(err, ErrInvalidCredentials) {
 			api.logger.Error("lookup account", "error", err)
 			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
-			return
+			return User{}, false
 		}
-		_, _ = VerifyPassword(api.dummyHash, request.Password)
+		_, _ = VerifyPassword(api.dummyHash, password)
 		accountProblem(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
-		return
+		return User{}, false
 	}
-	valid, err := VerifyPassword(user.PasswordHash, request.Password)
+	valid, err := VerifyPassword(user.PasswordHash, password)
 	if err != nil {
 		api.logger.Error("invalid password record", "user_id", user.ID, "error", err)
 		accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
-		return
+		return User{}, false
 	}
 	if !valid {
 		accountProblem(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
-		return
+		return User{}, false
 	}
 	if api.durableLimiter != nil && len(api.throttleKey) >= 32 {
 		if err := api.durableLimiter.ClearLoginAttempts(r.Context(), identityHash); err != nil {
 			api.logger.Error("clear login throttle", "user_id", user.ID, "error", err)
 			accountProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
-			return
+			return User{}, false
 		}
 	} else {
 		api.limiter.Reset(email)
 	}
-	api.createTokenPair(w, r.Context(), user, request.DeviceName, nil)
+	return user, true
 }
 
 func (api *API) refresh(w http.ResponseWriter, r *http.Request) {

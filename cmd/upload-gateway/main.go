@@ -1,6 +1,9 @@
 package main
 
 import (
+	// The Alpine image has no zoneinfo; PHOTO_TIMEZONE needs the embedded copy.
+	_ "time/tzdata"
+
 	"context"
 	"encoding/base64"
 	"errors"
@@ -17,6 +20,7 @@ import (
 	"family-photo-cloud/internal/account"
 	"family-photo-cloud/internal/auth"
 	"family-photo-cloud/internal/gateway"
+	"family-photo-cloud/internal/library"
 	"family-photo-cloud/internal/upload"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -123,6 +127,12 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	repository := upload.NewPostgresRepository(pool)
+	photoTimezone := time.Local
+	if name := os.Getenv("PHOTO_TIMEZONE"); name != "" {
+		if photoTimezone, err = time.LoadLocation(name); err != nil {
+			return fmt.Errorf("PHOTO_TIMEZONE: %w", err)
+		}
+	}
 	application, err := gateway.New(gateway.Config{
 		Repository:                repository,
 		Accounts:                  account.NewPostgresRepository(pool),
@@ -145,6 +155,8 @@ func run(logger *slog.Logger) error {
 		MFAEncryptionKey:          mfaEncryptionKey,
 		RefreshRetryEncryptionKey: refreshRetryEncryptionKey,
 		CanonicalHost:             os.Getenv("CANONICAL_HOST"),
+		Library:                   library.NewPostgresStore(pool),
+		PhotoTimezone:             photoTimezone,
 		Logger:                    logger,
 	})
 	if err != nil {

@@ -14,6 +14,38 @@ import (
 
 const testOwnerID = "10000000-0000-4000-8000-000000000001"
 
+type liveSweepStore struct {
+	PurgeStore
+	key string
+}
+
+func (s liveSweepStore) AssetStorage(context.Context, string) (string, bool, bool, error) {
+	return s.key, true, true, nil
+}
+
+func TestSweepPreservesLiveOriginalOnStatError(t *testing.T) {
+	root := t.TempDir()
+	p := &Processor{mediaRoot: root}
+	holding := filepath.Join(root, ".purging", "live-asset")
+	if err := os.MkdirAll(filepath.Dir(holding), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(holding, []byte("only surviving original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A damaged parent path makes Stat fail with ENOTDIR, not ENOENT.
+	if err := os.WriteFile(filepath.Join(root, "originals"), []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := p.SweepPurging(context.Background(), liveSweepStore{key: "originals/photo"})
+	if data, readErr := os.ReadFile(holding); readErr != nil || string(data) != "only surviving original" {
+		t.Fatalf("live original lost during recovery: data=%q err=%v (sweep=%v)", data, readErr, err)
+	}
+	if err == nil {
+		t.Fatal("sweep ignored the filesystem error")
+	}
+}
+
 func TestProcessorVerifiesAndCommitsOriginal(t *testing.T) {
 	t.Parallel()
 	content := []byte("original photo bytes that must remain unchanged")
