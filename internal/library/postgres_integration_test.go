@@ -10,12 +10,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -23,8 +26,10 @@ import (
 	"testing"
 	"time"
 
+	"family-photo-cloud/internal/account"
 	"family-photo-cloud/internal/auth"
 	"family-photo-cloud/internal/database"
+	"family-photo-cloud/internal/gateway"
 	"family-photo-cloud/internal/library"
 	"family-photo-cloud/internal/media"
 	"family-photo-cloud/internal/upload"
@@ -660,6 +665,323 @@ func TestAlbumMembershipMutationRace(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestLibraryPasswordLockGateway(t *testing.T) {
+	f := startFamily(t)
+	owner := f.user("lock@example.com")
+	password := "synthetic library lock password"
+	hash, err := account.HashPassword(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.pool.Exec(f.ctx, `UPDATE users SET password_hash=$2 WHERE id=$1::uuid`, owner, hash); err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := auth.NewAccessTokenManager([]byte(strings.Repeat("k", 32)), auth.DefaultIssuer, auth.DefaultAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := gateway.New(gateway.Config{
+		Repository: f.repo, Accounts: account.NewPostgresRepository(f.pool), Tokens: tokens,
+		Library: f.store, MediaRoot: f.mediaRoot, MaxUploadBytes: 1 << 20, ChunkBytes: 1 << 16,
+		ReconcileInterval: time.Hour, LoginThrottleHMACKey: []byte(strings.Repeat("l", 32)),
+		MFAEncryptionKey: []byte(strings.Repeat("m", 32)), RefreshRetryEncryptionKey: []byte(strings.Repeat("r", 32)),
+		GlobalLoginBurst: 100, GlobalLoginRatePerSecond: 100, Logger: testLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Close)
+	var bearer string
+	call := func(method, path string, body any, want int) map[string]any {
+		t.Helper()
+		var reader io.Reader
+		contentType := "application/json"
+		if raw, ok := body.([]byte); ok {
+			reader = bytes.NewReader(raw)
+			contentType = "image/jpeg"
+		} else if body != nil {
+			data, _ := json.Marshal(body)
+			reader = bytes.NewReader(data)
+		}
+		request := httptest.NewRequest(method, path, reader)
+		if body != nil {
+			request.Header.Set("Content-Type", contentType)
+		}
+		if bearer != "" {
+			request.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s %s = %d want %d: %s", method, path, response.Code, want, response.Body)
+		}
+		result := map[string]any{}
+		_ = json.Unmarshal(response.Body.Bytes(), &result)
+		if want == 403 && result["code"] != "library_locked" {
+			t.Fatalf("wrong locked error: %v", result)
+		}
+		return result
+	}
+	login := func() map[string]any {
+		return call("POST", "/v1/auth/login", map[string]any{"email": "lock@example.com", "password": password, "device_name": "Synthetic device"}, 200)
+	}
+	pair := login()
+	bearer = pair["access_token"].(string)
+	principal, err := tokens.Verify(bearer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.sessions[owner] = principal.SessionID
+	state := func() map[string]any { return call("GET", "/v1/auth/library-lock", nil, 200) }
+	unlock := func() {
+		current := state()
+		call("POST", "/v1/auth/library-lock/unlock", map[string]any{"password": password, "version": current["version"]}, 200)
+	}
+	if state()["enabled"] != false {
+		t.Fatal("existing user should default to unlocked")
+	}
+	var preview bytes.Buffer
+	if err := jpeg.Encode(&preview, image.NewRGBA(image.Rect(0, 0, 16, 16)), nil); err != nil {
+		t.Fatal(err)
+	}
+	photo := f.upload(owner, "synthetic.jpg", "image/jpeg", preview.Bytes())
+	f.meta(photo, media.Metadata{})
+	ids := []string{photo}
+	for _, color := range []string{"red", "blue"} {
+		path := filepath.Join(t.TempDir(), "synthetic.mp4")
+		output, err := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c="+color+":s=32x32:r=10", "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "1", "-bf", "0", path).CombinedOutput()
+		if err != nil {
+			t.Fatalf("synthetic ffmpeg: %v %s", err, output)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := f.upload(owner, color+".mp4", "video/mp4", content)
+		f.meta(id, media.Metadata{DurationMS: 2000})
+		ids = append(ids, id)
+	}
+	album := call("POST", "/v1/albums", map[string]any{"name": "Synthetic lock album", "asset_ids": ids}, 201)["id"].(string)
+	note := call("POST", "/v1/albums/"+album+"/comments", map[string]any{"asset_id": photo, "body": "Synthetic comment"}, 201)["id"].(string)
+	for _, id := range ids {
+		path := filepath.Join(f.mediaRoot, "thumbnails", owner)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, id+".jpg"), preview.Bytes(), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Prepare tickets/download sets before locking; they must not bypass a later lock.
+	type route struct {
+		method, path string
+		body         any
+		normal       int
+	}
+	reads := []route{{"GET", "/v1/assets?view=hidden", nil, 200}, {"GET", "/v1/assets?view=trash", nil, 200}}
+	for _, id := range ids {
+		detail := call("GET", "/v1/assets/"+id+"?tickets=1", nil, 200)
+		for _, suffix := range []string{"", "/original", "/thumbnail"} {
+			reads = append(reads, route{"GET", "/v1/assets/" + id + suffix, nil, 200})
+			if suffix != "" {
+				reads = append(reads, route{"HEAD", "/v1/assets/" + id + suffix, nil, 200})
+			}
+		}
+		reads = append(reads, route{"GET", "/v1/assets?ids=" + id, nil, 200})
+		reads = append(reads, route{"PUT", "/v1/assets/" + id + "/thumbnail", preview.Bytes(), 204})
+		reads = append(reads, route{"GET", detail["view_url"].(string), nil, 200}, route{"GET", detail["thumbnail_url"].(string), nil, 200})
+		if id != photo {
+			reads = append(reads, route{"GET", "/v1/assets/" + id + "/clip?start=0&end=1", nil, 200}, route{"GET", strings.Replace(detail["view_url"].(string), "/original?", "/clip?", 1) + "&start=0&end=1", nil, 200})
+		}
+	}
+	download := call("POST", "/v1/assets/download", map[string]any{"ids": ids}, 201)["url"].(string)
+	reads = append(reads, route{"GET", download, nil, 200}, route{"POST", "/v1/assets/download", map[string]any{"ids": ids}, 201})
+	reset := func() {
+		if _, err := f.pool.Exec(f.ctx, `UPDATE assets SET hidden=(id=ANY($1::uuid[])), trashed_at=CASE WHEN id=$2::uuid THEN now() ELSE NULL END WHERE id=ANY($3::uuid[])`, ids[:2], ids[2], ids); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reset()
+	call("PUT", "/v1/auth/library-lock", map[string]any{"enabled": true}, 200)
+	assertLocked := func(routes []route) {
+		for _, item := range routes {
+			// Exercise ticket authentication without a bearer.
+			old := bearer
+			if strings.Contains(item.path, "ticket=") {
+				bearer = ""
+			}
+			call(item.method, item.path, item.body, 403)
+			bearer = old
+		}
+	}
+	assertLocked(reads)
+	mutations := []route{
+		{"PATCH", "/v1/assets/" + photo, map[string]any{"caption": "Synthetic caption"}, 204},
+		{"PATCH", "/v1/assets/" + photo, map[string]any{"hidden": false}, 204},
+		{"POST", "/v1/assets/batch", map[string]any{"ids": []string{photo}, "action": "unhide"}, 200},
+		{"POST", "/v1/assets/batch", map[string]any{"ids": []string{ids[2]}, "action": "restore"}, 200},
+		{"POST", "/v1/assets/trash/restore", map[string]any{}, 200},
+		{"DELETE", "/v1/albums/" + album + "/comments/" + note, nil, 204},
+		{"POST", "/v1/albums/" + album + "/assets", map[string]any{"ids": ids}, 200},
+		{"POST", "/v1/albums/" + album + "/assets/remove", map[string]any{"ids": ids}, 200},
+		{"POST", "/v1/albums", map[string]any{"name": "Synthetic protected selection", "asset_ids": ids}, 201},
+	}
+	assertLocked(mutations)
+	assertLocked([]route{{"POST", "/v1/assets/batch", map[string]any{"ids": []string{ids[2]}, "action": "purge"}, 200}, {"POST", "/v1/assets/trash/empty", map[string]any{}, 200}})
+	// Album social/cover operations still require visibility even when unlocked.
+	assertLocked([]route{{"PATCH", "/v1/albums/" + album, map[string]any{"cover_asset_id": photo}, 204}, {"POST", "/v1/albums/" + album + "/likes", map[string]any{"asset_id": photo, "liked": true}, 204}, {"GET", "/v1/albums/" + album + "/comments?asset_id=" + photo, nil, 200}, {"POST", "/v1/albums/" + album + "/comments", map[string]any{"asset_id": photo, "body": "Synthetic"}, 201}})
+	summary := call("GET", "/v1/library/summary", nil, 200)
+	for _, field := range []string{"hidden", "trash"} {
+		if _, ok := summary["counts"].(map[string]any)[field]; ok {
+			t.Fatalf("locked count leaked: %s", field)
+		}
+	}
+	for _, field := range []string{"hidden_count", "trash_count", "trash_bytes"} {
+		if _, ok := summary["usage"].(map[string]any)[field]; ok {
+			t.Fatalf("locked usage leaked: %s", field)
+		}
+	}
+	for _, path := range []string{"/v1/assets", "/v1/assets?q=synthetic", "/v1/assets?album=" + album} {
+		if got := call("GET", path, nil, 200)["assets"].([]any); len(got) != 0 {
+			t.Fatalf("protected items in %s: %v", path, got)
+		}
+	}
+	call("POST", "/v1/auth/library-lock/unlock", map[string]any{"password": "wrong", "version": state()["version"]}, 401)
+	call("PUT", "/v1/auth/library-lock", map[string]any{"enabled": false, "password": "wrong"}, 401)
+	if state()["enabled"] != true {
+		t.Fatal("wrong password disabled lock")
+	}
+	unlock()
+	for _, item := range reads {
+		old := bearer
+		if strings.Contains(item.path, "ticket=") {
+			bearer = ""
+		}
+		call(item.method, item.path, item.body, item.normal)
+		bearer = old
+	}
+	for _, item := range mutations {
+		reset()
+		call(item.method, item.path, item.body, item.normal)
+	}
+	t.Logf("lock refused %d read/download routes and %d mutation routes; unlock restored access", len(reads), len(mutations)+6)
+	reset()
+	// A refresh rotates access credentials without moving the unlock deadline.
+	until := state()["unlocked_until"]
+	pair = call("POST", "/v1/auth/refresh", map[string]any{"refresh_token": pair["refresh_token"]}, 200)
+	bearer = pair["access_token"].(string)
+	if state()["unlocked_until"] != until {
+		t.Fatal("refresh changed unlock deadline")
+	}
+	// Device isolation and pending unlock cancellation.
+	firstBearer := bearer
+	second := login()
+	bearer = second["access_token"].(string)
+	call("GET", "/v1/assets?view=hidden", nil, 403)
+	bearer = firstBearer
+	oldVersion := state()["version"]
+	call("POST", "/v1/auth/library-lock/relock", map[string]any{}, 200)
+	call("POST", "/v1/auth/library-lock/unlock", map[string]any{"password": password, "version": oldVersion}, 409)
+	assertLocked(reads)
+	unlock()
+	if _, err := f.pool.Exec(f.ctx, `UPDATE device_sessions SET library_unlocked_until=now()-interval '1 second' WHERE id=$1::uuid`, principal.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	assertLocked(reads)
+	t.Log("expired unlock refused every read/download route; stale unlock rejected; second session stayed locked")
+	// Mutations include a Live Photo's paired half even when only the still is selected.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE assets SET live_photo_id='synthetic-pair', hidden=(id=$2::uuid), trashed_at=NULL WHERE id=ANY($1::uuid[])`, ids[:2], ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	assertLocked([]route{{"GET", "/v1/assets?ids=" + photo, nil, 200}, {"POST", "/v1/assets/download", map[string]any{"ids": []string{photo}}, 201}, {"POST", "/v1/assets/batch", map[string]any{"ids": []string{photo}, "action": "hide"}, 200}})
+	if item := call("GET", "/v1/assets/"+photo, nil, 200); item["live_video"] != nil {
+		t.Fatalf("protected paired video leaked: %v", item)
+	}
+	if count := call("GET", "/v1/library/summary", nil, 200)["counts"].(map[string]any)["live"]; count != float64(0) {
+		t.Fatalf("protected paired video leaked in live count: %v", count)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE assets SET live_photo_id=NULL WHERE id=ANY($1::uuid[])`, ids[:2]); err != nil {
+		t.Fatal(err)
+	}
+	reset()
+	// Automatic retention uses the internal store and does not need a browser unlock.
+	expired := f.upload(owner, "synthetic-retention.jpg", "image/jpeg", append(append([]byte{}, preview.Bytes()...), 0))
+	if _, err := f.pool.Exec(f.ctx, `UPDATE assets SET trashed_at=now()-interval '31 days' WHERE id=$1::uuid`, expired); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := f.processor.PurgeExpiredTrash(f.ctx, f.repo, time.Now().Add(-library.TrashRetention), 10); err != nil || count != 1 {
+		t.Fatalf("locked retention purge = %d: %v", count, err)
+	}
+	// Internal re-upload restore remains independent of the lock.
+	item, err := f.store.Accessible(f.ctx, owner, ids[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(f.mediaRoot, filepath.FromSlash(item.StorageKey)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored := f.upload(owner, "again.mp4", "video/mp4", content); restored != ids[2] {
+		t.Fatal("re-upload did not restore binned asset")
+	}
+	call("GET", "/v1/assets/"+ids[2], nil, 200)
+	// Trashing/hiding visible items is still available without an unlock.
+	call("POST", "/v1/assets/batch", map[string]any{"ids": []string{ids[2]}, "action": "trash"}, 200)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE assets SET hidden=false,trashed_at=NULL WHERE id=$1::uuid`, photo); err != nil {
+		t.Fatal(err)
+	}
+	call("POST", "/v1/assets/batch", map[string]any{"ids": []string{photo}, "action": "hide"}, 200)
+	unlock()
+	call("POST", "/v1/assets/batch", map[string]any{"ids": []string{ids[2]}, "action": "purge"}, 200)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE assets SET trashed_at=now() WHERE id=$1::uuid`, ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	call("POST", "/v1/assets/trash/empty", map[string]any{}, 200)
+	call("POST", "/v1/auth/logout", map[string]any{"refresh_token": pair["refresh_token"]}, 204)
+	call("GET", "/v1/assets?view=hidden", nil, 401)
+	old := bearer
+	bearer = ""
+	call("GET", download, nil, 401)
+	bearer = old
+	pair = login()
+	bearer = pair["access_token"].(string)
+	call("GET", "/v1/assets?view=hidden", nil, 403)
+	unlock()
+	current, err := tokens.Verify(bearer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call("DELETE", "/v1/auth/sessions/"+current.SessionID, nil, 204)
+	call("GET", "/v1/assets?view=hidden", nil, 401)
+	pair = login()
+	bearer = pair["access_token"].(string)
+	unlock()
+	password = "replacement synthetic library password"
+	replacement, err := account.HashPassword(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := account.NewAdminRepository(f.pool).ResetPassword(f.ctx, "lock@example.com", replacement); err != nil {
+		t.Fatal(err)
+	}
+	call("GET", "/v1/assets?view=hidden", nil, 401)
+	pair = login()
+	bearer = pair["access_token"].(string)
+	call("GET", "/v1/assets?view=hidden", nil, 403)
+	call("PUT", "/v1/auth/library-lock", map[string]any{"enabled": false, "password": password}, 200)
+	call("GET", "/v1/assets?view=hidden", nil, 200)
+	if _, ok := call("GET", "/v1/library/summary", nil, 200)["counts"].(map[string]any)["hidden"]; !ok {
+		t.Fatal("disabled lock withheld counts")
+	}
+	call("PUT", "/v1/auth/library-lock", map[string]any{"enabled": true}, 200)
+	// Failed reauthentication exhausts the same durable budget as sign-in.
+	for i := 0; i < 5; i++ {
+		call("POST", "/v1/auth/library-lock/unlock", map[string]any{"password": "wrong", "version": state()["version"]}, 401)
+	}
+	call("POST", "/v1/auth/login", map[string]any{"email": "lock@example.com", "password": password, "device_name": "Synthetic device"}, 429)
+	t.Log("retention, re-upload restore, visible hide/trash work while locked; sign-out, session revocation and password change end unlocks; wrong unlock passwords trigger sign-in lockout")
 }
 
 func TestMetadataPendingAndPurgeSweep(t *testing.T) {

@@ -451,7 +451,8 @@ func (s *PostgresStore) Counts(ctx context.Context, ownerID string) (Counts, map
                    (a.live_photo_id IS NOT NULL AND a.media_type NOT LIKE 'video/%' AND EXISTS (
                        SELECT 1 FROM assets AS video WHERE video.owner_id = a.owner_id
                          AND video.live_photo_id = a.live_photo_id AND video.media_type LIKE 'video/%'
-                         AND video.deleted_at IS NULL)) AS live_still
+                         AND video.deleted_at IS NULL AND video.hidden = a.hidden
+                         AND (video.trashed_at IS NULL) = (a.trashed_at IS NULL))) AS live_still
             FROM assets AS a WHERE a.owner_id = $1::uuid AND a.deleted_at IS NULL
         ) AS a`, ownerID)
 	targets := make([]any, 0, len(names)*2)

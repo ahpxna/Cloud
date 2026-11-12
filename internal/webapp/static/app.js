@@ -243,7 +243,7 @@ async function api(path, options = {}) {
   const token = await accessToken();
   const headers = { ...(options.headers || {}), Authorization: "Bearer " + token };
   const response = await fetch(path, { ...options, headers });
-  if (response.status === 401) {
+  if (response.status === 401 && !path.startsWith("/v1/auth/library-lock")) {
     credentials.clear();
     throw new SignedOut();
   }
@@ -265,6 +265,9 @@ async function apiJSON(path, method = "GET", body) {
 }
 
 const problemMessages = {
+  library_locked: "Album đã khoá. Hãy mở lại bằng mật khẩu.",
+  library_lock_changed: "Trạng thái khoá đã đổi. Hãy mở lại album rồi thử lại.",
+  invalid_credentials: "Mật khẩu không đúng.",
   not_found: "Không tìm thấy (có thể đã bị xoá hoặc không còn được chia sẻ).",
   forbidden: "Chỉ chủ album mới làm được việc này.",
   invalid_request: "Yêu cầu không hợp lệ.",
@@ -433,6 +436,7 @@ function route() {
     return;
   }
   const next = parseHash();
+  if (sensitiveRoute(currentRoute) && (next.name !== currentRoute.name || next.arg !== currentRoute.arg)) relockLibrary();
   closeViewer();
   closeSheet();
   if (picking && !(next.name === "library")) cancelPicking();
@@ -1327,7 +1331,7 @@ function smartRow(key, counts) {
   return el("li", {}, el("button", { class: "row-button", onclick: () => go(key === "places" ? "places" : "smart/" + key) },
     el("span", { class: "row-icon", text: smart.icon }),
     el("span", { class: "row-label", text: smart.title }),
-    el("span", { class: "row-count", text: count === "" ? "" : Number(count).toLocaleString("vi-VN") }),
+    el("span", { class: "row-count", text: count === "" ? (["hidden", "trash"].includes(key) ? "🔒" : "") : Number(count).toLocaleString("vi-VN") }),
     el("span", { class: "row-chevron", text: "›" })));
 }
 
@@ -1585,6 +1589,20 @@ async function openCollectionRoute({ name, arg }) {
     } else if (name === "smart") {
       const smart = smartAlbums[arg] || (arg === "on_this_day" ? { title: "Ngày này năm xưa" } : null);
       if (!smart) throw new Error("Không có album này.");
+      if (["hidden", "trash"].includes(arg)) {
+        const epoch = libraryLockEpoch;
+        collection.reset();
+        collection.done = true;
+        await awaitLibraryRelock();
+        const state = await apiJSON("/v1/auth/library-lock");
+        if (epoch !== libraryLockEpoch || document.hidden || !sensitiveRoute(currentRoute) || currentRoute.arg !== arg) return;
+        libraryLock = state;
+        if (state.enabled && (!libraryUnlockUntil || Date.now() >= libraryUnlockUntil || !state.unlocked_until)) {
+          if (state.unlocked_until) await relockLibrary(true);
+          renderLockedAlbum();
+          return;
+        }
+      }
       const params = { view: arg };
       if (arg === "on_this_day") {
         const now = new Date();
@@ -1893,6 +1911,7 @@ function canShareFiles() {
 
 // filesFor downloads originals (and Live Photo videos) for the share sheet.
 async function filesFor(items, onProgress) {
+  const epoch = libraryLockEpoch;
   const parts = [];
   for (const item of items) {
     parts.push(item);
@@ -1906,6 +1925,7 @@ async function filesFor(items, onProgress) {
     const response = await api(part.original_url || "/v1/assets/" + part.id + "/original");
     if (!response.ok) throw new Error(await problemText(response));
     const blob = await response.blob();
+    if (epoch !== libraryLockEpoch) throw new Error("Album đã khoá lại.");
     files.push(new File([blob], part.original_filename, { type: part.media_type }));
     done += part.byte_size || blob.size;
     onProgress(total ? done / total : 1);
@@ -1929,6 +1949,7 @@ function shareItems(items) {
 }
 
 async function prepareShare(items, files = null) {
+  const epoch = libraryLockEpoch;
   const bar = el("progress", { class: "sheet-progress", max: "1", value: "0" });
   const status = el("p", { class: "muted", text: "Đang tải bản gốc…" });
   openSheet("Chuẩn bị lưu", status, bar);
@@ -1942,9 +1963,11 @@ async function prepareShare(items, files = null) {
     return;
   }
   // Safari needs a fresh tap to open the share sheet after a download.
+  if (epoch !== libraryLockEpoch) return;
   openSheet("Sẵn sàng",
     el("p", { text: plural(files.length, "tệp") + " · " + formatBytes(files.reduce((sum, file) => sum + file.size, 0)) }),
     el("button", { class: "primary", onclick: async () => {
+      if (epoch !== libraryLockEpoch) return;
       try {
         await navigator.share({ files });
         closeSheet();
@@ -1956,8 +1979,10 @@ async function prepareShare(items, files = null) {
 }
 
 async function downloadOriginal(item) {
+  const epoch = libraryLockEpoch;
   try {
     const fresh = await ensureFresh(item);
+    if (epoch !== libraryLockEpoch) return;
     const link = el("a", { href: fresh.view_url || fresh.original_url, download: fresh.original_filename });
     document.body.append(link);
     link.click();
@@ -1968,8 +1993,10 @@ async function downloadOriginal(item) {
 }
 
 async function downloadZip(ids) {
+  const epoch = libraryLockEpoch;
   try {
     const result = await apiJSON("/v1/assets/download", "POST", { ids });
+    if (epoch !== libraryLockEpoch) return;
     toast("Đang tải " + plural(result.count, "tệp") + " (" + formatBytes(result.total_bytes) + ")…");
     const link = el("a", { href: result.url });
     document.body.append(link);
@@ -2038,6 +2065,8 @@ function openViewer(collection, index) {
 }
 
 function closeViewer() {
+  viewer.token++;
+  viewer.collection = null;
   if ($("viewer").hidden) return;
   stopSlideshow();
   exitTrim();
@@ -2051,11 +2080,13 @@ function closeViewer() {
 
 async function showItem(index) {
   const collection = viewer.collection;
+  const initialToken = viewer.token;
   if (!collection || index < 0) return;
   if (index >= collection.items.length) {
     if (!collection.done) await collection.loadMore();
     if (index >= collection.items.length) return;
   }
+  if (initialToken !== viewer.token || collection !== viewer.collection || $("viewer").hidden) return;
   const token = ++viewer.token;
   viewer.index = index;
   let item = collection.items[index];
@@ -2170,11 +2201,13 @@ function stopSlideshow() {
 }
 
 async function toggleFavorite(item) {
+  const collection = viewer.collection;
+  const token = viewer.token;
   try {
     await apiJSON("/v1/assets/" + item.id, "PATCH", { favorite: !item.favorite });
     item.favorite = !item.favorite;
-    viewer.collection.refresh(item);
-    renderViewerChrome(item);
+    collection.refresh(item);
+    if (token === viewer.token) renderViewerChrome(item);
   } catch (error) {
     handleError(error);
   }
@@ -2194,6 +2227,9 @@ async function toggleLike(item) {
 
 async function viewerBatch(action) {
   const item = viewer.item;
+  const collection = viewer.collection;
+  const index = viewer.index;
+  const token = viewer.token;
   const messages = {
     trash: "Xoá mục này? Nó sẽ nằm trong \"Đã xoá gần đây\" 30 ngày.",
     purge: "Xoá vĩnh viễn mục này? Không thể hoàn tác.",
@@ -2201,10 +2237,9 @@ async function viewerBatch(action) {
   if (messages[action] && !confirm(messages[action])) return;
   try {
     await apiJSON("/v1/assets/batch", "POST", { ids: withLiveVideos([item]), action });
-    const collection = viewer.collection;
-    const index = viewer.index;
     collection.remove([item.id]);
     toast({ trash: "Đã chuyển vào Đã xoá gần đây", purge: "Đã xoá vĩnh viễn", restore: "Đã khôi phục", hide: "Đã ẩn", unhide: "Đã bỏ ẩn" }[action]);
+    if (token !== viewer.token) return;
     if (!collection.items.length) closeViewer();
     else showItem(Math.min(index, collection.items.length - 1));
   } catch (error) {
@@ -2239,13 +2274,16 @@ async function setCover(album, item) {
 }
 
 async function removeCurrentFromAlbum(album, item) {
+  const collection = viewer.collection;
+  const index = viewer.index;
+  const token = viewer.token;
   try {
     await apiJSON("/v1/albums/" + album.id + "/assets/remove", "POST", { ids: withLiveVideos([item]) });
-    const index = viewer.index;
-    viewer.collection.remove([item.id]);
+    collection.remove([item.id]);
     toast("Đã bỏ khỏi album");
-    if (!viewer.collection.items.length) closeViewer();
-    else showItem(Math.min(index, viewer.collection.items.length - 1));
+    if (token !== viewer.token) return;
+    if (!collection.items.length) closeViewer();
+    else showItem(Math.min(index, collection.items.length - 1));
   } catch (error) {
     handleError(error);
   }
@@ -2729,8 +2767,10 @@ function saveClip() {
   const entries = [];
   if (canShareFiles()) entries.push({ label: "Lưu đoạn này vào app Ảnh", icon: "⤴︎", action: () => shareClip(item) });
   entries.push({ label: "Tải đoạn này về", icon: "⤓", action: async () => {
+    const epoch = libraryLockEpoch;
     try {
       await ensureFresh(item);
+      if (epoch !== libraryLockEpoch) return;
       const ticket = item.view_url.slice(item.view_url.indexOf("ticket="));
       const link = el("a", { href: "/v1/assets/" + item.id + "/clip?" + clipQuery() + "&" + ticket, download: clipName(item) });
       document.body.append(link);
@@ -2746,6 +2786,7 @@ function saveClip() {
 }
 
 async function shareClip(item) {
+  const epoch = libraryLockEpoch;
   const bar = el("progress", { class: "sheet-progress", max: "1", value: "0" });
   const status = el("p", { class: "muted", text: "Đang cắt video…" });
   openSheet("Chuẩn bị đoạn video", status, bar);
@@ -2758,6 +2799,7 @@ async function shareClip(item) {
     let received = 0;
     for (;;) {
       const { done, value } = await reader.read();
+      if (epoch !== libraryLockEpoch) { await reader.cancel(); return; }
       if (done) break;
       chunks.push(value);
       received += value.length;
@@ -2842,6 +2884,7 @@ function deviceName() {
 }
 
 async function logout() {
+  relockLibrary();
   const credential = currentCredential();
   if (credential) {
     await fetch("/v1/auth/logout", {
@@ -3262,6 +3305,7 @@ function enableDropZone() {
 // ---------------------------------------------------------------- settings
 
 async function loadSettings({ keepOpenWork = false } = {}) {
+  refreshLibraryLock();
   refreshKeys();
   // Don't wipe an MFA setup or recovery codes the person may be copying into
   // another app when they come back.
@@ -3291,19 +3335,19 @@ async function loadUsage() {
   try {
     const summary = await apiJSON("/v1/library/summary");
     const usage = summary.usage;
-    const used = usage.photo_bytes + usage.video_bytes + usage.trash_bytes;
+    const used = usage.photo_bytes + usage.video_bytes + (usage.trash_bytes || 0);
     const capacity = usage.quota_bytes || used + (usage.disk_free_bytes || 0) || 1;
     const segment = (kind, bytes) => {
       const bar = el("span", { class: "usage-" + kind });
       bar.style.setProperty("width", Math.min(100, (bytes / capacity) * 100) + "%");
       return bar;
     };
-    $("usage-bar").replaceChildren(segment("photo", usage.photo_bytes), segment("video", usage.video_bytes), segment("trash", usage.trash_bytes));
+    $("usage-bar").replaceChildren(segment("photo", usage.photo_bytes), segment("video", usage.video_bytes), segment("trash", usage.trash_bytes || 0));
     const row = (kind, label, value) => el("li", {}, el("span", {}, kind ? el("span", { class: "dot usage-" + kind }) : null, label), el("span", { class: "muted", text: value }));
     $("usage-list").replaceChildren(...[
       row("photo", plural(usage.photo_count, "ảnh"), formatBytes(usage.photo_bytes)),
       row("video", plural(usage.video_count, "video"), formatBytes(usage.video_bytes)),
-      row("trash", "Đã xoá gần đây (" + usage.trash_count + ")", formatBytes(usage.trash_bytes)),
+      row("trash", usage.trash_count === undefined ? "Đã xoá gần đây 🔒" : "Đã xoá gần đây (" + usage.trash_count + ")", usage.trash_bytes === undefined ? "🔒" : formatBytes(usage.trash_bytes)),
       usage.quota_bytes ? row("", "Hạn mức của bạn", formatBytes(usage.quota_bytes)) : null,
       usage.disk_free_bytes !== undefined && usage.disk_free_bytes !== null ? row("", "Còn trống trên máy chủ", formatBytes(usage.disk_free_bytes)) : null,
     ].filter(Boolean));
@@ -3594,12 +3638,158 @@ document.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("online", () => ($("offline").hidden = true));
   window.addEventListener("offline", () => ($("offline").hidden = false));
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshActiveTab();
+    if (document.hidden) relockLibrary();
+    else refreshActiveTab();
   });
   window.addEventListener("focus", refreshActiveTab);
   window.addEventListener("pageshow", (event) => {
-    if (event.persisted) refreshActiveTab();
+    if (event.persisted) { relockLibrary(); refreshActiveTab(); }
   });
+  $("library-lock-toggle").addEventListener("change", changeLibraryLock);
+  window.addEventListener("pagehide", () => relockLibrary());
   $("offline").hidden = navigator.onLine;
   route();
 });
+
+
+let libraryLock = { enabled: false };
+let libraryUnlockUntil = 0;
+let libraryUnlockRequests = 0;
+let libraryLockTimer = null;
+let libraryLockEpoch = 0;
+let libraryRelockPending = Promise.resolve();
+
+function sensitiveRoute(value) {
+  return value && value.name === "smart" && ["hidden", "trash"].includes(value.arg);
+}
+
+function renderLockedAlbum() {
+  if (!sensitiveRoute(currentRoute)) return;
+  const collection = collectionView.collection;
+  collection.reset();
+  collection.done = true;
+  collectionHeader({ title: smartAlbums[currentRoute.arg].title, select: false });
+  $("collection-folders").replaceChildren(el("button", { class: "primary", onclick: () => libraryPasswordSheet(false) }, "🔒 Mở khoá album"));
+}
+
+function relockLibrary(force = false) {
+  if (!force && (!libraryLock.enabled || (!libraryUnlockUntil && !libraryUnlockRequests))) return libraryRelockPending;
+  libraryLockEpoch++;
+  libraryUnlockUntil = 0;
+  clearTimeout(libraryLockTimer);
+  if (libraryLock.enabled && sensitiveRoute(currentRoute)) {
+    endSelection();
+    closeViewer();
+    closeSheet();
+    renderLockedAlbum();
+  }
+  if (libraryLock.enabled && librarySummary) {
+    delete librarySummary.counts.hidden;
+    delete librarySummary.counts.trash;
+  }
+  if (!currentCredential()) return libraryRelockPending;
+  // Queue revocations so navigation waits for them; keepalive also covers pagehide.
+  const credential = currentCredential();
+  libraryRelockPending = libraryRelockPending.catch(() => {}).then(async () => {
+    const response = await fetch("/v1/auth/library-lock/relock", {
+      method: "POST", keepalive: true,
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + credential.accessToken },
+      body: "{}",
+    });
+    if (!response.ok) throw new Error("Chưa khoá được trên máy chủ. Hãy thử lại.");
+    const state = await response.json();
+    if (currentCredential()?.accessToken === credential.accessToken) libraryLock = state;
+  });
+  libraryRelockPending.catch(() => {});
+  return libraryRelockPending;
+}
+
+async function awaitLibraryRelock() {
+  libraryRelockPending = libraryRelockPending.catch(async () => {
+    libraryLock = await apiJSON("/v1/auth/library-lock/relock", "POST", {});
+  });
+  await libraryRelockPending;
+}
+
+async function refreshLibraryLock() {
+  const toggle = $("library-lock-toggle");
+  toggle.disabled = true;
+  try {
+    libraryLock = await apiJSON("/v1/auth/library-lock");
+    toggle.checked = libraryLock.enabled;
+  } catch (error) { handleError(error, $("library-lock-error")); }
+  finally { toggle.disabled = false; }
+}
+
+async function changeLibraryLock() {
+  const toggle = $("library-lock-toggle");
+  if (!toggle.checked) {
+    toggle.checked = true;
+    libraryPasswordSheet(true);
+    return;
+  }
+  toggle.disabled = true;
+  try {
+    libraryLock = await apiJSON("/v1/auth/library-lock", "PUT", { enabled: true });
+    await relockLibrary();
+    loadUsage();
+  } catch (error) { handleError(error, $("library-lock-error")); }
+  finally { toggle.disabled = false; toggle.checked = libraryLock.enabled; }
+}
+
+function libraryPasswordSheet(disable) {
+  let epoch;
+  let submitted = false;
+  const password = el("input", { type: "password", name: "password", autocomplete: "current-password", required: true });
+  const username = el("input", { type: "text", name: "username", autocomplete: "username", readonly: true, "aria-label": "Tài khoản" });
+  fetchPeople().then((people) => {
+    const me = people.find((person) => person.me);
+    if (me) username.value = me.email;
+  }).catch(() => {});
+  const error = el("p", { class: "error", role: "alert" });
+  const submit = el("button", { type: "submit", class: "primary" }, disable ? "Tắt khoá" : "Mở khoá");
+  const form = el("form", {}, username, el("label", {}, "Mật khẩu tài khoản", password), error, submit);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    let requestPending = false;
+    try {
+      await awaitLibraryRelock();
+      if (epoch !== libraryLockEpoch || document.hidden) return;
+      submitted = true;
+      libraryUnlockRequests++;
+      requestPending = true;
+      const state = await apiJSON(disable ? "/v1/auth/library-lock" : "/v1/auth/library-lock/unlock", disable ? "PUT" : "POST",
+        disable ? { enabled: false, password: password.value } : { password: password.value, version: libraryLock.version });
+      password.value = "";
+      if (epoch !== libraryLockEpoch || document.hidden || (!disable && !sensitiveRoute(currentRoute))) {
+        await relockLibrary();
+        return;
+      }
+      libraryLock = state;
+      sheetOnClose = null;
+      closeSheet();
+      if (disable) {
+        $("library-lock-toggle").checked = false;
+        loadUsage();
+      } else {
+        libraryUnlockUntil = Date.parse(state.unlocked_until);
+        clearTimeout(libraryLockTimer);
+        libraryLockTimer = setTimeout(() => relockLibrary(), Math.max(0, libraryUnlockUntil - Date.now()));
+        openCollectionRoute(currentRoute);
+      }
+    } catch (failure) { handleError(failure, error); }
+    finally {
+      if (requestPending) libraryUnlockRequests--;
+      password.value = "";
+      submit.disabled = false;
+    }
+  });
+  openSheet(disable ? "Tắt khoá album riêng tư" : "Mở khoá album", form);
+  epoch = libraryLockEpoch;
+  sheetOnClose = () => {
+    password.value = "";
+    libraryLockEpoch++;
+    if (submitted) relockLibrary();
+  };
+}

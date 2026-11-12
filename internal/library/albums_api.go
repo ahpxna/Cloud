@@ -50,7 +50,7 @@ func (api *API) albumResponse(principal auth.Principal, album Album, now time.Ti
 		UpdatedAt: album.UpdatedAt, LatestAddedAt: album.LatestAddedAt, CoverAssetID: album.CoverAssetID,
 	}
 	if album.CoverAssetID != "" && api.viewTickets != nil && api.hasThumbnail(album.CoverOwnerID, album.CoverAssetID) {
-		response.CoverURL, _ = api.thumbnailURL(principal, album.CoverAssetID, now)
+		response.CoverURL, _ = api.thumbnailURL(principal, album.CoverAssetID, now, false)
 	}
 	for _, member := range album.Members {
 		response.Members = append(response.Members, personResponse{ID: member.ID, DisplayName: member.DisplayName, Email: member.Email, Me: member.IsMe})
@@ -94,6 +94,12 @@ func (api *API) serveAlbums(w http.ResponseWriter, r *http.Request, principal au
 			if (request.FolderID != "" && !safeID.MatchString(request.FolderID)) || !allSafe(request.AssetIDs) || !allSafe(request.MemberIDs) {
 				writeProblem(w, http.StatusBadRequest, "invalid_request", "invalid IDs")
 				return
+			}
+			if locked, ok := api.store.(lockedStore); ok {
+				if err := locked.check(ctx, principal.UserID, request.AssetIDs); err != nil {
+					api.writeStoreError(w, err, "could not create album")
+					return
+				}
 			}
 			album, err := api.store.CreateAlbum(ctx, principal.UserID, request.Name, request.FolderID)
 			if err != nil {
@@ -367,7 +373,7 @@ func (api *API) servePlaces(w http.ResponseWriter, r *http.Request, principal au
 				"count": place.Count, "latest_taken_at": place.LatestTaken,
 			}
 			if api.viewTickets != nil && api.hasThumbnail(principal.UserID, place.CoverAssetID) {
-				if link, err := api.thumbnailURL(principal, place.CoverAssetID, now); err == nil {
+				if link, err := api.thumbnailURL(principal, place.CoverAssetID, now, false); err == nil {
 					entry["cover_url"] = link
 				}
 			}
@@ -449,7 +455,7 @@ func (api *API) activity(w http.ResponseWriter, r *http.Request, principal auth.
 		var thumbnails []string
 		if api.viewTickets != nil {
 			for _, id := range entry.AssetIDs {
-				if link, err := api.thumbnailURL(principal, id, now); err == nil {
+				if link, err := api.thumbnailURL(principal, id, now, false); err == nil {
 					thumbnails = append(thumbnails, link)
 				}
 			}

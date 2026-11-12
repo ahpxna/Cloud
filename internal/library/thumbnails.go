@@ -47,10 +47,14 @@ func (api *API) hasThumbnail(ownerID, assetID string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// thumbnailURL returns a view URL whose ticket is identical for a whole hour,
-// so the browser can cache the image across library reloads.
-func (api *API) thumbnailURL(principal auth.Principal, assetID string, now time.Time) (string, error) {
-	ticket, err := api.viewTickets.IssueView(principal, assetID, auth.ViewThumbnail, now.Truncate(time.Hour), thumbnailTicketTTL)
+// thumbnailURL uses stable hourly tickets for visible assets and fresh URLs
+// for hidden or trashed assets so old browser cache entries are not reused.
+func (api *API) thumbnailURL(principal auth.Principal, assetID string, now time.Time, protected bool) (string, error) {
+	ticketTime := now.Truncate(time.Hour)
+	if protected {
+		ticketTime = now
+	}
+	ticket, err := api.viewTickets.IssueView(principal, assetID, auth.ViewThumbnail, ticketTime, thumbnailTicketTTL)
 	if err != nil {
 		return "", err
 	}
@@ -81,6 +85,9 @@ func (api *API) serveThumbnail(w http.ResponseWriter, r *http.Request, principal
 	}
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", thumbnailCacheControl)
+	if asset.Hidden || asset.TrashedAt != nil {
+		w.Header().Set("Cache-Control", "private, no-store")
+	}
 	http.ServeContent(w, r, "thumbnail.jpg", info.ModTime(), file)
 }
 

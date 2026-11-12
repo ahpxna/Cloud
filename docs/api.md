@@ -192,6 +192,39 @@ gateway (hourly). `purge` deletes binned items now; `POST
 /v1/assets/trash/empty` and `POST /v1/assets/trash/restore` act on the whole
 bin. Uploading a binned photo again restores it.
 
+The optional per-user library lock defaults to off. Authenticated account routes:
+
+- `GET /v1/auth/library-lock` returns `{enabled, version, unlocked_until?}`.
+- `PUT /v1/auth/library-lock` accepts `{"enabled":true}` to enable it, or
+  `{"enabled":false,"password":"..."}` to disable it. Either clears every
+  device session's unlock.
+- `POST /v1/auth/library-lock/unlock` accepts `{"password":"...","version":n}`,
+  using the version from the latest state response. It unlocks this device
+  session for ten minutes. Password verification shares sign-in's rate limit,
+  identity lockout and generic `401 invalid_credentials` failure.
+- `POST /v1/auth/library-lock/relock` accepts `{}` and immediately clears this
+  session's unlock. Relocking changes the version; a delayed unlock with an old
+  version fails with `409 library_lock_changed`. Fetch state and try again.
+
+While enabled and locked, protected views and access to hidden or binned assets
+return `403 library_locked`: listing (including explicit IDs), detail, originals,
+thumbnails (read and write), clips, album membership and asset mutations, batch
+restore/unhide/purge, whole-bin restore/empty, and download preparation/streaming.
+Previously issued view tickets and download sets check the current lock too.
+Search and ordinary/shared albums continue excluding hidden and binned items.
+Hiding or binning a visible item remains allowed; Live Photo mutations check both
+halves before changing either. Summary `counts.hidden`, `counts.trash` and usage
+`hidden_count`, `trash_count`, `trash_bytes` are omitted while locked.
+
+The unlock belongs to the existing device session, survives access-token refresh
+without extending its deadline, and ends on sign-out, password change or session
+revocation. Clients must relock on backgrounding, leaving either protected album
+and at the deadline, clear protected media locally, and start each page locked.
+The web password form uses `autocomplete="current-password"`; iPhone Passwords
+can fill it after Face ID. The server receives the account password, never
+biometric data. Retention purge, upload deduplication and re-upload restore are
+independent maintenance/upload paths and do not require an album unlock.
+
 A purge tombstones the asset row (`deleted_at`), removes it from every album,
 records an append-only `asset_events` entry, and removes the original and its
 preview. The original is first renamed into `.purging/` inside the database
@@ -266,7 +299,9 @@ frames) and uploads it once with `PUT /v1/assets/{id}/thumbnail`
 (`Content-Type: image/jpeg`, access token, at most 512 KiB and 640×640). The
 server decodes and re-encodes it, dropping any metadata, and stores it under
 `thumbnails/<owner>/` on the media volume. `GET /v1/assets?tickets=1` then adds
-a `thumbnail_url` whose ticket is identical for an hour so browsers cache it.
+a `thumbnail_url`. Visible assets use hourly tickets and `private, max-age=3600`
+even when the library lock is enabled. Hidden or binned assets use fresh tickets
+and `private, no-store`; every request still checks the current library lock.
 Thumbnail and original tickets are separate kinds: neither opens the other.
 Thumbnails are derived data, outside the signed integrity manifest, and can be
 deleted and regenerated at any time.

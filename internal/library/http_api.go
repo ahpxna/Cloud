@@ -42,6 +42,8 @@ type Purger interface {
 }
 
 type API struct {
+	libraryLocks     auth.LibraryLockReader
+	lockState        auth.LibraryLockState
 	store            Store
 	mediaRoot        string
 	writeIdleTimeout time.Duration
@@ -59,6 +61,8 @@ const viewTicketTTL = 10 * time.Minute
 func (api *API) EnableViewTickets(tokens *auth.AccessTokenManager) {
 	api.viewTickets = tokens
 }
+
+func (api *API) EnableLibraryLock(reader auth.LibraryLockReader) { api.libraryLocks = reader }
 
 // UseStore switches the API to the full library: smart albums, albums and
 // folders, sharing, Recently Deleted, places and downloads.
@@ -93,6 +97,19 @@ func (api *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok || principal.SessionID == "" {
 		writeProblem(w, http.StatusUnauthorized, "unauthorized", "valid access token required")
 		return
+	}
+	if api.libraryLocks != nil {
+		state, err := api.libraryLocks.LibraryLockState(r.Context(), principal.UserID, principal.SessionID)
+		if err != nil {
+			writeProblem(w, 503, "authentication_unavailable", "authentication is temporarily unavailable")
+			return
+		}
+		scoped := *api
+		scoped.lockState = state
+		if state.Locked() {
+			scoped.store = lockedStore{Store: api.store}
+		}
+		api = &scoped
 	}
 	switch path := r.URL.Path; {
 	case path == "/v1/assets" || strings.HasPrefix(path, "/v1/assets/"):
@@ -286,7 +303,7 @@ func (api *API) itemResponse(principal auth.Principal, item Item, withTickets bo
 			response.LiveVideo.ViewURL = response.LiveVideo.OriginalURL + "?ticket=" + url.QueryEscape(ticket)
 		}
 		if api.hasThumbnail(item.OwnerID, item.ID) {
-			if response.ThumbnailURL, err = api.thumbnailURL(principal, item.ID, now); err != nil {
+			if response.ThumbnailURL, err = api.thumbnailURL(principal, item.ID, now, item.Hidden || item.TrashedAt != nil); err != nil {
 				return itemResponse{}, err
 			}
 		}
@@ -389,7 +406,7 @@ func (api *API) detail(w http.ResponseWriter, r *http.Request, principal auth.Pr
 			response.Albums = append(response.Albums, albumRef{ID: album.ID, Name: album.Name, IsOwner: album.IsOwner})
 		}
 	} else if !errors.Is(err, ErrUnsupported) {
-		writeProblem(w, http.StatusInternalServerError, "asset_lookup_failed", "could not load asset")
+		api.writeStoreError(w, err, "could not load asset")
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -464,6 +481,11 @@ func (api *API) batch(w http.ResponseWriter, r *http.Request, principal auth.Pri
 }
 
 func (api *API) purgeAll(ctx context.Context, ownerID string, ids []string) (int, error) {
+	if locked, ok := api.store.(lockedStore); ok {
+		if err := locked.check(ctx, ownerID, ids); err != nil {
+			return 0, err
+		}
+	}
 	if api.purger == nil {
 		return 0, ErrUnsupported
 	}
@@ -529,12 +551,18 @@ func (api *API) summary(w http.ResponseWriter, r *http.Request, principal auth.P
 		api.writeStoreError(w, err, "could not load the library summary")
 		return
 	}
+	if api.lockState.Locked() {
+		delete(counts, "hidden")
+		delete(counts, "trash")
+		delete(covers, "hidden")
+		delete(covers, "trash")
+	}
 	now := time.Now()
 	coverURLs := map[string]string{}
 	if api.viewTickets != nil {
 		for name, id := range covers {
 			if api.hasThumbnail(principal.UserID, id) {
-				if link, err := api.thumbnailURL(principal, id, now); err == nil {
+				if link, err := api.thumbnailURL(principal, id, now, name == "hidden" || name == "trash"); err == nil {
 					coverURLs[name] = link
 				}
 			}
@@ -544,16 +572,21 @@ func (api *API) summary(w http.ResponseWriter, r *http.Request, principal auth.P
 	if available, err := upload.AvailableBytes(api.mediaRoot)(); err == nil {
 		free = &available
 	}
+	usageResponse := map[string]any{
+		"photo_count": usage.PhotoCount, "photo_bytes": usage.PhotoBytes, "video_count": usage.VideoCount, "video_bytes": usage.VideoBytes,
+		"quota_bytes": usage.QuotaBytes, "disk_free_bytes": free,
+	}
+	if !api.lockState.Locked() {
+		usageResponse["trash_count"] = usage.TrashCount
+		usageResponse["trash_bytes"] = usage.TrashBytes
+		usageResponse["hidden_count"] = usage.HiddenCount
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"counts": counts,
-		"covers": coverURLs,
-		"usage": map[string]any{
-			"photo_count": usage.PhotoCount, "photo_bytes": usage.PhotoBytes,
-			"video_count": usage.VideoCount, "video_bytes": usage.VideoBytes,
-			"trash_count": usage.TrashCount, "trash_bytes": usage.TrashBytes,
-			"hidden_count": usage.HiddenCount, "quota_bytes": usage.QuotaBytes,
-			"disk_free_bytes": free,
-		},
+		"library_lock":         api.lockState,
+		"library_locked":       api.lockState.Locked(),
+		"counts":               counts,
+		"covers":               coverURLs,
+		"usage":                usageResponse,
 		"trash_retention_days": int(TrashRetention / (24 * time.Hour)),
 		"sorts":                SortNames,
 	})
@@ -741,6 +774,8 @@ func (api *API) writeStoreError(w http.ResponseWriter, err error, detail string)
 	case errors.As(err, &pgError) && pgError.Code == "22P02":
 		// A malformed ID never names anything.
 		writeProblem(w, http.StatusNotFound, "not_found", "not found")
+	case errors.Is(err, ErrLibraryLocked):
+		writeProblem(w, http.StatusForbidden, "library_locked", "unlock Hidden and Recently Deleted to continue")
 	case errors.Is(err, ErrForbidden):
 		writeProblem(w, http.StatusForbidden, "forbidden", "only the album's owner can do that")
 	case errors.Is(err, ErrInvalid):

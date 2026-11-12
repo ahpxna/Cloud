@@ -467,6 +467,13 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	libraryAPI.EnableViewTickets(config.Tokens)
+	if config.Accounts != nil && config.Library != nil {
+		reader, ok := config.Accounts.(auth.LibraryLockReader)
+		if !ok {
+			return nil, errors.New("account repository must persist library locks")
+		}
+		libraryAPI.EnableLibraryLock(reader)
+	}
 	if config.Library != nil {
 		var purger library.Purger
 		if canPurge {

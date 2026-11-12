@@ -99,8 +99,9 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM photo_cloud_gateway, photo_clo
 -- reads. upload_events remains append-only at the privilege layer as well as by
 -- trigger: the gateway can insert events but cannot update or delete them.
 GRANT SELECT ON users TO photo_cloud_gateway;
-GRANT UPDATE (auth_epoch, display_name) ON users TO photo_cloud_gateway;
-GRANT SELECT, INSERT, UPDATE ON device_sessions TO photo_cloud_gateway;
+GRANT UPDATE (auth_epoch, display_name, library_lock_enabled) ON users TO photo_cloud_gateway;
+GRANT SELECT, INSERT ON device_sessions TO photo_cloud_gateway;
+GRANT UPDATE (last_used_at, expires_at, revoked_at, library_unlocked_until, library_lock_version) ON device_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE ON user_sessions TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE, DELETE ON login_throttles TO photo_cloud_gateway;
 GRANT SELECT, INSERT, UPDATE, DELETE ON user_mfa_totp TO photo_cloud_gateway;
@@ -188,6 +189,16 @@ BEGIN
      OR has_table_privilege('photo_cloud_gateway', 'asset_integrity_checks', 'INSERT')
      OR has_table_privilege('photo_cloud_gateway', 'schema_migrations', 'UPDATE') THEN
     RAISE EXCEPTION 'gateway database role can mutate integrity/migration evidence';
+  END IF;
+  IF NOT has_column_privilege('photo_cloud_gateway', 'users', 'library_lock_enabled', 'UPDATE')
+     OR NOT has_column_privilege('photo_cloud_gateway', 'device_sessions', 'library_unlocked_until', 'UPDATE')
+     OR NOT has_column_privilege('photo_cloud_gateway', 'device_sessions', 'library_lock_version', 'UPDATE')
+     OR has_column_privilege('photo_cloud_admin', 'users', 'library_lock_enabled', 'UPDATE')
+     OR has_column_privilege('photo_cloud_admin', 'device_sessions', 'library_unlocked_until', 'UPDATE') THEN
+    RAISE EXCEPTION 'library lock column privileges are incorrect';
+  END IF;
+  IF has_column_privilege('photo_cloud_admin', 'device_sessions', 'library_lock_version', 'UPDATE') THEN
+    RAISE EXCEPTION 'library lock column privileges are incorrect';
   END IF;
   IF has_table_privilege('photo_cloud_gateway', 'assets', 'DELETE')
      OR has_column_privilege('photo_cloud_gateway', 'assets', 'content_sha256', 'UPDATE')

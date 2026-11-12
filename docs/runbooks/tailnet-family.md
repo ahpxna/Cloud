@@ -79,6 +79,33 @@ photo again also restores it. **Đã ẩn** keeps items out of the library and e
 album. Permanent deletion removes the original from the media volume; older
 restic snapshots still contain it until they are pruned.
 
+To require a password before opening either album, use **Cài đặt → Khoá album
+riêng tư** and enable **Khoá album Đã ẩn và Đã xoá gần đây**. This is off by default,
+including for existing accounts. Locked albums show a lock instead of a count.
+Tap **Mở khoá album** and enter the account password; on iPhone, a saved password
+can be filled through Passwords using Face ID. This uses the phone's password
+manager, with no biometric information sent to the server. Incorrect passwords
+count toward the same lockout as sign-in. Turning the setting off also asks for
+the password.
+
+An unlock lasts at most ten minutes on that signed-in device. Leaving the album,
+backgrounding or reloading the page locks it again. Sign-out, password change
+and revoking the device session also end access. When offline, the page clears
+protected media immediately; server revocation requires connectivity, otherwise
+the ten-minute deadline still applies. Files already downloaded or shared cannot
+be taken back. Hiding/deleting a visible photo, retention cleanup, duplicate
+uploads and restoring a binned photo by uploading it again continue to work.
+
+After upgrading, apply migration **0013** and rerun database-role **finalize** so
+the gateway receives the new column grants. Verify with synthetic photos: enable
+the setting, open both albums and cancel the password sheet, try a wrong password,
+then unlock with a saved password on iPhone. Check originals, thumbnails, video
+clips and ZIP downloads; leave the album and return, background the page and
+return, and wait ten minutes. Each must ask again. A second device remains locked.
+Use the browser network panel to confirm `403 library_locked` for protected
+requests while locked, including old ticket URLs, and that summary counts are
+absent. Confirm disabling asks for the password and restores normal behavior.
+
 ## What is and is not an original
 
 - The server never resizes, transcodes or recompresses anything. Every upload
