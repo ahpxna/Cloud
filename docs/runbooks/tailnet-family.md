@@ -1,5 +1,7 @@
 # Private Family Access with Tailscale (no domain, no Apple fee)
 
+For parents using iPhones, see [Hướng dẫn cho ba mẹ](../huong-dan-gia-dinh.md).
+
 This path replaces the domain, Cloudflare Tunnel and the App Store/TestFlight
 app with three free pieces:
 

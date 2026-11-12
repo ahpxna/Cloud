@@ -37,6 +37,7 @@ The accepted direction is:
 For an always-on Linux box and a tested library migration path, follow [ThinkCentre host](docs/runbooks/thinkcentre-host.md).
 For free private family access (Tailscale + web app + iOS Shortcut), see
 [tailnet-family](docs/runbooks/tailnet-family.md).
+For parents using iPhones, see [Hướng dẫn cho ba mẹ](docs/huong-dan-gia-dinh.md).
 
 The web app at `/app/` is modelled on the iPhone Photos app: a timeline by date
 taken with sorting, filters and search; multi-select; albums in folders, smart
