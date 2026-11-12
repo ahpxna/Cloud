@@ -235,6 +235,8 @@ videos included.
 
 An album item is a reference: nobody gets a copy. The database enforces that
 whoever adds an item owns it. Hidden or binned items are not shown to anyone.
+Removing a member or leaving an album also deletes that person's comments and
+likes in the album, together with the items they added.
 
 ### Places and summary
 
