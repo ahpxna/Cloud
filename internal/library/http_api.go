@@ -546,7 +546,7 @@ func (api *API) summary(w http.ResponseWriter, r *http.Request, principal auth.P
 		api.writeStoreError(w, err, "could not load the library summary")
 		return
 	}
-	usage, err := api.store.Usage(r.Context(), principal.UserID)
+	usage, err := api.store.Usage(r.Context(), principal.UserID, !api.lockState.Locked())
 	if err != nil {
 		api.writeStoreError(w, err, "could not load the library summary")
 		return

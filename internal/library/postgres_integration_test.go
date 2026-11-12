@@ -833,6 +833,9 @@ func TestLibraryPasswordLockGateway(t *testing.T) {
 	// Album social/cover operations still require visibility even when unlocked.
 	assertLocked([]route{{"PATCH", "/v1/albums/" + album, map[string]any{"cover_asset_id": photo}, 204}, {"POST", "/v1/albums/" + album + "/likes", map[string]any{"asset_id": photo, "liked": true}, 204}, {"GET", "/v1/albums/" + album + "/comments?asset_id=" + photo, nil, 200}, {"POST", "/v1/albums/" + album + "/comments", map[string]any{"asset_id": photo, "body": "Synthetic"}, 201}})
 	summary := call("GET", "/v1/library/summary", nil, 200)
+	if usage, counts := summary["usage"].(map[string]any), summary["counts"].(map[string]any); usage["photo_count"] != counts["photos"] || usage["video_count"] != counts["videos"] {
+		t.Fatalf("locked usage includes hidden items: %v, visible counts: %v", usage, counts)
+	}
 	for _, field := range []string{"hidden", "trash"} {
 		if _, ok := summary["counts"].(map[string]any)[field]; ok {
 			t.Fatalf("locked count leaked: %s", field)

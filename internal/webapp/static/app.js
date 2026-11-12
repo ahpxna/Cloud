@@ -1188,8 +1188,8 @@ const library = {
   async updateCount() {
     try {
       const summary = await apiJSON("/v1/library/summary");
-      const usage = summary.usage;
-      $("library-count").textContent = plural(usage.photo_count, "ảnh") + ", " + plural(usage.video_count, "video");
+      const counts = summary.counts;
+      $("library-count").textContent = plural(counts.photos, "ảnh") + ", " + plural(counts.videos, "video");
       librarySummary = summary;
     } catch {
       $("library-count").textContent = "";
@@ -1595,7 +1595,11 @@ async function openCollectionRoute({ name, arg }) {
         collection.done = true;
         await awaitLibraryRelock();
         const state = await apiJSON("/v1/auth/library-lock");
-        if (epoch !== libraryLockEpoch || document.hidden || !sensitiveRoute(currentRoute) || currentRoute.arg !== arg) return;
+        if (epoch !== libraryLockEpoch || !sensitiveRoute(currentRoute) || currentRoute.arg !== arg) return;
+        if (document.hidden) {
+          if (state.enabled && (!libraryUnlockUntil || Date.now() >= libraryUnlockUntil || !state.unlocked_until)) renderLockedAlbum();
+          return;
+        }
         libraryLock = state;
         if (state.enabled && (!libraryUnlockUntil || Date.now() >= libraryUnlockUntil || !state.unlocked_until)) {
           if (state.unlocked_until) await relockLibrary(true);
@@ -2239,7 +2243,13 @@ async function viewerBatch(action) {
     await apiJSON("/v1/assets/batch", "POST", { ids: withLiveVideos([item]), action });
     collection.remove([item.id]);
     toast({ trash: "Đã chuyển vào Đã xoá gần đây", purge: "Đã xoá vĩnh viễn", restore: "Đã khôi phục", hide: "Đã ẩn", unhide: "Đã bỏ ẩn" }[action]);
-    if (token !== viewer.token) return;
+    if (token !== viewer.token) {
+      if (viewer.collection === collection && viewer.item && viewer.item.id !== item.id) {
+        const currentIndex = collection.items.findIndex((candidate) => candidate.id === viewer.item.id);
+        if (currentIndex >= 0) viewer.index = currentIndex;
+      }
+      return;
+    }
     if (!collection.items.length) closeViewer();
     else showItem(Math.min(index, collection.items.length - 1));
   } catch (error) {
@@ -2281,7 +2291,13 @@ async function removeCurrentFromAlbum(album, item) {
     await apiJSON("/v1/albums/" + album.id + "/assets/remove", "POST", { ids: withLiveVideos([item]) });
     collection.remove([item.id]);
     toast("Đã bỏ khỏi album");
-    if (token !== viewer.token) return;
+    if (token !== viewer.token) {
+      if (viewer.collection === collection && viewer.item && viewer.item.id !== item.id) {
+        const currentIndex = collection.items.findIndex((candidate) => candidate.id === viewer.item.id);
+        if (currentIndex >= 0) viewer.index = currentIndex;
+      }
+      return;
+    }
     if (!collection.items.length) closeViewer();
     else showItem(Math.min(index, collection.items.length - 1));
   } catch (error) {

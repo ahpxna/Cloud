@@ -194,7 +194,7 @@ type Store interface {
 	SetCaption(ctx context.Context, ownerID, assetID, caption string) error
 	TrashedIDs(ctx context.Context, ownerID string) ([]string, error)
 	Counts(ctx context.Context, ownerID string) (Counts, map[string]string, error)
-	Usage(ctx context.Context, ownerID string) (Usage, error)
+	Usage(ctx context.Context, ownerID string, includeHidden bool) (Usage, error)
 
 	Albums(ctx context.Context, viewerID string) ([]Album, []Folder, error)
 	Album(ctx context.Context, viewerID, albumID string) (Album, error)

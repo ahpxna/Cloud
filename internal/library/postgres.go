@@ -475,19 +475,19 @@ func (s *PostgresStore) Counts(ctx context.Context, ownerID string) (Counts, map
 	return result, coverMap, nil
 }
 
-func (s *PostgresStore) Usage(ctx context.Context, ownerID string) (Usage, error) {
+func (s *PostgresStore) Usage(ctx context.Context, ownerID string, includeHidden bool) (Usage, error) {
 	var usage Usage
 	err := s.pool.QueryRow(ctx, `
         SELECT
-            count(*) FILTER (WHERE trashed_at IS NULL AND media_type NOT LIKE 'video/%'),
-            COALESCE(sum(byte_size) FILTER (WHERE trashed_at IS NULL AND media_type NOT LIKE 'video/%'), 0),
-            count(*) FILTER (WHERE trashed_at IS NULL AND media_type LIKE 'video/%'),
-            COALESCE(sum(byte_size) FILTER (WHERE trashed_at IS NULL AND media_type LIKE 'video/%'), 0),
+            count(*) FILTER (WHERE trashed_at IS NULL AND ($2 OR NOT hidden) AND media_type NOT LIKE 'video/%'),
+            COALESCE(sum(byte_size) FILTER (WHERE trashed_at IS NULL AND ($2 OR NOT hidden) AND media_type NOT LIKE 'video/%'), 0),
+            count(*) FILTER (WHERE trashed_at IS NULL AND ($2 OR NOT hidden) AND media_type LIKE 'video/%'),
+            COALESCE(sum(byte_size) FILTER (WHERE trashed_at IS NULL AND ($2 OR NOT hidden) AND media_type LIKE 'video/%'), 0),
             count(*) FILTER (WHERE trashed_at IS NOT NULL),
             COALESCE(sum(byte_size) FILTER (WHERE trashed_at IS NOT NULL), 0),
             count(*) FILTER (WHERE trashed_at IS NULL AND hidden),
             (SELECT quota_bytes FROM users WHERE id = $1::uuid)
-        FROM assets WHERE owner_id = $1::uuid AND deleted_at IS NULL`, ownerID).Scan(
+        FROM assets WHERE owner_id = $1::uuid AND deleted_at IS NULL`, ownerID, includeHidden).Scan(
 		&usage.PhotoCount, &usage.PhotoBytes, &usage.VideoCount, &usage.VideoBytes,
 		&usage.TrashCount, &usage.TrashBytes, &usage.HiddenCount, &usage.QuotaBytes)
 	return usage, err

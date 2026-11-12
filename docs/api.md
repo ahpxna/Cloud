@@ -215,6 +215,7 @@ Search and ordinary/shared albums continue excluding hidden and binned items.
 Hiding or binning a visible item remains allowed; Live Photo mutations check both
 halves before changing either. Summary `counts.hidden`, `counts.trash` and usage
 `hidden_count`, `trash_count`, `trash_bytes` are omitted while locked.
+While locked, usage `photo_count`, `photo_bytes`, `video_count` and `video_bytes` also exclude hidden items.
 
 The unlock belongs to the existing device session, survives access-token refresh
 without extending its deadline, and ends on sign-out, password change or session
